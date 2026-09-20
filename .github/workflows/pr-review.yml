@@ -61,7 +61,7 @@ on:
           両方を secrets から渡す場合は使われない
         type: string
         required: false
-        default: "arn:aws:iam::222165754930:role/github-actions-claude-pr-review"
+        default: "arn:aws:iam::222165754930:role/github-actions-pr-review"
       aws_region:
         description: "パラメータが置いてあるリージョン"
         type: string
@@ -71,7 +71,7 @@ on:
         description: "OAuth トークンを入れた SSM パラメータの名前"
         type: string
         required: false
-        default: "/claude-pr-review/oauth-token"
+        default: "/pr-review/oauth-token"
       claude_fallback:
         description: "Codex が失敗したときに Claude でレビューを再試行するか"
         type: boolean
@@ -86,7 +86,7 @@ on:
         description: "Codex の auth.json を入れた SSM パラメータの名前"
         type: string
         required: false
-        default: "/claude-pr-review/codex-auth-json"
+        default: "/pr-review/codex-auth-json"
     secrets:
       claude_code_oauth_token:
         description: >-
