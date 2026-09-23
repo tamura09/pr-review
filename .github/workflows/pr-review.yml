@@ -52,6 +52,13 @@ on:
         type: number
         required: false
         default: 30
+      claude_timeout_minutes:
+        description: >-
+          Claude のステップのタイムアウト (分)。超えたら失敗として Codex へ回す。
+          timeout_minutes との差が Codex に残る時間になる
+        type: number
+        required: false
+        default: 20
       skip_authors:
         description: "レビューをスキップする作成者。カンマ区切り"
         type: string
@@ -307,6 +314,9 @@ jobs:
       # 差分ファイルのあるディレクトリを --add-dir で読めるようにする。
       - name: Review with Claude
         id: claude
+        # 遅延・ハングしたときもフォールバックできるよう、ジョブのタイムアウトより
+        # 先に切る。ジョブごと打ち切られると Codex は起動しない
+        timeout-minutes: ${{ inputs.claude_timeout_minutes }}
         if: >-
           always() &&
           steps.effort.outcome == 'success' &&

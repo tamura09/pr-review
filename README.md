@@ -170,7 +170,8 @@ p90 で 174 行。`effort` を指定すると行数に関係なくその値を�
 ## フォールバックの動作
 
 Claude の実行が失敗したときだけ Codex を起動する。利用枠超過のほか、認証切れ・
-SSM から token を読めない場合・`max_turns` 到達なども対象にする。Claude が成功したときは
+SSM から token を読めない場合・`max_turns` 到達・`claude_timeout_minutes` 超過なども
+対象にする。Claude が成功したときは
 Codex の `auth.json` を SSM から読まず、Codex も起動しない。
 
 Claude は `track_progress` 付きで動き、進捗コメントを最終的なレビューに書き換える。
@@ -297,6 +298,7 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | `large_pr_min_lines` | number | `500` | 変更行数がこれ以上なら effort を `high` にする |
 | `max_turns` | number | `40` | Claude の最大ターン数 |
 | `timeout_minutes` | number | `30` | ジョブのタイムアウト。Claude が落ちた後の Codex の分も含む |
+| `claude_timeout_minutes` | number | `20` | Claude のステップのタイムアウト。超えたら Codex へ回す。`timeout_minutes` との差が Codex の持ち時間 |
 | `skip_authors` | string | `dependabot[bot],renovate[bot],tamura09-renovate[bot]` | レビューをスキップする作成者。カンマ区切り |
 | `skip_draft` | boolean | `true` | draft の PR をスキップするか |
 | `findings_state` | string | `failure` | 指摘があったときの `claude-review` チェックの状態。`success` にすると常に緑 |
