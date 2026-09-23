@@ -664,7 +664,7 @@ jobs:
                   clean_body="**✅ 指摘なし**
 
           ---
-          _${REVIEWER} · [Workflow run](${RUN_URL})_"
+          _${REVIEWER} [Workflow run](${RUN_URL})_"
                   gh api --method PATCH "repos/${GH_REPO}/issues/comments/${comment_id}" \
                     -f body="${clean_body}" >/dev/null \
                     || echo "コメントを verdict 行だけに書き換えられなかった"
