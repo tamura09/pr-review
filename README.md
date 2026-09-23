@@ -1,12 +1,14 @@
 # pr-review
 
-[Codex の GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) に
-PR をレビューさせる再利用可能ワークフロー。Codex の実行が
-利用枠超過などで失敗した場合は、自動で Claude に切り替える。**レビューを投稿するだけで、
-マージも承認もしない。** 判断は人間がする。
+Claude (既定は Opus 5.5) に PR をレビューさせる再利用可能ワークフロー。Claude の
+実行が利用枠超過などで失敗した場合は、自動で
+[Codex の GPT-5.6 Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra)
+に切り替える。**レビューを投稿するだけで、マージも承認もしない。** 判断は人間がする。
 
-Codex は OpenAI API key ではなく、`codex login` が保存する ChatGPT OAuth 認証を使う。
-フォールバック Claude も API key ではなく、Pro / Max サブスクリプションの OAuth token を使う。
+Claude の effort は PR の変更行数で切り替える (→ [effort の決め方](#effort-の決め方))。
+
+Claude は API key ではなく、Pro / Max サブスクリプションの OAuth token を使う。
+フォールバック Codex も OpenAI API key ではなく、`codex login` が保存する ChatGPT OAuth 認証を使う。
 
 ## トークンの置き場所
 
@@ -40,7 +42,7 @@ reusable workflow は呼び出され側 (このリポジトリ) の secret を�
 
 ### 1. Codex OAuth 認証を SSM に入れる
 
-ローカルで `codex login` を実行する。既に Codex CLI や Codex app へ ChatGPT で
+フォールバックを使う場合に要る。ローカルで `codex login` を実行する。既に Codex CLI や Codex app へ ChatGPT で
 ログイン済みなら、その認証を使える。
 
 ```bash
@@ -69,7 +71,7 @@ CI で ChatGPT 管理認証を使う場合は `auth.json` を安全なストレ�
 
 ### 2. Claude OAuth token を発行する
 
-フォールバックを使う場合、ローカルで実行する。ブラウザ認証後、token が1度だけ表示される。
+ローカルで実行する。ブラウザ認証後、token が1度だけ表示される。
 
 ```bash
 claude setup-token
@@ -147,16 +149,38 @@ jobs:
 `codex_auth_json` を GitHub secret から渡した場合、workflow は secret を更新できない。
 OAuth の refresh 後は手動更新が必要になるため、SSM 経由を推奨する。
 
+## effort の決め方
+
+ベースブランチとの差分の変更行数 (追加 + 削除) で Claude の effort を決める。
+
+| 変更行数 | effort |
+| --- | --- |
+| `small_pr_max_lines` (30) 以下 | `low` |
+| その間 | `medium` |
+| `large_pr_min_lines` (500) 以上 | `high` |
+
+ロックファイル (`pnpm-lock.yaml`・`package-lock.json`・`yarn.lock`・`*.lock`・
+`.terraform.lock.hcl`・`go.sum`) は生成物で、1行の依存追加でも数百行動くので数えない。
+バイナリも数えない。
+
+閾値は導入時点の人間の PR (直近 93 件) の分布から決めた。中央値 14 行、p75 で 40 行、
+p90 で 174 行。`effort` を指定すると行数に関係なくその値を使う。不正な値なら両モデルとも
+起動せず、`claude-review` チェックは error になる。
+
 ## フォールバックの動作
 
-Codex CLI が失敗したときだけ Claude を起動する。利用枠超過のほか、認証・通信・
-CLI の導入・実行失敗、空の最終回答も対象にする。Codex が成功したときは Claude OAuth token を
-SSM から読まず、Claude も起動しない。
+Claude の実行が失敗したときだけ Codex を起動する。利用枠超過のほか、認証切れ・
+SSM から token を読めない場合・`max_turns` 到達・`claude_timeout_minutes` 超過なども
+対象にする。Claude が成功したときは
+Codex の `auth.json` を SSM から読まず、Codex も起動しない。
+
+Claude は `track_progress` 付きで動き、進捗コメントを最終的なレビューに書き換える。
+失敗した場合、そのコメントはエラー表示のまま残り、フォールバックが起きたことの記録になる。
 
 Codex は GPT-5.6 Terra・read-only 権限でローカルの差分と関連コードを読み、最終回答を
 `github-actions[bot]` の PR コメントとして投稿する。コメント末尾に workflow run URL を
-付ける。Claude へフォールバックした場合も同じ verdict 書式で投稿するため、既存の
-`claude-review` チェック判定を共用できる。
+付ける。Claude と同じ verdict 書式で投稿するため、`claude-review` チェックの判定を
+共用できる。
 
 ## `v1` タグは main に自動で追従する
 
@@ -268,9 +292,13 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | --- | --- | --- | --- |
 | `focus` | string | (上記4観点) | レビュー観点。指定すると既定の観点を**上書き**する |
 | `extra_instructions` | string | `""` | リポジトリ固有の追加指示。観点は残したまま末尾に足される |
-| `model` | string | `claude-sonnet-5` | フォールバック Claude のモデル。空文字なら Claude Code の既定 |
-| `max_turns` | number | `40` | フォールバック Claude の最大ターン数 |
-| `timeout_minutes` | number | `20` | ジョブのタイムアウト |
+| `model` | string | `claude-opus-5-5` | レビューに使う Claude のモデル。空文字なら Claude Code の既定 |
+| `effort` | string | `""` | Claude の effort (`low` / `medium` / `high` / `xhigh` / `max`)。空文字なら変更行数で決める |
+| `small_pr_max_lines` | number | `30` | 変更行数がこれ以下なら effort を `low` にする |
+| `large_pr_min_lines` | number | `500` | 変更行数がこれ以上なら effort を `high` にする |
+| `max_turns` | number | `40` | Claude の最大ターン数 |
+| `timeout_minutes` | number | `30` | ジョブのタイムアウト。Claude が落ちた後の Codex の分も含む |
+| `claude_timeout_minutes` | number | `20` | Claude のステップのタイムアウト。超えたら Codex へ回す。`timeout_minutes` との差が Codex の持ち時間 |
 | `skip_authors` | string | `dependabot[bot],renovate[bot],tamura09-renovate[bot]` | レビューをスキップする作成者。カンマ区切り |
 | `skip_draft` | boolean | `true` | draft の PR をスキップするか |
 | `findings_state` | string | `failure` | 指摘があったときの `claude-review` チェックの状態。`success` にすると常に緑 |
@@ -278,8 +306,8 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | `aws_role_to_assume` | string | `arn:aws:iam::222165754930:role/github-actions-pr-review` | トークンを読むために OIDC で引くロール |
 | `aws_region` | string | `ap-northeast-1` | パラメータのあるリージョン |
 | `oauth_token_parameter` | string | `/pr-review/oauth-token` | トークンを入れた SSM パラメータ名 |
-| `claude_fallback` | boolean | `true` | Codex 失敗時に Claude で再試行するか |
-| `codex_effort` | string | `""` | GPT-5.6 Terra の reasoning effort。空文字なら既定 |
+| `codex_fallback` | boolean | `true` | Claude 失敗時に Codex で再試行するか |
+| `codex_effort` | string | `""` | フォールバック GPT-5.6 Terra の reasoning effort。空文字なら既定 |
 | `codex_auth_parameter` | string | `/pr-review/codex-auth-json` | Codex `auth.json` を入れた SSM パラメータ名 |
 
 ### Secrets
@@ -343,17 +371,19 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
 
 ## 注意点
 
-- **Codex と Claude の認証が両方とも未設定なら、PR のチェックが赤くなる。**
-  Codex だけ未設定なら Claude へフォールバックするが、通常運用前に両方投入すること。
+- **Claude と Codex の認証が両方とも未設定なら、PR のチェックが赤くなる。**
+  Claude が成功している間は Codex の認証を読まないので、Codex 側が切れていても
+  フォールバックが起きるまで気づけない。
 - **AWS が単一障害点になる。** ロールの信頼ポリシーやパラメータを壊すと、
   全リポジトリのレビューが同時に止まる。secret を各リポジトリに置いていた頃は
   リポジトリごとに独立していた。
 - **消費するのはサブスクリプションの利用枠。** push のたびに走る (同一 PR への連続
-  push は `concurrency` で古い実行をキャンセルする)。主系は `gpt-5.6-terra` 固定。
-  `with: model:` はフォールバック Claude のモデルだけを変える。
+  push は `concurrency` で古い実行をキャンセルする)。effort を行数で変えているのは
+  このため。`with: model:` は Claude のモデルだけを変え、フォールバックは
+  `gpt-5.6-terra` 固定。
 - **Codex OAuth 認証も失効しうる。** 通常の refresh は workflow が SSM へ保存する。
   refresh 自体が拒否された場合は `codex login` をやり直し、
-  `/pr-review/codex-auth-json` を上書きする。Claude フォールバックも失敗した場合、
+  `/pr-review/codex-auth-json` を上書きする。Claude も失敗していた場合、
   `claude-review` チェックは error になる。
 - **トークンは失効する。** 失効するとワークフローが認証エラーで落ちるので、
   `claude setup-token` で再発行して SSM パラメータを上書きする。更新するのは

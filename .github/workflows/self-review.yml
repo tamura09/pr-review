@@ -51,8 +51,9 @@ jobs:
           `if` が効いたままか
         - トークンやパラメータの値がログや `GITHUB_OUTPUT` 経由で漏れないか
           (`add-mask` の漏れ、`set -x` の混入)
-        - Codex 成功時に Claude の OAuth token を読んでいないか。各モデルの実行前に
+        - Claude 成功時に Codex の auth.json を読んでいないか。各モデルの実行前に
           AWS の一時認証情報を消し、Codex refresh 後だけ auth.json を SSM へ戻しているか
+        - effort を決める変更行数の数え方と閾値の比較が、README の説明と一致しているか
         - 呼び出され側のプロンプトが出力させる verdict 行の書式と、それを読む
           チェック出力ステップの正規表現が食い違っていないか
         - README と examples/pr-review.yml が、実際の入力名・既定値・権限と
