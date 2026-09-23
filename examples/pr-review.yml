@@ -34,7 +34,7 @@ jobs:
     uses: tamura09/pr-review/.github/workflows/pr-review.yml@v1
     # 必要に応じて上書きする
     # with:
-    #   model: claude-opus-5
+    #   effort: high  # 変更行数に関係なく固定したい場合
     #   findings_state: success  # 指摘があっても PR を赤くしたくない場合
     #   extra_instructions: |
     #     このリポジトリは Prisma のスキーマ変更がマイグレーションを伴う。
