@@ -182,6 +182,9 @@ jobs:
       # チェックは error になる。黙って既定に戻すと設定ミスに気づけない。
       - name: Decide review effort
         id: effort
+        # review_diff は continue-on-error なので、失敗しても後続は走る。ここで
+        # 止めないと、pr.diff が無いまま Claude/Codex が起動する
+        if: steps.review_diff.outcome == 'success'
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           EFFORT_OVERRIDE: ${{ inputs.effort }}
