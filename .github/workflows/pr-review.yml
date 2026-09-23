@@ -574,7 +574,13 @@ jobs:
 
             その後は、確認できた指摘だけを深刻な順に並べてください。前置き、変更要約、
             問題がない箇所、褒め言葉、結び、進捗チェックリストは書かないでください。
-            指摘がなければ verdict 行だけで終えてください。
+            「〜を確認しました」「追加の指摘はありません」のような確認結果の報告も
+            書かないでください。
+
+            2回目以降のレビューでも、前回の指摘が直ったかの報告は書かないでください。
+            直っていれば何も書かず、直っていなければ今回の指摘として書き直します。
+
+            指摘がなければ、他に書きたいことがあっても verdict 行だけで終えてください。
 
             対象は `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD` と影響範囲です。
 
@@ -595,6 +601,10 @@ jobs:
       # verdict 行から読み取る。両者の出力書式を同じに固定している。
       #
       # 両方の実行が落ちた場合も error として出したいので always()。
+      #
+      # 指摘なしのときは、コメントを verdict 行だけに書き換える。プロンプトで禁じても
+      # モデルは「前回の指摘は修正済み」「追加の指摘はありません」のような確認結果を
+      # 書き足すことがあり、指摘なしのコメントに文章が付くと読み手が中身を読まされる。
       - name: レビュー結果をチェックとして出す
         if: always()
         env:
@@ -606,6 +616,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
+          REVIEWER: ${{ steps.claude.outcome == 'success' && 'Claude' || 'Codex · GPT-5.6 Terra' }}
         run: |
           # 途中で失敗してもチェックだけは必ず出したいので -e は付けない
           set -uo pipefail
@@ -616,11 +627,15 @@ jobs:
           if [ "${REVIEW_DIFF_OUTCOME}" != "success" ]; then
             description="PR差分を取得できませんでした"
           else
-            # この実行が投稿したコメントだけを拾う (本文に実行URLが入っている)
-            body=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
-              --jq "[.[] | select(.user.login == \"github-actions[bot]\")
-                         | select(.body | contains(\"/actions/runs/${RUN_ID}\"))]
-                    | last | .body // empty" 2>/dev/null) || body=""
+            # この実行が投稿したコメントだけを拾う (本文に実行URLが入っている)。
+            # --paginate の --jq はページごとに評価されるので、1コメント1行の JSON で
+            # 出して最後の行を取る
+            comment=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
+              --jq ".[] | select(.user.login == \"github-actions[bot]\")
+                        | select(.body | contains(\"/actions/runs/${RUN_ID}\"))
+                        | {id, body} | @json" 2>/dev/null | tail -n 1) || comment=""
+            comment_id=$(jq -r '.id // empty' <<< "$comment" 2>/dev/null) || comment_id=""
+            body=$(jq -r '.body // empty' <<< "$comment" 2>/dev/null) || body=""
 
             if [ -n "$body" ]; then
               # JavaScript はシェルで展開しない。
@@ -643,6 +658,17 @@ jobs:
               if [ -n "$out" ]; then
                 state=${out%%$'\t'*}
                 description=${out#*$'\t'}
+                # 「指摘なし」になるのは verdict が指摘なしのときだけ
+                # (指摘ありは findings_state に関わらず「指摘 N件」になる)
+                if [ "${description}" = "指摘なし" ] && [ -n "${comment_id}" ]; then
+                  clean_body="**✅ 指摘なし**
+
+          ---
+          _${REVIEWER} [Workflow run](${RUN_URL})_"
+                  gh api --method PATCH "repos/${GH_REPO}/issues/comments/${comment_id}" \
+                    -f body="${clean_body}" >/dev/null \
+                    || echo "コメントを verdict 行だけに書き換えられなかった"
+                fi
               else
                 echo "コメントに verdict 行が見つからなかった"
               fi
