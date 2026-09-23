@@ -323,11 +323,8 @@ jobs:
           (steps.token_source.outputs.claude_from_ssm == 'false' ||
            steps.oauth_token.outcome == 'success')
         continue-on-error: true
-        # 未リリースの main (v1.0.231 + Claude Code 2.1.280 への版上げ1コミット) に
-        # 固定している。Opus 5.5 は Claude Code 2.1.280 以上でないと
-        # claude_code_version_too_old で起動直後に落ち、v1.0.231 は 2.1.278 を入れる。
-        # v1.0.232 以降が出るまでは、Renovate が v1 の digest へ戻す PR を出しうる。
-        # その PR はマージしないこと。
+        # Opus 5.5 は Claude Code 2.1.280 以上でないと claude_code_version_too_old で
+        # 起動直後に落ちる。v1.0.232 は 2.1.280 を入れる (v1.0.231 は 2.1.278)。
         uses: anthropics/claude-code-action@46a42b43239748e5b25771606bf1f551c3b1b517 # v1.0.232
         with:
           claude_code_oauth_token: ${{ secrets.claude_code_oauth_token || steps.oauth_token.outputs.token }}
