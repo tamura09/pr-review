@@ -12,7 +12,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  # claude-review チェックを PR のチェック一覧に出すため
+  # claude-review / codex-review チェックを PR のチェック一覧に出すため
   statuses: write
   # Claude/Codex の認証情報を AWS の SSM から読むための OIDC トークン発行
   id-token: write
@@ -36,6 +36,7 @@ jobs:
     # with:
     #   effort: high  # 変更行数に関係なく固定したい場合
     #   findings_state: success  # 指摘があっても PR を赤くしたくない場合
+    #   codex_review: false  # Codex を使わず Claude だけでレビューする場合
     #   extra_instructions: |
     #     このリポジトリは Prisma のスキーマ変更がマイグレーションを伴う。
     #     prisma/schema.prisma の変更があれば、対応するマイグレーションの有無を確認すること。
