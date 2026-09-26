@@ -1,6 +1,10 @@
-# Claude による PR レビューと、失敗時の Codex フォールバックを行う再利用可能ワークフロー。
+# Claude と Codex (OpenAI) の2つで PR をレビューする再利用可能ワークフロー。
 #
-# Claude の effort は PR の変更行数で決める (小さい PR は low、普段は medium、
+# 2つは matrix の別の leg として並列に走り、それぞれがコメントを1件投稿して
+# PR のチェック一覧に claude-review / codex-review を出す。片方が落ちても
+# もう片方のレビューは届く。
+#
+# effort はどちらも PR の変更行数で決める (小さい PR は low、普段は medium、
 # 大きい PR は high)。
 #
 # 呼び出し側のリポジトリに examples/pr-review.yml を置いて `uses:` で参照する。
@@ -27,8 +31,9 @@ on:
         default: "claude-opus-5-5"
       effort:
         description: >-
-          Claude の effort (low / medium / high / xhigh / max)。
-          空文字にすると PR の変更行数から small_pr_max_lines / large_pr_min_lines で決める
+          Claude と Codex の effort (low / medium / high / xhigh / max)。
+          空文字にすると PR の変更行数から small_pr_max_lines / large_pr_min_lines で決める。
+          Codex だけ変えたい場合は codex_effort を使う
         type: string
         required: false
         default: ""
@@ -48,14 +53,14 @@ on:
         required: false
         default: 40
       timeout_minutes:
-        description: "ジョブのタイムアウト (分)。Claude が落ちた後の Codex の分も含む"
+        description: "ジョブのタイムアウト (分)。Claude と Codex の leg それぞれに掛かる"
         type: number
         required: false
         default: 30
       claude_timeout_minutes:
         description: >-
-          Claude のステップのタイムアウト (分)。超えたら失敗として Codex へ回す。
-          timeout_minutes との差が Codex に残る時間になる
+          Claude のステップのタイムアウト (分)。超えたら claude-review を error にする。
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが出ない
         type: number
         required: false
         default: 20
@@ -71,7 +76,7 @@ on:
         default: true
       findings_state:
         description: >-
-          指摘があったときに claude-review チェックに付ける状態。
+          指摘があったときに claude-review / codex-review チェックに付ける状態。
           failure だと赤バツで一目で分かるが PR 全体が赤くなる。
           success にすると常に緑で、件数は説明文だけに出る
         type: string
@@ -99,16 +104,30 @@ on:
         type: string
         required: false
         default: "/pr-review/oauth-token"
-      codex_fallback:
-        description: "Claude が失敗したときに Codex でレビューを再試行するか"
+      codex_review:
+        description: "Claude と並べて Codex でもレビューするか。false なら Claude だけ"
         type: boolean
         required: false
         default: true
+      codex_model:
+        description: "Codex のレビューに使う OpenAI モデル"
+        type: string
+        required: false
+        default: "gpt-6-astra"
       codex_effort:
-        description: "フォールバック Codex の reasoning effort。空文字にすると既定に従う"
+        description: >-
+          Codex の reasoning effort (low / medium / high / xhigh / max)。
+          空文字にすると effort と同じ決め方をする
         type: string
         required: false
         default: ""
+      codex_timeout_minutes:
+        description: >-
+          Codex のステップのタイムアウト (分)。超えたら codex-review を error にする。
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが出ない
+        type: number
+        required: false
+        default: 20
       codex_auth_parameter:
         description: "Codex の auth.json を入れた SSM パラメータの名前"
         type: string
@@ -130,7 +149,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  # claude-review チェックを PR のチェック一覧に出すため
+  # claude-review / codex-review チェックを PR のチェック一覧に出すため
   statuses: write
   # Claude/Codex の認証情報を SSM から読むための OIDC トークン発行
   id-token: write
@@ -153,6 +172,14 @@ jobs:
         format(',{0},', inputs.skip_authors),
         format(',{0},', github.event.pull_request.user.login)
       )
+    # Claude と Codex を別の leg で並列に走らせる。片方の失敗や遅延がもう片方の
+    # レビューを止めないよう fail-fast は切る。差分の用意・effort の決定・判定の
+    # 読み取りは両方で同じなので、job を分けずに matrix で共有する
+    strategy:
+      fail-fast: false
+      matrix:
+        reviewer: ${{ fromJSON(inputs.codex_review && '["claude","codex"]' || '["claude"]') }}
+    name: ${{ matrix.reviewer }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
@@ -162,7 +189,7 @@ jobs:
           fetch-depth: 0
 
       # checkout の refspec に依存せず、レビュー対象の base ref を明示的に取得して
-      # 差分を一度生成し、Claude と Codex の両方に同じファイルを読ませる。Claude は
+      # 差分を一度生成し、モデルにはこのファイルを読ませる。Claude は
       # タグモードで Bash を持たず git diff を実行できないので、ファイルで渡す必要が
       # ある。ここで失敗した場合はモデルを起動せず、レビュー不能の原因を job と
       # PR コメントに残す。
@@ -179,22 +206,24 @@ jobs:
           install -d -m 700 "${RUNNER_TEMP}/pr-review"
           git diff --no-ext-diff "${base}...HEAD" > "${RUNNER_TEMP}/pr-review/pr.diff"
 
-      # 変更行数 (追加 + 削除) で Claude の effort を決める。小さい PR に high を
+      # 変更行数 (追加 + 削除) で effort を決める。小さい PR に high を
       # 使うと利用枠を無駄に食い、大きい PR に low を使うと見落とす。
+      # Claude と Codex は同じ段階名 (low〜max) を持つので、同じ値をそのまま使う。
       #
       # ロックファイルは生成物で、1行の依存追加でも数百行動くため数えない。
       # バイナリは numstat が "-" を返すので数えない。
       #
-      # effort の値が不正なときはここで落とす。モデルはどちらも起動せず、
+      # effort の値が不正なときはここで落とす。モデルは起動せず、
       # チェックは error になる。黙って既定に戻すと設定ミスに気づけない。
       - name: Decide review effort
         id: effort
         # review_diff は continue-on-error なので、失敗しても後続は走る。ここで
-        # 止めないと、pr.diff が無いまま Claude/Codex が起動する
+        # 止めないと、pr.diff が無いままモデルが起動する
         if: steps.review_diff.outcome == 'success'
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          EFFORT_OVERRIDE: ${{ inputs.effort }}
+          EFFORT_OVERRIDE: >-
+            ${{ matrix.reviewer == 'codex' && (inputs.codex_effort || inputs.effort) || inputs.effort }}
           SMALL_PR_MAX_LINES: ${{ inputs.small_pr_max_lines }}
           LARGE_PR_MIN_LINES: ${{ inputs.large_pr_min_lines }}
         run: |
@@ -234,35 +263,37 @@ jobs:
       # secret を読めないため、各リポジトリに同じ認証情報を複製する運用になって
       # いた。AWS の SSM に1本ずつ置き、OIDC で読む。
       #
-      # 呼び出し側が両方のトークンを渡した場合は AWS には触らない。片方だけなら、
-      # 足りない方を SSM から読む。Codex の認証は Claude が落ちたときにしか読まない。
+      # 呼び出し側がトークンを渡した場合は AWS には触らない。渡さなかった方を
+      # SSM から読む。各 leg は自分のモデルの認証情報しか読まない。
       #
       # secrets コンテキストは step の if では読めないので、いったん env 経由で
       # 受けてフラグに落とす。
       - name: Decide where the token comes from
         id: token_source
+        # `a && b || c` で選ぶと、Codex の leg で secret が空のとき Claude の
+        # secret に落ちるので、シェル側で選ぶ
         env:
+          REVIEWER: ${{ matrix.reviewer }}
           CALLER_CLAUDE_TOKEN: ${{ secrets.claude_code_oauth_token }}
           CALLER_CODEX_AUTH: ${{ secrets.codex_auth_json }}
-          CODEX_FALLBACK: ${{ inputs.codex_fallback }}
         run: |
-          if [ -z "${CALLER_CLAUDE_TOKEN}" ]; then
-            echo "claude_from_ssm=true" >> "${GITHUB_OUTPUT}"
+          if [ "${REVIEWER}" = "codex" ]; then
+            caller_token="${CALLER_CODEX_AUTH}"
           else
-            echo "claude_from_ssm=false" >> "${GITHUB_OUTPUT}"
+            caller_token="${CALLER_CLAUDE_TOKEN}"
           fi
 
-          if [ "${CODEX_FALLBACK}" = "true" ] && [ -z "${CALLER_CODEX_AUTH}" ]; then
-            echo "codex_from_ssm=true" >> "${GITHUB_OUTPUT}"
+          if [ -z "${caller_token}" ]; then
+            echo "from_ssm=true" >> "${GITHUB_OUTPUT}"
           else
-            echo "codex_from_ssm=false" >> "${GITHUB_OUTPUT}"
+            echo "from_ssm=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Configure AWS credentials for Claude
-        id: claude_aws
+      - name: Configure AWS credentials to read the token
+        id: token_aws
         if: >-
           steps.effort.outcome == 'success' &&
-          steps.token_source.outputs.claude_from_ssm == 'true'
+          steps.token_source.outputs.from_ssm == 'true'
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
@@ -273,9 +304,10 @@ jobs:
         id: oauth_token
         if: >-
           always() &&
+          matrix.reviewer == 'claude' &&
           steps.effort.outcome == 'success' &&
-          steps.token_source.outputs.claude_from_ssm == 'true' &&
-          steps.claude_aws.outcome == 'success'
+          steps.token_source.outputs.from_ssm == 'true' &&
+          steps.token_aws.outcome == 'success'
         continue-on-error: true
         env:
           PARAMETER_NAME: ${{ inputs.oauth_token_parameter }}
@@ -296,10 +328,52 @@ jobs:
           echo "::add-mask::${token}"
           echo "token=${token}" >> "${GITHUB_OUTPUT}"
 
+      - name: Prepare Codex authentication
+        id: codex_auth
+        if: >-
+          always() &&
+          matrix.reviewer == 'codex' &&
+          steps.effort.outcome == 'success' &&
+          (steps.token_source.outputs.from_ssm == 'false' || steps.token_aws.outcome == 'success')
+        continue-on-error: true
+        env:
+          CALLER_AUTH_JSON: ${{ secrets.codex_auth_json }}
+          FROM_SSM: ${{ steps.token_source.outputs.from_ssm }}
+          PARAMETER_NAME: ${{ inputs.codex_auth_parameter }}
+          PARAMETER_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+
+          if [ "${FROM_SSM}" = "true" ]; then
+            auth_json="$(aws ssm get-parameter \
+              --name "${PARAMETER_NAME}" \
+              --with-decryption \
+              --query 'Parameter.Value' \
+              --output text)"
+          else
+            auth_json="${CALLER_AUTH_JSON}"
+          fi
+
+          if [ -z "${auth_json}" ] || [ "${auth_json}" = "MANAGED_OUTSIDE_TERRAFORM" ]; then
+            echo "::error::${PARAMETER_NAME} (${PARAMETER_REGION}) に Codex auth.json がありません。"
+            exit 1
+          fi
+
+          compact="$(jq -ce 'if type == "object" then . else error("auth.json must be an object") end' \
+            <<< "${auth_json}")"
+          echo "::add-mask::${compact}"
+          while IFS= read -r secret_value; do
+            echo "::add-mask::${secret_value}"
+          done < <(jq -r '.. | strings | select(length > 8)' <<< "${compact}")
+          install -d -m 700 "${RUNNER_TEMP}/codex-home"
+          printf '%s\n' "${compact}" > "${RUNNER_TEMP}/codex-home/auth.json"
+          chmod 600 "${RUNNER_TEMP}/codex-home/auth.json"
+          printf '%s' "${compact}" | shasum -a 256 | awk '{print "digest=" $1}' >> "${GITHUB_OUTPUT}"
+
       # configure-aws-credentials が job 環境へ入れた一時認証情報を、モデルを動かす前に
-      # 消す。Claude が必要なのは上で読んだ OAuth token だけ。
-      - name: Remove AWS credentials from Claude
-        if: ${{ always() && steps.token_source.outputs.claude_from_ssm == 'true' }}
+      # 消す。モデルに要るのは上で読んだ OAuth token / auth.json だけ。
+      - name: Remove AWS credentials before the review
+        if: ${{ always() && steps.token_source.outputs.from_ssm == 'true' }}
         run: |
           {
             echo "AWS_ACCESS_KEY_ID="
@@ -307,20 +381,21 @@ jobs:
             echo "AWS_SESSION_TOKEN="
           } >> "${GITHUB_ENV}"
 
-      # 失敗しても job は止めず、Codex へ進める。利用枠超過・認証切れ・max-turns
-      # 到達などで Claude の実行が落ちた場合が対象。
+      # 失敗しても job は止めず、最後のステップで claude-review を error にする。
+      # 利用枠超過・認証切れ・max-turns 到達などで Claude の実行が落ちた場合が対象。
       #
       # タグモードではツールが Read / Grep / Glob / LS に固定され Bash が無いので、
       # 差分ファイルのあるディレクトリを --add-dir で読めるようにする。
       - name: Review with Claude
         id: claude
-        # 遅延・ハングしたときもフォールバックできるよう、ジョブのタイムアウトより
-        # 先に切る。ジョブごと打ち切られると Codex は起動しない
+        # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らない
         timeout-minutes: ${{ inputs.claude_timeout_minutes }}
         if: >-
           always() &&
+          matrix.reviewer == 'claude' &&
           steps.effort.outcome == 'success' &&
-          (steps.token_source.outputs.claude_from_ssm == 'false' ||
+          (steps.token_source.outputs.from_ssm == 'false' ||
            steps.oauth_token.outcome == 'success')
         continue-on-error: true
         # Opus 5.5 は Claude Code 2.1.280 以上でないと claude_code_version_too_old で
@@ -401,74 +476,6 @@ jobs:
 
             ${{ inputs.extra_instructions }}
 
-      - name: Configure AWS credentials for the Codex fallback
-        id: codex_aws
-        if: >-
-          always() &&
-          steps.effort.outcome == 'success' &&
-          inputs.codex_fallback &&
-          steps.claude.outcome != 'success' &&
-          steps.token_source.outputs.codex_from_ssm == 'true'
-        continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
-        with:
-          role-to-assume: ${{ inputs.aws_role_to_assume }}
-          aws-region: ${{ inputs.aws_region }}
-
-      - name: Prepare Codex authentication
-        id: codex_auth
-        if: >-
-          always() &&
-          steps.effort.outcome == 'success' &&
-          inputs.codex_fallback &&
-          steps.claude.outcome != 'success' &&
-          (steps.token_source.outputs.codex_from_ssm == 'false' || steps.codex_aws.outcome == 'success')
-        continue-on-error: true
-        env:
-          CALLER_AUTH_JSON: ${{ secrets.codex_auth_json }}
-          FROM_SSM: ${{ steps.token_source.outputs.codex_from_ssm }}
-          PARAMETER_NAME: ${{ inputs.codex_auth_parameter }}
-          PARAMETER_REGION: ${{ inputs.aws_region }}
-        run: |
-          set -euo pipefail
-
-          if [ "${FROM_SSM}" = "true" ]; then
-            auth_json="$(aws ssm get-parameter \
-              --name "${PARAMETER_NAME}" \
-              --with-decryption \
-              --query 'Parameter.Value' \
-              --output text)"
-          else
-            auth_json="${CALLER_AUTH_JSON}"
-          fi
-
-          if [ -z "${auth_json}" ] || [ "${auth_json}" = "MANAGED_OUTSIDE_TERRAFORM" ]; then
-            echo "::error::${PARAMETER_NAME} (${PARAMETER_REGION}) に Codex auth.json がありません。"
-            exit 1
-          fi
-
-          compact="$(jq -ce 'if type == "object" then . else error("auth.json must be an object") end' \
-            <<< "${auth_json}")"
-          echo "::add-mask::${compact}"
-          while IFS= read -r secret_value; do
-            echo "::add-mask::${secret_value}"
-          done < <(jq -r '.. | strings | select(length > 8)' <<< "${compact}")
-          install -d -m 700 "${RUNNER_TEMP}/codex-home"
-          printf '%s\n' "${compact}" > "${RUNNER_TEMP}/codex-home/auth.json"
-          chmod 600 "${RUNNER_TEMP}/codex-home/auth.json"
-          printf '%s' "${compact}" | shasum -a 256 | awk '{print "digest=" $1}' >> "${GITHUB_OUTPUT}"
-
-      # configure-aws-credentials が job 環境へ入れた一時認証情報を、モデルを動かす前に
-      # 消す。Codex が必要なのは上で復元した auth.json だけ。
-      - name: Remove AWS credentials from Codex
-        if: ${{ always() && steps.token_source.outputs.codex_from_ssm == 'true' }}
-        run: |
-          {
-            echo "AWS_ACCESS_KEY_ID="
-            echo "AWS_SECRET_ACCESS_KEY="
-            echo "AWS_SESSION_TOKEN="
-          } >> "${GITHUB_ENV}"
-
       - name: Set up Node.js for Codex
         id: codex_node
         if: ${{ always() && steps.codex_auth.outcome == 'success' }}
@@ -486,8 +493,14 @@ jobs:
         continue-on-error: true
         run: npm install --global @openai/codex@0.155.0
 
+      # Claude と同じく、失敗しても job は止めず最後のステップで codex-review を
+      # error にする。Codex は read-only のサンドボックスでシェルを使えるので、
+      # 差分はプロンプトに埋め込み、関連コードは自分で読ませる。
       - name: Review with Codex
         id: codex
+        # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らない
+        timeout-minutes: ${{ inputs.codex_timeout_minutes }}
         if: >-
           always() &&
           steps.codex_auth.outcome == 'success' &&
@@ -496,7 +509,8 @@ jobs:
         continue-on-error: true
         env:
           CODEX_HOME: ${{ runner.temp }}/codex-home
-          CODEX_EFFORT: ${{ inputs.codex_effort }}
+          CODEX_MODEL: ${{ inputs.codex_model }}
+          CODEX_EFFORT: ${{ steps.effort.outputs.effort }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -521,14 +535,12 @@ jobs:
             exec
             --ignore-user-config
             --ephemeral
-            --model gpt-5.6-terra
+            --model "${CODEX_MODEL}"
             --sandbox read-only
             --color never
+            --config "model_reasoning_effort=${CODEX_EFFORT}"
             --output-last-message "${output_file}"
           )
-          if [ -n "${CODEX_EFFORT}" ]; then
-            args+=(--config "model_reasoning_effort=${CODEX_EFFORT}")
-          fi
           review_focus="${REVIEW_FOCUS:-${DEFAULT_REVIEW_FOCUS}}"
 
           {
@@ -624,7 +636,7 @@ jobs:
         if: >-
           always() &&
           steps.codex.outcome != 'skipped' &&
-          steps.token_source.outputs.codex_from_ssm == 'true'
+          steps.token_source.outputs.from_ssm == 'true'
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6
         with:
           role-to-assume: ${{ inputs.aws_role_to_assume }}
@@ -634,7 +646,7 @@ jobs:
         if: >-
           always() &&
           steps.codex.outcome != 'skipped' &&
-          steps.token_source.outputs.codex_from_ssm == 'true'
+          steps.token_source.outputs.from_ssm == 'true'
         env:
           BEFORE_DIGEST: ${{ steps.codex_auth.outputs.digest }}
           PARAMETER_NAME: ${{ inputs.codex_auth_parameter }}
@@ -659,7 +671,7 @@ jobs:
       - name: Remove Codex authentication and AWS credentials
         if: ${{ always() && steps.codex_auth.outcome == 'success' }}
         env:
-          FROM_SSM: ${{ steps.token_source.outputs.codex_from_ssm }}
+          FROM_SSM: ${{ steps.token_source.outputs.from_ssm }}
         run: |
           auth_file="${RUNNER_TEMP}/codex-home/auth.json"
           if [ -f "${auth_file}" ]; then
@@ -674,6 +686,8 @@ jobs:
             } >> "${GITHUB_ENV}"
           fi
 
+      # Claude のコメントと同じ実行 URL を含むので、判定のステップが見分けられるよう
+      # 本文に目印の HTML コメントを入れる。
       - name: Post the Codex review
         if: ${{ always() && steps.codex.outcome == 'success' && steps.codex.outputs.final-message != '' }}
         env:
@@ -681,18 +695,21 @@ jobs:
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
+          REVIEWER: ${{ format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          body="${CODEX_REVIEW}
+          body="<!-- pr-review:codex -->
+          ${CODEX_REVIEW}
 
           ---
-          _Codex · GPT-5.6 Terra (Claude 失敗時のフォールバック) [Workflow run](${RUN_URL})_"
+          _${REVIEWER} [Workflow run](${RUN_URL})_"
           gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
             -f body="${body}" >/dev/null
 
+      # 両方の leg が同じ失敗をするので、コメントは Claude の leg だけが出す
       - name: Report PR diff preparation failure
-        if: ${{ always() && steps.review_diff.outcome != 'success' }}
+        if: ${{ always() && matrix.reviewer == 'claude' && steps.review_diff.outcome != 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -711,14 +728,15 @@ jobs:
 
       # コメントを開かなくても結果が分かるよう、PR のチェック一覧に1行出す。
       #
-      # 判定は Claude またはフォールバックした Codex が投稿したコメント冒頭の
-      # verdict 行から読み取る。両者の出力書式を同じに固定している。
+      # 判定は各 leg のモデルが投稿したコメント冒頭の verdict 行から読み取る。
+      # Claude と Codex の出力書式を同じに固定し、チェックは claude-review /
+      # codex-review に分けて出す。
       #
-      # Claude が落ちた場合、その進捗コメント (エラー表示に書き換わったもの) も
-      # 同じ実行 URL を含む。Codex のコメントはその後に投稿されるので、最後の
-      # 1件を取れば Codex の結果を読む。
+      # 2つの leg のコメントはどちらも同じ実行 URL を含むので、Codex のコメントに
+      # だけ入れた目印の有無で見分ける。Claude が落ちた場合は、その進捗コメント
+      # (エラー表示に書き換わったもの) を拾い、verdict 行が無いので error になる。
       #
-      # 両方の実行が落ちた場合も error として出したいので always()。
+      # モデルの実行が落ちた場合も error として出したいので always()。
       #
       # 指摘なしのときは、コメントを verdict 行だけに書き換える。プロンプトで禁じても
       # モデルは「前回の指摘は修正済み」「追加の指摘はありません」のような確認結果を
@@ -735,8 +753,11 @@ jobs:
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
+          CONTEXT: ${{ matrix.reviewer }}-review
+          IS_CODEX: ${{ matrix.reviewer == 'codex' }}
           REVIEWER: >-
-            ${{ steps.codex.outcome == 'success' && 'Codex · GPT-5.6 Terra (Claude 失敗時のフォールバック)' ||
+            ${{ matrix.reviewer == 'codex' &&
+            format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
             format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort) }}
         run: |
           # 途中で失敗してもチェックだけは必ず出したいので -e は付けない
@@ -750,12 +771,13 @@ jobs:
           elif [ "${EFFORT_OUTCOME}" != "success" ]; then
             description="effort を決められませんでした"
           else
-            # この実行が投稿したコメントだけを拾う (本文に実行URLが入っている)。
-            # --paginate の --jq はページごとに評価されるので、1コメント1行の JSON で
-            # 出して最後の行を取る
+            # この実行でこの leg が投稿したコメントだけを拾う (本文に実行URLが入って
+            # いて、目印の有無が leg と一致する)。--paginate の --jq はページごとに
+            # 評価されるので、1コメント1行の JSON で出して最後の行を取る
             comment=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
               --jq ".[] | select(.user.login == \"github-actions[bot]\")
                         | select(.body | contains(\"/actions/runs/${RUN_ID}\"))
+                        | select((.body | contains(\"<!-- pr-review:codex -->\")) == ${IS_CODEX})
                         | {id, body} | @json" 2>/dev/null | tail -n 1) || comment=""
             comment_id=$(jq -r '.id // empty' <<< "$comment" 2>/dev/null) || comment_id=""
             body=$(jq -r '.body // empty' <<< "$comment" 2>/dev/null) || body=""
@@ -784,7 +806,12 @@ jobs:
                 # 「指摘なし」になるのは verdict が指摘なしのときだけ
                 # (指摘ありは findings_state に関わらず「指摘 N件」になる)
                 if [ "${description}" = "指摘なし" ] && [ -n "${comment_id}" ]; then
-                  clean_body="**✅ 指摘なし**
+                  marker=""
+                  if [ "${IS_CODEX}" = "true" ]; then
+                    marker="<!-- pr-review:codex -->
+          "
+                  fi
+                  clean_body="${marker}**✅ 指摘なし**
 
           ---
           _${REVIEWER} [Workflow run](${RUN_URL})_"
@@ -800,14 +827,14 @@ jobs:
             fi
           fi
 
-          echo "claude-review: ${state} / ${description}"
+          echo "${CONTEXT}: ${state} / ${description}"
           gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
             -f state="${state}" \
-            -f context="claude-review" \
+            -f context="${CONTEXT}" \
             -f description="${description}" \
             -f target_url="${RUN_URL}" >/dev/null
 
-          # Claude の失敗を continue-on-error にして Codex へ進めているため、両方が
+          # モデルの実行を continue-on-error にしているため、レビューが
           # 完了しなかった場合はここで job 自体も失敗させる。
           if [ "${state}" = "error" ]; then
             exit 1

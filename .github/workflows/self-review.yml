@@ -23,7 +23,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  # claude-review チェックを PR のチェック一覧に出すため
+  # claude-review / codex-review チェックを PR のチェック一覧に出すため
   statuses: write
   # Claude/Codex の認証情報を SSM から読むための OIDC トークン発行
   id-token: write
@@ -51,8 +51,11 @@ jobs:
           `if` が効いたままか
         - トークンやパラメータの値がログや `GITHUB_OUTPUT` 経由で漏れないか
           (`add-mask` の漏れ、`set -x` の混入)
-        - Claude 成功時に Codex の auth.json を読んでいないか。各モデルの実行前に
-          AWS の一時認証情報を消し、Codex refresh 後だけ auth.json を SSM へ戻しているか
+        - 各 leg が自分のモデルの認証情報だけを読んでいるか (Claude の leg で Codex の
+          auth.json を読んでいないか、その逆も)。各モデルの実行前に AWS の一時認証情報を
+          消し、Codex refresh 後だけ auth.json を SSM へ戻しているか
+        - Claude と Codex のコメントを判定ステップが取り違えないか (目印の有無と leg の
+          対応)。claude-review / codex-review が leg ごとに1つずつ出るか
         - effort を決める変更行数の数え方と閾値の比較が、README の説明と一致しているか
         - 呼び出され側のプロンプトが出力させる verdict 行の書式と、それを読む
           チェック出力ステップの正規表現が食い違っていないか
