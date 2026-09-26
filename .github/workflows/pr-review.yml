@@ -109,6 +109,12 @@ on:
         type: boolean
         required: false
         default: true
+      # 未定義の入力を渡すと呼び出し側が startup_failure になるので、v1 の間は残す
+      codex_fallback:
+        description: "廃止。codex_review を使う。false を渡すと codex_review: false と同じく Codex を止める"
+        type: boolean
+        required: false
+        default: true
       codex_model:
         description: "Codex のレビューに使う OpenAI モデル"
         type: string
@@ -178,7 +184,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        reviewer: ${{ fromJSON(inputs.codex_review && '["claude","codex"]' || '["claude"]') }}
+        reviewer: >-
+          ${{ fromJSON(inputs.codex_review && inputs.codex_fallback && '["claude","codex"]' || '["claude"]') }}
     name: ${{ matrix.reviewer }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
@@ -687,7 +694,8 @@ jobs:
           fi
 
       # Claude のコメントと同じ実行 URL を含むので、判定のステップが見分けられるよう
-      # 本文に目印の HTML コメントを入れる。
+      # 本文の先頭に目印の HTML コメントを入れる。判定は先頭一致で見るので、
+      # 前に何か足すと Claude のコメントとして扱われる。
       - name: Post the Codex review
         if: ${{ always() && steps.codex.outcome == 'success' && steps.codex.outputs.final-message != '' }}
         env:
@@ -732,8 +740,8 @@ jobs:
       # Claude と Codex の出力書式を同じに固定し、チェックは claude-review /
       # codex-review に分けて出す。
       #
-      # 2つの leg のコメントはどちらも同じ実行 URL を含むので、Codex のコメントに
-      # だけ入れた目印の有無で見分ける。Claude が落ちた場合は、その進捗コメント
+      # 2つの leg のコメントはどちらも同じ実行 URL を含むので、Codex のコメントの
+      # 先頭にだけ入れた目印の有無で見分ける。Claude が落ちた場合は、その進捗コメント
       # (エラー表示に書き換わったもの) を拾い、verdict 行が無いので error になる。
       #
       # モデルの実行が落ちた場合も error として出したいので always()。
@@ -772,12 +780,13 @@ jobs:
             description="effort を決められませんでした"
           else
             # この実行でこの leg が投稿したコメントだけを拾う (本文に実行URLが入って
-            # いて、目印の有無が leg と一致する)。--paginate の --jq はページごとに
+            # いて、目印の有無が leg と一致する)。目印は先頭だけを見る。Claude が
+            # 指摘の中で目印の文字列を引用しても Codex 扱いにしないため。--paginate の --jq はページごとに
             # 評価されるので、1コメント1行の JSON で出して最後の行を取る
             comment=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
               --jq ".[] | select(.user.login == \"github-actions[bot]\")
                         | select(.body | contains(\"/actions/runs/${RUN_ID}\"))
-                        | select((.body | contains(\"<!-- pr-review:codex -->\")) == ${IS_CODEX})
+                        | select((.body | startswith(\"<!-- pr-review:codex -->\")) == ${IS_CODEX})
                         | {id, body} | @json" 2>/dev/null | tail -n 1) || comment=""
             comment_id=$(jq -r '.id // empty' <<< "$comment" 2>/dev/null) || comment_id=""
             body=$(jq -r '.body // empty' <<< "$comment" 2>/dev/null) || body=""

@@ -184,7 +184,8 @@ Codex は GPT-6 Astra・read-only サンドボックスで差分と関連コー�
 `github-actions[bot]` の PR コメントとして投稿する。コメント末尾に workflow run URL を
 付ける。Claude と同じ verdict 書式で投稿するので、判定の読み取りは共通。どちらの
 コメントも同じ run URL を含むため、Codex のコメントには目印の HTML コメント
-(`<!-- pr-review:codex -->`) を入れて見分けている。
+(`<!-- pr-review:codex -->`) を先頭に入れ、先頭一致で見分けている。Claude が指摘の
+中でこの文字列を引用しても取り違えない。
 
 Codex を止めて Claude だけにしたい場合は `codex_review: false` にする。
 
@@ -316,6 +317,7 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | `aws_region` | string | `ap-northeast-1` | パラメータのあるリージョン |
 | `oauth_token_parameter` | string | `/pr-review/oauth-token` | トークンを入れた SSM パラメータ名 |
 | `codex_review` | boolean | `true` | Claude と並べて Codex でもレビューするか |
+| `codex_fallback` | boolean | `true` | 廃止。`false` を渡すと `codex_review: false` と同じ。v1 の呼び出し側を壊さないために残してある |
 | `codex_model` | string | `gpt-6-astra` | Codex のレビューに使う OpenAI モデル |
 | `codex_effort` | string | `""` | Codex の reasoning effort。空文字なら `effort` と同じ決め方 |
 | `codex_timeout_minutes` | number | `20` | Codex のステップのタイムアウト。超えたら `codex-review` を error にする |
