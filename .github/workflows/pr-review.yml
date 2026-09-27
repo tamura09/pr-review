@@ -498,7 +498,14 @@ jobs:
           steps.codex_auth.outcome == 'success' &&
           steps.codex_node.outcome == 'success'
         continue-on-error: true
-        run: npm install --global @openai/codex@0.155.0
+        # PATH に bwrap が無いと Codex は同梱の bwrap でサンドボックスを作るが、
+        # ubuntu-24.04 ではそれが `bwrap: loopback: Failed RTM_NEWADDR:
+        # Operation not permitted` で失敗し、シェルコマンドが1つも動かない。
+        # Codex の案内どおり OS のパッケージを入れて、そちらを使わせる
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          npm install --global @openai/codex@0.155.0
 
       # Claude と同じく、失敗しても job は止めず最後のステップで codex-review を
       # error にする。Codex は read-only のサンドボックスでシェルを使えるので、
