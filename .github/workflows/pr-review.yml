@@ -498,13 +498,26 @@ jobs:
           steps.codex_auth.outcome == 'success' &&
           steps.codex_node.outcome == 'success'
         continue-on-error: true
-        # PATH に bwrap が無いと Codex は同梱の bwrap でサンドボックスを作るが、
-        # ubuntu-24.04 ではそれが `bwrap: loopback: Failed RTM_NEWADDR:
-        # Operation not permitted` で失敗し、シェルコマンドが1つも動かない。
-        # Codex の案内どおり OS のパッケージを入れて、そちらを使わせる
+        # ubuntu-24.04 は AppArmor で非特権ユーザー名前空間の権限を落とすため、
+        # Codex の read-only サンドボックス (bwrap) が `bwrap: loopback: Failed
+        # RTM_NEWADDR: Operation not permitted` で失敗し、シェルコマンドが1つも
+        # 動かない。Codex は差分しか読めないままレビューを返す。
+        # OS の bubblewrap を入れて (PATH に無いと Codex は同梱の bwrap を使う)、
+        # その /usr/bin/bwrap にだけ userns を許すプロファイルを読み込む。
+        # ランナー全体の制限 (kernel.apparmor_restrict_unprivileged_userns) は
+        # 外さない
         run: |
           sudo apt-get update --quiet
           sudo apt-get install --yes --no-install-recommends bubblewrap
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          sudo apparmor_parser --replace /etc/apparmor.d/bwrap
           npm install --global @openai/codex@0.155.0
 
       # Claude と同じく、失敗しても job は止めず最後のステップで codex-review を
