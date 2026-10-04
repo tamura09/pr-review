@@ -155,6 +155,10 @@ jobs:
 
 `codex_auth_json` を GitHub secret から渡した場合、workflow は secret を更新できない。
 OAuth の refresh 後は手動更新が必要になるため、SSM 経由を推奨する。
+secret に入れる場合も、手元の `~/.codex/auth.json` ではなく
+[1. の手順](#1-codex-oauth-認証を-ssm-に入れる) (`CODEX_HOME` を一時ディレクトリにして
+`codex login`) で作った CI 専用セッションの `auth.json` を使う。CI が refresh すると、
+同じセッションを使う手元の refresh token が使用済みになる点は SSM 経由と同じ。
 
 ## effort の決め方
 
@@ -334,7 +338,7 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | 名前 | 必須 | 説明 |
 | --- | --- | --- |
 | `claude_code_oauth_token` | | `claude setup-token` で発行したトークン。省略すると SSM から読む |
-| `codex_auth_json` | | `codex login` が生成した `auth.json`。省略すると SSM から読む |
+| `codex_auth_json` | | [1. の手順](#1-codex-oauth-認証を-ssm-に入れる) (`CODEX_HOME` を一時ディレクトリにして `codex login`) で作った CI 専用セッションの `auth.json`。手元の `~/.codex/auth.json` は使わない。省略すると SSM から読む |
 
 ## コードへの書き込み権限を渡していない
 

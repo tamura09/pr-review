@@ -148,6 +148,8 @@ on:
       codex_auth_json:
         description: >-
           codex login が生成した auth.json の内容。
+          手元の ~/.codex/auth.json ではなく、README の 1. の手順
+          (CODEX_HOME を一時ディレクトリにして codex login) で作った CI 専用セッションを使う。
           省略すると SSM から読む (aws_role_to_assume / codex_auth_parameter)
         required: false
 
