@@ -407,7 +407,7 @@ jobs:
         continue-on-error: true
         # Opus 5.5 は Claude Code 2.1.280 以上でないと claude_code_version_too_old で
         # 起動直後に落ちる。v1.0.232 は 2.1.280 を入れる (v1.0.231 は 2.1.278)。
-        uses: anthropics/claude-code-action@46a42b43239748e5b25771606bf1f551c3b1b517 # v1.0.232
+        uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
         with:
           claude_code_oauth_token: ${{ secrets.claude_code_oauth_token || steps.oauth_token.outputs.token }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
