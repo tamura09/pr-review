@@ -43,21 +43,27 @@ reusable workflow は呼び出され側 (このリポジトリ) の secret を�
 
 ### 1. Codex OAuth 認証を SSM に入れる
 
-Codex のレビューに要る (`codex_review: false` なら不要)。ローカルで `codex login` を実行する。既に Codex CLI や Codex app へ ChatGPT で
-ログイン済みなら、その認証を使える。
+Codex のレビューに要る (`codex_review: false` なら不要)。CI 専用のセッションを
+一時ディレクトリでログインして作り、その `auth.json` を SSM に入れる。
 
 ```bash
-codex login
+export CODEX_TMP="$(mktemp -d)"
+CODEX_HOME="$CODEX_TMP" codex login
 
 aws ssm put-parameter --region ap-northeast-1 \
   --name /pr-review/codex-auth-json \
   --type SecureString --tier Advanced --overwrite \
-  --value file:///absolute/path/to/.codex/auth.json
+  --value "file://$CODEX_TMP/auth.json"
+
+rm -rf "$CODEX_TMP"
 ```
 
-通常は `~/.codex/auth.json` にある。`file://` を使うと内容をコマンドライン引数や
-シェル履歴に載せず投入できる。GitHub Actions は Codex 実行後、refresh された
-`auth.json` を同じ SSM パラメータへ保存する。
+**手元の `~/.codex/auth.json` をそのまま入れない。** refresh token は1回しか使えず、
+GitHub Actions は Codex 実行後に refresh された `auth.json` を同じ SSM パラメータへ
+保存する。手元と同じセッションを入れると、CI が refresh した時点で手元の refresh token
+は使用済みになる。手元の Codex CLI / Codex app がその古い token で refresh すると
+`refresh_token_reused` で拒否され、セッションごと失効して CI 側も止まる。
+`file://` を使うと内容をコマンドライン引数やシェル履歴に載せず投入できる。
 
 [公式 OpenAI ドキュメント](https://developers.openai.com/ja-JP/docs/non-interactive-mode) では、
 CI で ChatGPT 管理認証を使う場合は `auth.json` を安全なストレージから復元し、実行後の
@@ -149,6 +155,10 @@ jobs:
 
 `codex_auth_json` を GitHub secret から渡した場合、workflow は secret を更新できない。
 OAuth の refresh 後は手動更新が必要になるため、SSM 経由を推奨する。
+secret に入れる場合も、手元の `~/.codex/auth.json` ではなく
+[1. の手順](#1-codex-oauth-認証を-ssm-に入れる) (`CODEX_HOME` を一時ディレクトリにして
+`codex login`) で作った CI 専用セッションの `auth.json` を使う。CI が refresh すると、
+同じセッションを使う手元の refresh token が使用済みになる点は SSM 経由と同じ。
 
 ## effort の決め方
 
@@ -328,7 +338,7 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | 名前 | 必須 | 説明 |
 | --- | --- | --- |
 | `claude_code_oauth_token` | | `claude setup-token` で発行したトークン。省略すると SSM から読む |
-| `codex_auth_json` | | `codex login` が生成した `auth.json`。省略すると SSM から読む |
+| `codex_auth_json` | | [1. の手順](#1-codex-oauth-認証を-ssm-に入れる) (`CODEX_HOME` を一時ディレクトリにして `codex login`) で作った CI 専用セッションの `auth.json`。手元の `~/.codex/auth.json` は使わない。省略すると SSM から読む |
 
 ## コードへの書き込み権限を渡していない
 
@@ -394,13 +404,14 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
   する)。effort を行数で変えているのはこのため。`with: model:` は Claude のモデル
   だけを変える。Codex のモデルは `codex_model` で変える。
 - **Codex OAuth 認証も失効しうる。** 通常の refresh は workflow が SSM へ保存する。
-  refresh 自体が拒否された場合は `codex login` をやり直し、
+  refresh 自体が拒否された場合 (ログに `refresh_token_reused` など) は、
+  [1. の手順](#1-codex-oauth-認証を-ssm-に入れる) で CI 専用のセッションを作り直し、
   `/pr-review/codex-auth-json` を上書きする。それまで `codex-review` は error になる。
 - **Codex の refresh は複数リポジトリの実行が重なると競合しうる。** 全 PR で Codex が
   走るので、同じ `auth.json` を読んだ実行が同時に refresh する機会がフォールバック
   だった頃より増えた。`concurrency` はリポジトリをまたげないので直列化できない。
   負けた側の `codex-review` が認証エラーになったら、再実行すれば SSM の新しい方を読む。
-  それでも通らなければ `codex login` からやり直す。
+  それでも通らなければ 1. の手順で CI 専用のセッションを作り直す。
 - **トークンは失効する。** 失効するとワークフローが認証エラーで落ちるので、
   `claude setup-token` で再発行して SSM パラメータを上書きする。更新するのは
   1箇所だけで、利用しているリポジトリの数には依らない。

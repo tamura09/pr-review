@@ -148,6 +148,8 @@ on:
       codex_auth_json:
         description: >-
           codex login が生成した auth.json の内容。
+          手元の ~/.codex/auth.json ではなく、README の 1. の手順
+          (CODEX_HOME を一時ディレクトリにして codex login) で作った CI 専用セッションを使う。
           省略すると SSM から読む (aws_role_to_assume / codex_auth_parameter)
         required: false
 
@@ -375,7 +377,11 @@ jobs:
           install -d -m 700 "${RUNNER_TEMP}/codex-home"
           printf '%s\n' "${compact}" > "${RUNNER_TEMP}/codex-home/auth.json"
           chmod 600 "${RUNNER_TEMP}/codex-home/auth.json"
-          printf '%s' "${compact}" | shasum -a 256 | awk '{print "digest=" $1}' >> "${GITHUB_OUTPUT}"
+          # Persist ステップが refresh の有無を見分けるため、refresh token の
+          # digest だけを残す。auth.json 全体だと、refresh に失敗した実行でも
+          # Codex が書き直した分だけ digest が変わる
+          jq -j '.tokens.refresh_token // ""' <<< "${compact}" | shasum -a 256 \
+            | awk '{print "refresh-token-digest=" $1}' >> "${GITHUB_OUTPUT}"
 
       # configure-aws-credentials が job 環境へ入れた一時認証情報を、モデルを動かす前に
       # 消す。モデルに要るのは上で読んだ OAuth token / auth.json だけ。
@@ -675,13 +681,13 @@ jobs:
           steps.codex.outcome != 'skipped' &&
           steps.token_source.outputs.from_ssm == 'true'
         env:
-          BEFORE_DIGEST: ${{ steps.codex_auth.outputs.digest }}
+          BEFORE_DIGEST: ${{ steps.codex_auth.outputs.refresh-token-digest }}
           PARAMETER_NAME: ${{ inputs.codex_auth_parameter }}
         run: |
           set -euo pipefail
           auth_file="${RUNNER_TEMP}/codex-home/auth.json"
           test -s "${auth_file}"
-          after_digest="$(shasum -a 256 "${auth_file}" | awk '{print $1}')"
+          after_digest="$(jq -j '.tokens.refresh_token // ""' "${auth_file}" | shasum -a 256 | awk '{print $1}')"
 
           if [ "${after_digest}" != "${BEFORE_DIGEST}" ]; then
             aws ssm put-parameter \
