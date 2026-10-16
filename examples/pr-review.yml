@@ -34,7 +34,7 @@ jobs:
     uses: tamura09/pr-review/.github/workflows/pr-review.yml@v1
     # 必要に応じて上書きする
     # with:
-    #   effort: high  # Claude の effort を変更行数に関係なく固定したい場合 (Codex は codex_effort。既定 high)
+    #   effort: high  # 変更行数に関係なく固定したい場合
     #   findings_state: success  # 指摘があっても PR を赤くしたくない場合
     #   codex_review: false  # Codex を使わず Claude だけでレビューする場合
     #   extra_instructions: |

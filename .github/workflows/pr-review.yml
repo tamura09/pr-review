@@ -31,9 +31,9 @@ on:
         default: "claude-opus-5-5"
       effort:
         description: >-
-          Claude の effort (low / medium / high / xhigh / max)。
+          Claude と Codex の effort (low / medium / high / xhigh / max)。
           空文字にすると PR の変更行数から small_pr_max_lines / large_pr_min_lines で決める。
-          Codex は codex_effort (既定 high) を使い、codex_effort が空文字のときだけこれに従う
+          Codex だけ変えたい場合は codex_effort を使う
         type: string
         required: false
         default: ""
@@ -126,7 +126,7 @@ on:
           空文字にすると effort と同じ決め方をする
         type: string
         required: false
-        default: "high"
+        default: ""
       codex_timeout_minutes:
         description: >-
           Codex のステップのタイムアウト (分)。超えたら codex-review を error にする。
