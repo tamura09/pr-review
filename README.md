@@ -1,7 +1,7 @@
 # pr-review
 
 Claude (既定は Opus 5.5) と
-[Codex の GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
+[Codex の GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
 の2つに、同じ PR を並列でレビューさせる再利用可能ワークフロー。それぞれが別の
 コメントを投稿し、別のチェック (`claude-review` / `codex-review`) を出す。
 **レビューを投稿するだけで、マージも承認もしない。** 判断は人間がする。
@@ -163,7 +163,7 @@ secret に入れる場合も、手元の `~/.codex/auth.json` ではなく
 ## effort の決め方
 
 ベースブランチとの差分の変更行数 (追加 + 削除) で effort を決める。Claude と
-GPT-6 Astra は effort の段階名 (`low`〜`max`) が同じなので、両方に同じ値を渡す。
+GPT-6.1 Sol は effort の段階名 (`low`〜`max`) が同じなので、両方に同じ値を渡す。
 
 | 変更行数 | effort |
 | --- | --- |
@@ -190,7 +190,7 @@ SSM から読まない。
 Claude は `track_progress` 付きで動き、進捗コメントを最終的なレビューに書き換える。
 失敗した場合、そのコメントはエラー表示のまま残る。
 
-Codex は GPT-6 Astra・read-only サンドボックスで差分と関連コードを読み、最終回答を
+Codex は GPT-6.1 Sol・read-only サンドボックスで差分と関連コードを読み、最終回答を
 `github-actions[bot]` の PR コメントとして投稿する。コメント末尾に workflow run URL を
 付ける。Claude と同じ verdict 書式で投稿するので、判定の読み取りは共通。どちらの
 コメントも同じ run URL を含むため、Codex のコメントには目印の HTML コメント
@@ -328,7 +328,7 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | `oauth_token_parameter` | string | `/pr-review/oauth-token` | トークンを入れた SSM パラメータ名 |
 | `codex_review` | boolean | `true` | Claude と並べて Codex でもレビューするか |
 | `codex_fallback` | boolean | `true` | 廃止。`false` を渡すと `codex_review: false` と同じ。v1 の呼び出し側を壊さないために残してある |
-| `codex_model` | string | `gpt-6-astra` | Codex のレビューに使う OpenAI モデル |
+| `codex_model` | string | `gpt-6.1-sol` | Codex のレビューに使う OpenAI モデル |
 | `codex_effort` | string | `""` | Codex の reasoning effort。空文字なら `effort` と同じ決め方 |
 | `codex_timeout_minutes` | number | `20` | Codex のステップのタイムアウト。超えたら `codex-review` を error にする |
 | `codex_auth_parameter` | string | `/pr-review/codex-auth-json` | Codex `auth.json` を入れた SSM パラメータ名 |
