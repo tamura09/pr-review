@@ -86,7 +86,7 @@ on:
         description: "実行するランナー"
         type: string
         required: false
-        default: "ubuntu-latest"
+        default: "ubuntu-26.04-arm"
       aws_role_to_assume:
         description: >-
           Claude/Codex の認証情報を SSM から読むために OIDC で引く IAM ロール。
