@@ -86,7 +86,7 @@ on:
         description: "実行するランナー"
         type: string
         required: false
-        default: "ubuntu-latest"
+        default: "ubuntu-26.04-arm"
       aws_role_to_assume:
         description: >-
           Claude/Codex の認証情報を SSM から読むために OIDC で引く IAM ロール。
@@ -516,10 +516,11 @@ jobs:
           steps.codex_auth.outcome == 'success' &&
           steps.codex_node.outcome == 'success'
         continue-on-error: true
-        # ubuntu-24.04 は AppArmor で非特権ユーザー名前空間の権限を落とすため、
-        # Codex の read-only サンドボックス (bwrap) が `bwrap: loopback: Failed
-        # RTM_NEWADDR: Operation not permitted` で失敗し、シェルコマンドが1つも
-        # 動かない。Codex は差分しか読めないままレビューを返す。
+        # ubuntu-24.04 以降 (既定の ubuntu-26.04-arm も) は AppArmor で非特権
+        # ユーザー名前空間の権限を落とすため、Codex の read-only サンドボックス
+        # (bwrap) が `bwrap: loopback: Failed RTM_NEWADDR: Operation not
+        # permitted` で失敗し、シェルコマンドが1つも動かない。Codex は差分しか
+        # 読めないままレビューを返す。
         # OS の bubblewrap を入れて (PATH に無いと Codex は同梱の bwrap を使う)、
         # その /usr/bin/bwrap にだけ userns を許すプロファイルを読み込む。
         # ランナー全体の制限 (kernel.apparmor_restrict_unprivileged_userns) は

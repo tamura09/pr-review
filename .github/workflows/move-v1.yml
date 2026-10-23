@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   move:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04-arm
     steps:
       # push イベントの github.sha ではなく、実行時点の main の先頭を読む。
       # 直列化していても、先にマージされた側の実行が後になった場合に

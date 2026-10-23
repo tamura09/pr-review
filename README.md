@@ -322,7 +322,7 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | `skip_authors` | string | `dependabot[bot],renovate[bot],tamura09-renovate[bot]` | レビューをスキップする作成者。カンマ区切り |
 | `skip_draft` | boolean | `true` | draft の PR をスキップするか |
 | `findings_state` | string | `failure` | 指摘があったときの `claude-review` / `codex-review` チェックの状態。`success` にすると常に緑 |
-| `runs_on` | string | `ubuntu-latest` | 実行するランナー |
+| `runs_on` | string | `ubuntu-26.04-arm` | 実行するランナー |
 | `aws_role_to_assume` | string | `arn:aws:iam::222165754930:role/github-actions-pr-review` | トークンを読むために OIDC で引くロール |
 | `aws_region` | string | `ap-northeast-1` | パラメータのあるリージョン |
 | `oauth_token_parameter` | string | `/pr-review/oauth-token` | トークンを入れた SSM パラメータ名 |
