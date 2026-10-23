@@ -519,7 +519,8 @@ jobs:
         # ubuntu-24.04 以降 (既定の ubuntu-26.04-arm も) は AppArmor で非特権
         # ユーザー名前空間の権限を落とすため、Codex の read-only サンドボックス
         # (bwrap) が `bwrap: loopback: Failed RTM_NEWADDR: Operation not
-        # permitted` で失敗し、シェルコマンドが1つも動かない。Codex は差分しか読めないままレビューを返す。
+        # permitted` で失敗し、シェルコマンドが1つも動かない。Codex は差分しか
+        # 読めないままレビューを返す。
         # OS の bubblewrap を入れて (PATH に無いと Codex は同梱の bwrap を使う)、
         # その /usr/bin/bwrap にだけ userns を許すプロファイルを読み込む。
         # ランナー全体の制限 (kernel.apparmor_restrict_unprivileged_userns) は
