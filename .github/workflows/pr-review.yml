@@ -78,11 +78,11 @@ on:
       findings_state:
         description: >-
           指摘があったときに claude-review / codex-review チェックに付ける状態。
-          既定は success。マージの可否はスレッドの解決必須設定で制御する。
-          failure にすると、スレッドを解決してもチェックは失敗のままになる
+          既定は failure。指摘があれば赤になり、スレッドを解決しても失敗のままになる。
+          success にすると、指摘があってもチェックは緑になる
         type: string
         required: false
-        default: "success"
+        default: "failure"
       runs_on:
         description: "実行するランナー"
         type: string

@@ -292,7 +292,7 @@ PR のチェック一覧にも `claude-review` と `codex-review` を出す。
 | 状態 | 表示 |
 | --- | --- |
 | 指摘なし | ✅ `claude-review — 指摘なし` |
-| 指摘あり | ✅ `claude-review — 指摘 3件: <最も重いものの要約>` |
+| 指摘あり | ❌ `claude-review — 指摘 3件: <最も重いものの要約>` |
 | レビュー失敗 | ❌ `claude-review — レビュー結果の取得・スレッド投稿に失敗しました` |
 
 2つのモデルの指摘は突き合わせない。片方だけが挙げた指摘も、そのまま人間が読む。
@@ -302,7 +302,7 @@ PR のチェック一覧にも `claude-review` と `codex-review` を出す。
 
 モデルの失敗、JSON の形式不正、差分に付けられない行番号、API の投稿失敗は
 `error` とし、ジョブも失敗させる。通常コメントへのフォールバックは行わない。
-全指摘のスレッドとサマリーの投稿が完了してから成功チェックを出す。
+全指摘のスレッドとサマリーの投稿が完了してから件数付きのチェックを出す。
 
 ### 未解決スレッドがある間はマージを禁止する
 
@@ -321,11 +321,10 @@ PR のチェック一覧にも `claude-review` と `codex-review` を出す。
 管理者や bypass 権限にも制限を適用するかは、ブランチ保護・Ruleset 側で設定する。
 ワークフロー自体はリポジトリの保護設定を変更しない。
 
-`findings_state` の既定値は `success`。チェックはレビューの完了を表し、マージの可否は
-未解決スレッドで制御する。以前の既定値 `failure` からの変更になる。
-`findings_state: failure` を明示した場合は従来どおり赤になるが、スレッドを解決しても
-コミットのチェック状態は変わらない。解決によってマージ可能にしたい場合は、
-`success` を使う。
+`findings_state` の既定値は従来どおり `failure`。指摘があればチェックは赤になり、
+スレッドを解決してもコミットのチェック状態は変わらない。このチェックを必須にしている
+場合、スレッド解決だけではマージできず、指摘がなくなるまで修正・再レビューが必要になる。
+指摘があってもチェックを緑にしたい場合は `findings_state: success` を指定する。
 
 判定用のファイルを Claude に書かせる方式は取れない。`track_progress` を使うと
 タグモードになり、ツールが明示的な allowlist (`Read` / `Grep` / `Glob` / `LS` と
@@ -347,7 +346,7 @@ PR のチェック一覧にも `claude-review` と `codex-review` を出す。
 | `claude_timeout_minutes` | number | `20` | Claude のステップのタイムアウト。超えたら `claude-review` を error にする |
 | `skip_authors` | string | `dependabot[bot],renovate[bot],tamura09-renovate[bot]` | レビューをスキップする作成者。カンマ区切り |
 | `skip_draft` | boolean | `true` | draft の PR をスキップするか |
-| `findings_state` | string | `success` | 指摘があったときのチェック状態。マージ制御にはスレッド解決必須を使う。`failure` にするとスレッドを解決しても赤のまま |
+| `findings_state` | string | `failure` | 指摘があったときのチェック状態。スレッドを解決しても赤のまま。`success` にすると指摘があっても緑 |
 | `runs_on` | string | `ubuntu-26.04-arm` | 実行するランナー |
 | `aws_role_to_assume` | string | `arn:aws:iam::222165754930:role/github-actions-pr-review` | トークンを読むために OIDC で引くロール |
 | `aws_region` | string | `ap-northeast-1` | パラメータのあるリージョン |

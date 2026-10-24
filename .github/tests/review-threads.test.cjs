@@ -6,6 +6,7 @@ const { test } = require('node:test');
 // Execute the actual inline publisher. Reusable workflows check out the caller's
 // repository, so the publisher cannot import a script from this repository.
 const workflow = readFileSync(join(__dirname, '../workflows/pr-review.yml'), 'utf8');
+const defaultFindingsState = workflow.match(/      findings_state:\n[\s\S]*?        default: "([^"]+)"/)[1];
 const script = workflow.split('          script: |\n').at(-1)
   .split('\n').map(line => line.replace(/^ {12}/, '')).join('\n');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
@@ -26,7 +27,7 @@ async function run(options = {}) {
   const failures = [];
   const errors = [];
   const env = {
-    SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: 'success',
+    SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
     REVIEWER: isCodex ? 'Codex · test-model · effort medium' : 'Claude · test-model · effort medium',
     IS_CODEX: String(isCodex), REVIEW_DIFF_OUTCOME: 'success',
     EFFORT_OUTCOME: 'success', MODEL_OUTCOME: 'success', CODEX_REVIEW: raw,
@@ -83,7 +84,7 @@ for (const isCodex of [false, true]) {
     assert.ok(!output.summary.body.includes('入力が 0'));
     assert.ok(!output.summary.body.includes('```json'));
     assert.equal(output.summary.body.startsWith('<!-- pr-review:codex -->'), isCodex);
-    assert.equal(output.status.state, 'success');
+    assert.equal(output.status.state, 'failure');
     assert.equal(output.status.context, isCodex ? 'codex-review' : 'claude-review');
     assert.equal(output.status.sha, 'reviewed-head');
     assert.match(output.status.description, /^指摘 2件/);
@@ -117,7 +118,7 @@ test('Claude uses only its own bot comment from this run', async () => {
     ],
   });
   assert.equal(output.summary.comment_id, 2);
-  assert.equal(output.status.state, 'success');
+  assert.equal(output.status.state, 'failure');
 });
 
 for (const [name, raw] of [
@@ -168,10 +169,10 @@ for (const fail of ['createReview', 'createComment', 'updateComment']) {
   });
 }
 
-test('explicit legacy failure state still publishes threads and a red status', async () => {
-  const output = await run({ env: { FINDINGS_STATE: 'failure' } });
+test('explicit success state still publishes threads and a green status', async () => {
+  const output = await run({ env: { FINDINGS_STATE: 'success' } });
   assert.equal(output.review.comments.length, 1);
-  assert.equal(output.status.state, 'failure');
+  assert.equal(output.status.state, 'success');
   assert.equal(output.failures.length, 0);
 });
 
