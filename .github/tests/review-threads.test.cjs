@@ -48,6 +48,7 @@ async function run(options = {}) {
       issues: {
         listComments: () => {},
         createComment: api('createComment'), updateComment: api('updateComment'),
+        deleteComment: api('deleteComment'),
       },
       repos: { createCommitStatus: api('createCommitStatus') },
     },
@@ -58,14 +59,14 @@ async function run(options = {}) {
   return {
     calls, failures, errors,
     review: calls.find(call => call.method === 'createReview')?.params,
-    summary: calls.find(call => ['createComment', 'updateComment'].includes(call.method))?.params,
+    summary: calls.find(call => ['createReview', 'createComment', 'updateComment'].includes(call.method))?.params,
     status: calls.find(call => call.method === 'createCommitStatus')?.params,
   };
 }
 
 for (const isCodex of [false, true]) {
   const reviewer = isCodex ? 'Codex' : 'Claude';
-  test(`${reviewer}: one resolvable thread per finding, then a count-only summary`, async () => {
+  test(`${reviewer}: one summary review with one resolvable thread per finding`, async () => {
     const findings = [finding, { ...finding, line: 9, side: 'LEFT', body: '**削除による不具合**\n既存の呼び出しが失敗します。' }];
     const output = await run({ isCodex, result: { summary: '境界値で失敗する', findings } });
     assert.equal(output.failures.length, 0);
@@ -80,7 +81,6 @@ for (const isCodex of [false, true]) {
       assert.ok(output.review.comments[index].body.includes(reviewer));
     }
     assert.ok(output.summary.body.includes('**⚠️ 指摘 2件** — 境界値で失敗する'));
-    assert.ok(output.summary.body.includes('#pullrequestreview-88'));
     assert.ok(!output.summary.body.includes('入力が 0'));
     assert.ok(!output.summary.body.includes('```json'));
     assert.equal(output.summary.body.startsWith('<!-- pr-review:codex -->'), isCodex);
@@ -88,9 +88,9 @@ for (const isCodex of [false, true]) {
     assert.equal(output.status.context, isCodex ? 'codex-review' : 'claude-review');
     assert.equal(output.status.sha, 'reviewed-head');
     assert.match(output.status.description, /^指摘 2件/);
-    assert.deepEqual(output.calls.slice(-3).map(call => call.method), [
-      'createReview', isCodex ? 'createComment' : 'updateComment', 'createCommitStatus',
-    ]);
+    assert.equal(output.calls.filter(call => ['createComment', 'updateComment'].includes(call.method)).length, 0);
+    assert.deepEqual(output.calls.filter(call => call.method !== 'listComments').map(call => call.method),
+      isCodex ? ['createReview', 'createCommitStatus'] : ['createReview', 'deleteComment', 'createCommitStatus']);
   });
 
   test(`${reviewer}: no findings creates no threads and removes model commentary`, async () => {
@@ -117,7 +117,7 @@ test('Claude uses only its own bot comment from this run', async () => {
       comment(4, `<!-- pr-review:codex -->\n${raw}\n${runUrl}`),
     ],
   });
-  assert.equal(output.summary.comment_id, 2);
+  assert.equal(output.calls.find(call => call.method === 'deleteComment').params.comment_id, 2);
   assert.equal(output.status.state, 'failure');
 });
 
@@ -160,14 +160,32 @@ test('missing Claude source comment is an error', async () => {
   assert.equal(output.summary, undefined);
 });
 
-for (const fail of ['createReview', 'createComment', 'updateComment']) {
+for (const fail of ['createReview', 'createComment', 'updateComment', 'deleteComment']) {
   test(`${fail} failure reports error and fails the job`, async () => {
-    const output = await run({ fail, isCodex: fail !== 'updateComment' });
+    const output = await run({
+      fail, isCodex: !['updateComment', 'deleteComment'].includes(fail),
+      result: ['createComment', 'updateComment'].includes(fail) ? { summary: '', findings: [] } : result,
+    });
     assert.equal(output.status.state, 'error');
     assert.equal(output.failures.length, 1);
-    if (fail === 'createReview') assert.equal(output.summary, undefined);
+    if (fail === 'createReview') {
+      assert.equal(output.calls.some(call => ['createComment', 'updateComment'].includes(call.method)), false);
+    }
   });
 }
+
+test('cancelled Claude removes its own progress comment without deleting older discussions', async () => {
+  const output = await run({
+    isCodex: false, env: { MODEL_OUTCOME: 'cancelled' },
+    sourceComments: [
+      comment(1, 'A previous review with findings'),
+      comment(2, `Claude Code is working…\n\n[View job run](${runUrl})`),
+    ],
+  });
+  assert.deepEqual(output.calls.filter(call => call.method === 'deleteComment').map(call => call.params.comment_id), [2]);
+  assert.equal(output.review, undefined);
+  assert.equal(output.status.state, 'error');
+});
 
 test('explicit success state still publishes threads and a green status', async () => {
   const output = await run({ env: { FINDINGS_STATE: 'success' } });

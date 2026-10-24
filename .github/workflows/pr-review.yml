@@ -766,19 +766,6 @@ jobs:
             let description = "レビューを完了できませんでした";
 
             try {
-              if (process.env.REVIEW_DIFF_OUTCOME !== "success") {
-                throw new Error("PR差分を取得できませんでした");
-              }
-              if (process.env.EFFORT_OUTCOME !== "success") {
-                throw new Error("effort を決められませんでした");
-              }
-              if (process.env.MODEL_OUTCOME !== "success") {
-                throw new Error("レビューを完了できませんでした");
-              }
-              if (!["success", "failure"].includes(FINDINGS_STATE)) {
-                throw new Error("findings_state は success / failure を指定してください");
-              }
-
               let sourceComment;
               let raw = process.env.CODEX_REVIEW || "";
               if (!isCodex) {
@@ -791,6 +778,22 @@ jobs:
                   !comment.body.startsWith("<!-- pr-review:codex -->")
                 ).at(-1);
                 raw = sourceComment?.body || "";
+                if (process.env.MODEL_OUTCOME === "cancelled" && sourceComment) {
+                  await github.rest.issues.deleteComment({ ...repo, comment_id: sourceComment.id });
+                }
+              }
+
+              if (process.env.REVIEW_DIFF_OUTCOME !== "success") {
+                throw new Error("PR差分を取得できませんでした");
+              }
+              if (process.env.EFFORT_OUTCOME !== "success") {
+                throw new Error("effort を決められませんでした");
+              }
+              if (process.env.MODEL_OUTCOME !== "success") {
+                throw new Error("レビューを完了できませんでした");
+              }
+              if (!["success", "failure"].includes(FINDINGS_STATE)) {
+                throw new Error("findings_state は success / failure を指定してください");
               }
 
               const blocks = [...raw.matchAll(/^```json\s*\n([\s\S]*?)^```[ \t]*$/gm)];
@@ -818,26 +821,26 @@ jobs:
               const verdict = findings.length
                 ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
                 : "**✅ 指摘なし**";
-              let summary = `${verdict}\n\n${footer}`;
+              const summary = `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n${footer}`;
 
               if (findings.length) {
                 // 全指摘を1回の API 呼び出しで投稿する。無効な差分位置を通常コメントに
                 // フォールバックすると解決必須を回避するため、その場合は error にする。
-                const { data: review } = await github.rest.pulls.createReview({
+                await github.rest.pulls.createReview({
                   ...repo, pull_number: issue_number, commit_id: SHA,
-                  event: "COMMENT", body: footer, comments,
+                  event: "COMMENT", body: summary, comments,
                 });
-                summary = `${verdict}\n\n[指摘スレッドを確認](${review.html_url})\n\n${footer}`;
-              }
-
-              if (sourceComment) {
+                // レビュー自体を件数サマリーにし、進捗コメントと別サマリーを残さない。
+                if (sourceComment) {
+                  await github.rest.issues.deleteComment({ ...repo, comment_id: sourceComment.id });
+                }
+              } else if (sourceComment) {
                 await github.rest.issues.updateComment({
                   ...repo, comment_id: sourceComment.id, body: summary,
                 });
               } else {
                 await github.rest.issues.createComment({
-                  ...repo, issue_number,
-                  body: `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${summary}`,
+                  ...repo, issue_number, body: summary,
                 });
               }
               state = findings.length ? FINDINGS_STATE : "success";
