@@ -873,8 +873,12 @@ jobs:
               }
               const { createHash } = require("node:crypto");
               const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
-              // run URL は再実行でも変わらない。別の run / SHA / reviewer とは共有しない。
-              const publicationKey = hash([RUN_URL, SHA, statusContext]);
+              // 再実行でモデルの結果が変わった場合は、前回のサマリーを上書きしない。
+              // フィールド順だけが変わった同じ結果は、同じ投稿として扱う。
+              const resultKey = hash([result.summary, findings.map(finding =>
+                [finding?.path, finding?.line, finding?.side, finding?.body])]);
+              const publicationKey = hash([RUN_URL, SHA, statusContext, resultKey]);
+              publication.result_key = resultKey;
               const summaryMarker = `<!-- pr-review:summary:${publicationKey} -->`;
               const lineComments = [];
               const fileComments = [];
@@ -912,7 +916,12 @@ jobs:
               }
               function positionRejected(error) {
                 const detail = `${error.message} ${JSON.stringify(error.response?.data || {})}`;
-                return error.status === 422 && /line could not be resolved/i.test(detail);
+                const errors = error.response?.data?.errors;
+                return error.status === 422 && (
+                  /\bline (?:could not be resolved|must be part of the diff)\b/i.test(detail) ||
+                  (Array.isArray(errors) && errors.some(item => item?.field === "line" &&
+                    /\bmust be part of the diff\b/i.test(item.message || "")))
+                );
               }
               if (findings.length) {
                 const params = { ...repo, pull_number: issue_number, per_page: 100 };
@@ -921,10 +930,14 @@ jobs:
                   github.paginate(github.rest.pulls.listReviews, params),
                   github.paginate(github.rest.pulls.listReviewComments, params),
                 ]);
-                let review = reviews.find(item => item.body?.includes(summaryMarker) && item.state !== "PENDING");
+                // マーカーは公開値から計算できるため、GITHUB_TOKEN の投稿者も照合する。
+                const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
+                let review = reviews.find(item => isPublisher(item) &&
+                  item.body?.includes(summaryMarker) && item.state !== "PENDING");
                 const remaining = [];
                 for (const comment of [...lineComments, ...fileComments]) {
-                  const posted = comments.find(item => !item.in_reply_to_id && item.body?.includes(comment.marker));
+                  const posted = comments.find(item => isPublisher(item) &&
+                    !item.in_reply_to_id && item.body?.includes(comment.marker));
                   if (!posted) remaining.push(comment);
                   else {
                     record("comment", posted);
@@ -933,6 +946,7 @@ jobs:
                 }
                 let pendingLines = remaining.filter(comment => lineComments.includes(comment));
                 const pendingFiles = remaining.filter(comment => fileComments.includes(comment));
+                let batchedLines = [];
                 if (!review) {
                   const request = comments => github.rest.pulls.createReview({
                     ...repo, pull_number: issue_number, commit_id: SHA,
@@ -940,6 +954,7 @@ jobs:
                   });
                   try {
                     ({ data: review } = await request(pendingLines.map(({ index, marker, ...comment }) => comment)));
+                    batchedLines = pendingLines;
                     pendingLines = [];
                   } catch (error) {
                     if (!pendingLines.length || !positionRejected(error)) throw error;
@@ -948,6 +963,18 @@ jobs:
                   }
                 }
                 record("summary", review);
+                if (batchedLines.length) {
+                  // createReview の応答にはコメントがないため、後続投稿の前に URL を回収する。
+                  const postedComments = await github.paginate(github.rest.pulls.listCommentsForReview, {
+                    ...repo, pull_number: issue_number, review_id: review.id, per_page: 100,
+                  });
+                  for (const comment of batchedLines) {
+                    const posted = postedComments.find(item => isPublisher(item) &&
+                      !item.in_reply_to_id && item.body?.includes(comment.marker));
+                    if (!posted) throw new Error("一括投稿済みの指摘 URL を取得できませんでした");
+                    record("comment", posted);
+                  }
+                }
                 async function updateSummary() {
                   await github.rest.pulls.updateReview({
                     ...repo, pull_number: issue_number, review_id: review.id, body: summary(),

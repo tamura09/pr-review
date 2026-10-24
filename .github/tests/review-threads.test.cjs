@@ -56,20 +56,27 @@ async function run(options = {}) {
     calls.push({ method, params });
     if ((method === 'createReview' && params.comments.some(rejected)) ||
         (method === 'createReviewComment' && params.subject_type !== 'file' && rejected(params))) {
-      throw Object.assign(new Error('Unprocessable Entity: Line could not be resolved'), { status: 422 });
+      const error = (method === 'createReview' ? options.batchPositionError : options.linePositionError) ??
+        (method === 'createReview' ? { message: 'Unprocessable Entity: Line could not be resolved' } : {
+          message: 'Validation Failed', response: { data: { message: 'Validation Failed', errors: [{
+            resource: 'PullRequestReviewThread', field: 'line', code: 'custom',
+            message: 'pull_request_review_thread.line must be part of the diff',
+          }] } },
+        });
+      throw Object.assign(new Error(error.message), { status: 422 }, error);
     }
     const count = calls.filter(call => call.method === method).length;
     if (options.fail === method && (!options.failAt || options.failAt === count)) {
-      throw Object.assign(new Error(options.failMessage ?? `Simulated ${method} failure`), { status: options.failStatus });
+      throw Object.assign(new Error(options.failMessage ?? `Simulated ${method} failure`), { status: options.failStatus, response: options.failResponse });
     }
-    const posted = { ...params, id: server.nextId++ };
+    const posted = { ...params, id: server.nextId++, user: { login: 'github-actions[bot]', type: 'Bot' } };
     if (method === 'createReview') {
       posted.state = 'COMMENTED';
       posted.html_url = `https://github.com/example/repo/pull/7#pullrequestreview-${posted.id}`;
       server.reviews.push(posted);
       for (const comment of params.comments) {
         const id = server.nextId++;
-        server.comments.push({ ...comment, id, subject_type: 'line',
+        server.comments.push({ ...comment, id, subject_type: 'line', user: posted.user, pull_request_review_id: posted.id,
           html_url: `https://github.com/example/repo/pull/7#discussion_r${id}` });
       }
     } else if (method === 'createReviewComment') {
@@ -86,11 +93,14 @@ async function run(options = {}) {
     paginate: async (method, params) => {
       fetches.push({ method, params });
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
-      return structuredClone(method === 'listReviews' ? server.reviews : server.comments);
+      const rows = method === 'listReviews' ? server.reviews : method === 'listCommentsForReview'
+        ? server.comments.filter(comment => comment.pull_request_review_id === params.review_id) : server.comments;
+      return structuredClone(rows);
     },
     rest: {
       pulls: { createReview: api('createReview'), createReviewComment: api('createReviewComment'),
-        updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments' },
+        updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments',
+        listCommentsForReview: 'listCommentsForReview' },
       issues: { createComment: api('createComment') },
       repos: { createCommitStatus: api('createCommitStatus') },
     },
@@ -475,7 +485,7 @@ test('partial file publication is logged and resumes without duplicate summaries
   assert.equal(first.status.state, 'error');
   assert.equal(first.server.reviews.length, 1);
   assert.equal(first.server.comments.length, 2);
-  assert.equal(first.publication.posted.length, 2);
+  assert.equal(first.publication.posted.length, 3);
   assert.match(first.publication.posted[0].url, /pullrequestreview/);
   assert.match(first.publication.posted[1].url, /discussion_r/);
   assert.equal(first.publication.error, 'Simulated createReviewComment failure');
@@ -543,6 +553,114 @@ for (const method of ['createReview', 'createReviewComment']) {
     assert.match(resumed.summary.body, /#discussion_r/);
   });
 }
+
+test('changed model results create a separate summary and preserve the previous count and links', async () => {
+  const original = { summary: 'Original three findings', findings: [finding,
+    { ...finding, line: 998 }, { ...finding, line: 999 }] };
+  const first = await run({ result: original, fail: 'createReviewComment', failAt: 2 });
+  assert.equal(first.status.state, 'error');
+  const previousBody = first.server.reviews[0].body;
+  const changed = { summary: 'New two findings', findings: [finding, { ...finding, line: 9 }] };
+  const resumed = await run({ result: changed, server: first.server });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.server.reviews.length, 2);
+  assert.equal(resumed.server.comments.length, 4);
+  assert.equal(resumed.server.reviews[0].body, previousBody);
+  assert.match(previousBody, /指摘 3件/);
+  assert.match(previousBody, /#discussion_r/);
+  assert.match(resumed.summary.body, /指摘 2件/);
+  assert.notEqual(first.publication.result_key, resumed.publication.result_key);
+});
+
+test('identical results with different JSON field order still reuse the publication', async () => {
+  const first = await run();
+  const reordered = { findings: [{ body: finding.body, side: finding.side, line: finding.line, path: finding.path }],
+    summary: result.summary };
+  const resumed = await run({ result: reordered, server: first.server });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.server.reviews.length, 1);
+  assert.equal(resumed.server.comments.length, 1);
+  assert.equal(first.publication.result_key, resumed.publication.result_key);
+});
+
+for (const user of [{ login: 'mallory', type: 'User' }, { login: 'another[bot]', type: 'Bot' },
+  { login: 'github-actions[bot]', type: 'User' }, undefined]) {
+  test(`copied publication markers from ${JSON.stringify(user)} cannot impersonate the publisher`, async () => {
+    const seed = await run();
+    const server = structuredClone(seed.server);
+    server.reviews[0].user = user;
+    server.reviews[0].body = 'Copied review\n' + server.reviews[0].body;
+    server.comments[0].user = user;
+    const forgedBody = server.reviews[0].body;
+    const output = await run({ server });
+    assert.equal(output.failures.length, 0);
+    assert.equal(output.server.reviews.length, 2);
+    assert.equal(output.server.comments.length, 2);
+    assert.equal(output.server.reviews[0].body, forgedBody);
+    assert.ok(output.publication.posted.every(item => item.id !== server.reviews[0].id && item.id !== server.comments[0].id));
+  });
+}
+
+for (const message of ['Pull request review thread line must be part of the diff',
+  'pull_request_review_thread.line must be part of the diff']) {
+  test(`both endpoints fall back for position message: ${message}`, async () => {
+    const output = await run({ rejectLine: true,
+      batchPositionError: { message }, linePositionError: { message } });
+    assert.equal(output.failures.length, 0);
+    assert.equal(output.fileComments.length, 1);
+    assert.equal(output.status.state, 'failure');
+  });
+}
+
+test('structured line errors are recognized when the field and message are separate', async () => {
+  const error = { message: 'Validation Failed', response: { data: { errors: [{
+    resource: 'PullRequestReviewThread', field: 'line', code: 'custom', message: 'must be part of the diff',
+  }] } } };
+  const output = await run({ rejectLine: true, batchPositionError: error, linePositionError: error });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.fileComments.length, 1);
+});
+
+for (const error of [
+  { status: 500, message: 'Pull request review thread line must be part of the diff' },
+  { message: 'Validation Failed', response: { data: { errors: [{ field: 'line', message: 'is invalid' }] } } },
+  { message: 'Validation Failed', response: { data: { errors: [{ field: 'body', message: 'must be part of the diff' }] } } },
+]) {
+  test(`unrelated individual API error is preserved: ${JSON.stringify(error)}`, async () => {
+    const output = await run({ rejectLine: true, linePositionError: error });
+    assert.equal(output.failures.length, 1);
+    assert.equal(output.fileComments.length, 0);
+    assert.equal(output.status.state, 'error');
+  });
+}
+
+test('batch thread URLs are recorded before any subsequent file-thread failure', async () => {
+  const value = { ...result, findings: [finding, { ...finding, line: 9 }, { ...finding, line: 999 }] };
+  const output = await run({ result: value, fail: 'createReviewComment' });
+  assert.equal(output.status.state, 'error');
+  assert.equal(output.server.comments.length, 2);
+  const recorded = output.publication.posted.filter(item => item.kind === 'comment');
+  assert.equal(recorded.length, 2);
+  for (const comment of output.server.comments) {
+    assert.ok(recorded.some(item => item.id === comment.id && item.url === comment.html_url));
+    assert.ok(output.errors.some(message => message.includes(comment.html_url)));
+  }
+  assert.ok(output.fetches.some(fetch => fetch.method === 'listCommentsForReview' && fetch.params.review_id === output.summary.id));
+});
+
+test('failure to fetch batch thread URLs stops additional publication and recovers on retry', async () => {
+  const value = { ...result, findings: [finding, { ...finding, line: 999 }] };
+  const first = await run({ result: value, fail: 'listCommentsForReview' });
+  assert.equal(first.status.state, 'error');
+  assert.equal(first.server.comments.length, 1);
+  assert.equal(first.fileComments.length, 0);
+  assert.equal(first.publication.posted.length, 1);
+  const resumed = await run({ result: value, server: first.server });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.server.reviews.length, 1);
+  assert.equal(resumed.server.comments.length, 2);
+  assert.equal(resumed.publication.posted.filter(item => item.kind === 'comment').length, 2);
+});
 
 test('publication identities do not collide across reviewers, heads, or workflow runs', async () => {
   for (const options of [{ isCodex: false }, { env: { SHA: 'another-head' } }, { env: { RUN_URL: runUrl + '4' } }]) {
