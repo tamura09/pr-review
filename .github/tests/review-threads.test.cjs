@@ -19,7 +19,6 @@ const finding = {
 };
 const result = { summary: '境界値で失敗する', findings: [finding] };
 const jsonBlock = value => '```json\n' + JSON.stringify(value) + '\n```';
-const comment = (id, body, login = 'github-actions[bot]') => ({ id, body, user: { login } });
 
 async function run(options = {}) {
   const isCodex = options.isCodex ?? true;
@@ -43,16 +42,11 @@ async function run(options = {}) {
     return { data: { id: 88, html_url: 'https://github.com/example/repo/pull/7#pullrequestreview-88' } };
   };
   const github = {
-    paginate: async (method, params) => {
-      calls.push({ method: 'listComments', params });
-      return options.sourceComments ?? [comment(1, `${raw}\n\n${runUrl}`)];
-    },
+    paginate: async () => { throw new Error('Review history must not be fetched'); },
     rest: {
       pulls: { createReview: api('createReview') },
       issues: {
-        listComments: () => {},
-        createComment: api('createComment'), updateComment: api('updateComment'),
-        deleteComment: api('deleteComment'),
+        createComment: api('createComment'),
       },
       repos: { createCommitStatus: api('createCommitStatus') },
     },
@@ -66,7 +60,7 @@ async function run(options = {}) {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
       calls, failures, errors,
       review: calls.find(call => call.method === 'createReview')?.params,
-      summary: calls.find(call => ['createReview', 'createComment', 'updateComment'].includes(call.method))?.params,
+      summary: calls.find(call => ['createReview', 'createComment'].includes(call.method))?.params,
       status: calls.find(call => call.method === 'createCommitStatus')?.params,
     };
   } finally {
@@ -98,9 +92,8 @@ for (const isCodex of [false, true]) {
     assert.equal(output.status.context, isCodex ? 'codex-review' : 'claude-review');
     assert.equal(output.status.sha, 'reviewed-head');
     assert.match(output.status.description, /^指摘 2件/);
-    assert.equal(output.calls.filter(call => ['createComment', 'updateComment'].includes(call.method)).length, 0);
-    assert.deepEqual(output.calls.filter(call => call.method !== 'listComments').map(call => call.method),
-      isCodex ? ['createReview', 'createCommitStatus'] : ['createReview', 'deleteComment', 'createCommitStatus']);
+    assert.equal(output.calls.filter(call => ['createComment'].includes(call.method)).length, 0);
+    assert.deepEqual(output.calls.map(call => call.method), ['createReview', 'createCommitStatus']);
   });
 
   test(`${reviewer}: no findings creates no threads and removes model commentary`, async () => {
@@ -115,21 +108,6 @@ for (const isCodex of [false, true]) {
     assert.equal(output.failures.length, 0);
   });
 }
-
-test('Claude uses only its own bot comment from this run', async () => {
-  const raw = jsonBlock(result);
-  const output = await run({
-    isCodex: false,
-    sourceComments: [
-      comment(1, `${raw}\n${runUrl.replace('/123', '/12')}`),
-      comment(2, `${raw}\n${runUrl}`),
-      comment(3, `${raw}\n${runUrl}`, 'attacker'),
-      comment(4, `<!-- pr-review:codex -->\n${raw}\n${runUrl}`),
-    ],
-  });
-  assert.equal(output.calls.find(call => call.method === 'deleteComment').params.comment_id, 2);
-  assert.equal(output.status.state, 'failure');
-});
 
 for (const [name, raw] of [
   ['missing JSON', '**✅ 指摘なし**'],
@@ -164,38 +142,23 @@ for (const key of ['REVIEW_DIFF_OUTCOME', 'EFFORT_OUTCOME', 'MODEL_OUTCOME']) {
   });
 }
 
-test('Claude can publish structured output without a progress comment', async () => {
-  const output = await run({ isCodex: false, sourceComments: [] });
-  assert.equal(output.status.state, 'failure');
-  assert.equal(output.review.comments.length, 1);
-  assert.equal(output.failures.length, 0);
-});
-
-for (const fail of ['createReview', 'createComment', 'updateComment', 'deleteComment']) {
+for (const fail of ['createReview', 'createComment']) {
   test(`${fail} failure reports error and fails the job`, async () => {
     const output = await run({
-      fail, isCodex: !['updateComment', 'deleteComment'].includes(fail),
-      result: ['createComment', 'updateComment'].includes(fail) ? { summary: '', findings: [] } : result,
+      fail, result: fail === 'createComment' ? { summary: '', findings: [] } : result,
     });
     assert.equal(output.status.state, 'error');
     assert.equal(output.failures.length, 1);
     assert.equal(output.status.description, `Simulated ${fail} failure`);
     if (fail === 'createReview') {
-      assert.equal(output.calls.some(call => ['createComment', 'updateComment'].includes(call.method)), false);
+      assert.equal(output.calls.some(call => ['createComment'].includes(call.method)), false);
     }
   });
 }
 
-test('cancelled Claude removes its own progress comment without deleting older discussions', async () => {
-  const output = await run({
-    isCodex: false, env: { MODEL_OUTCOME: 'cancelled' },
-    sourceComments: [
-      comment(1, 'A previous review with findings'),
-      comment(2, `Claude Code is working…\n\n[View job run](${runUrl})`),
-    ],
-  });
-  assert.deepEqual(output.calls.filter(call => call.method === 'deleteComment').map(call => call.params.comment_id), [2]);
-  assert.equal(output.review, undefined);
+test('cancelled Claude creates no progress, summary, or review comments', async () => {
+  const output = await run({ isCodex: false, env: { MODEL_OUTCOME: 'cancelled' } });
+  assert.deepEqual(output.calls.map(call => call.method), ['createCommitStatus']);
   assert.equal(output.status.state, 'error');
 });
 
@@ -222,23 +185,20 @@ for (const isCodex of [false, true]) {
   });
 }
 
-test('Claude preserves HTML entities from structured output despite a corrupted tracking comment', async () => {
+test('Claude preserves HTML entities from structured output without comment conversion', async () => {
   const original = { summary: 'エンティティ処理の不具合', findings: [{
     ...finding, body: '**引用符の扱い**\n入力 `&#34;` / `&#10;` / `&#96;` をそのまま扱ってください。',
   }] };
   const corrupted = JSON.stringify(original).replaceAll('&#34;', '"').replaceAll('&#10;', '\n');
   assert.throws(() => JSON.parse(corrupted));
-  const output = await run({
-    isCodex: false, result: original,
-    sourceComments: [comment(1, `\`\`\`json\n${corrupted}\n\`\`\`\n${runUrl}`)],
-  });
+  const output = await run({ isCodex: false, result: original });
   assert.ok(output.review.comments[0].body.startsWith(original.findings[0].body));
   assert.equal(output.savedResult, JSON.stringify(original));
   assert.equal(output.failures.length, 0);
 });
 
 for (const claudeReview of ['', '{', 'null', '{"summary":""}']) {
-  test(`invalid structured Claude result ${JSON.stringify(claudeReview)} never falls back to the comment`, async () => {
+  test(`invalid structured Claude result ${JSON.stringify(claudeReview)} fails without fetching comment history`, async () => {
     const output = await run({ isCodex: false, claudeReview });
     assert.equal(output.review, undefined);
     assert.equal(output.status.state, 'error');
@@ -284,7 +244,14 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     git(origin, 'merge', '--no-edit', 'feature');
     const merged = git(origin, 'rev-parse', 'HEAD');
     git(tempDir, 'clone', origin, checkout);
+    git(origin, 'checkout', 'feature');
+    writeFileSync(join(origin, 'file.txt'), `future PR change\n${base}`);
+    git(origin, 'commit', '-am', 'Later PR push');
+    git(checkout, 'fetch', 'origin', 'feature');
     git(checkout, 'checkout', '--detach', head);
+    assert.notEqual(git(checkout, 'rev-parse', 'origin/feature'), head);
+    assert.equal(git(checkout, 'rev-parse', 'HEAD'), head);
+    assert.ok(!readFileSync(join(checkout, 'file.txt'), 'utf8').includes('future PR change'));
     const prepareScript = workflow.match(/      - name: Prepare PR diff\n[\s\S]*?        run: \|\n((?: {10}[^\n]*\n|\n)*)/)[1]
       .replace(/^ {10}/gm, '');
     execFileSync('bash', ['-c', prepareScript], {
@@ -301,4 +268,15 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+test('Claude uses agent mode with only local read tools and no automatic comment history', () => {
+  const claudeStep = workflow.split('      - name: Review with Claude\n')[1]
+    .split('      - name: Set up Node.js for Codex')[0];
+  assert.match(claudeStep, /track_progress: false/);
+  assert.doesNotMatch(claudeStep, /include_comments_by_actor/);
+  assert.match(claudeStep, /--tools "Read,Grep,Glob"/);
+  assert.match(claudeStep, /--allowedTools "Read,Grep,Glob"/);
+  assert.match(claudeStep, /--mcp-config '\{"mcpServers":\{\}\}'/);
+  assert.match(claudeStep, /--strict-mcp-config/);
 });

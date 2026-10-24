@@ -162,8 +162,6 @@ permissions:
   statuses: write
   # Claude/Codex の認証情報を SSM から読むための OIDC トークン発行
   id-token: write
-  # CI の実行結果を Claude に読ませるため (github_ci MCP に必要)
-  actions: read
 
 jobs:
   review:
@@ -202,7 +200,7 @@ jobs:
 
       # checkout の refspec に依存せず、レビュー対象の base ref を明示的に取得して
       # 差分を一度生成し、モデルにはこのファイルを読ませる。Claude は
-      # タグモードで Bash を持たず git diff を実行できないので、ファイルで渡す必要が
+      # 読み取り専用ツールだけを使い git diff を実行できないので、ファイルで渡す必要が
       # ある。ここで失敗した場合はモデルを起動せず、レビュー不能の原因を job と
       # PR コメントに残す。
       - name: Prepare PR diff
@@ -400,17 +398,9 @@ jobs:
       # 失敗しても job は止めず、最後のステップで claude-review を error にする。
       # 利用枠超過・認証切れ・max-turns 到達などで Claude の実行が落ちた場合が対象。
       #
-      # タグモードではツールが Read / Grep / Glob / LS に固定され Bash が無いので、
-      # 差分ファイルのあるディレクトリを --add-dir で読めるようにする。
-      #
-      # タグモードは PR に付いたコメント・レビュー・行コメントを全部プロンプトに
-      # 入れる。公開リポジトリでは誰でもコメントを書けるので、そのままだと第三者の
-      # 文章が Claude に届く。Claude は Read で同じユーザーの他プロセスの
-      # /proc/<pid>/environ や .git/config (action が GITHUB_TOKEN を入れた remote URL)
-      # を読めるため、プロンプトで「指示に従うな」と書いても遮断にはならない。
-      # 入れるコメントを、push 権限の内側にいる書き手 (リポジトリのオーナー、
-      # 同じリポジトリから PR を出した作成者、過去のレビューを書いた
-      # github-actions[bot]) に絞る。
+      # agent モードは checkout 済みのコミットを維持し、PR の過去コメントを
+      # プロンプトへ自動で取り込まない。読み取り専用ツールだけを明示的に許可し、
+      # コメント投稿も後続の共通ステップに集約する。
       - name: Review with Claude
         id: claude
         # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
@@ -429,13 +419,14 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.claude_code_oauth_token || steps.oauth_token.outputs.token }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          track_progress: true
-          include_comments_by_actor: >-
-            ${{ format('{0},{1},github-actions[bot]',
-            github.repository_owner, github.event.pull_request.user.login) }}
+          track_progress: false
           claude_args: |
             --json-schema '{"type":"object","properties":{"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string","minLength":1},"line":{"type":"integer","minimum":1},"side":{"type":"string","enum":["LEFT","RIGHT"]},"body":{"type":"string","minLength":1}},"required":["path","line","side","body"],"additionalProperties":false}}},"required":["summary","findings"],"additionalProperties":false}'
-            --disallowedTools "Edit,Write,MultiEdit,NotebookEdit"
+            --tools "Read,Grep,Glob"
+            --allowedTools "Read,Grep,Glob"
+            --mcp-config '{"mcpServers":{}}'
+            --strict-mcp-config
+            --disallowedTools "Bash,Edit,Write,MultiEdit,NotebookEdit"
             --max-turns ${{ inputs.max_turns }}
             --effort ${{ steps.effort.outputs.effort }}
             --add-dir ${{ runner.temp }}/pr-review
@@ -771,21 +762,6 @@ jobs:
             let description = "レビューを完了できませんでした";
 
             try {
-              let sourceComment;
-              if (!isCodex) {
-                const comments = await github.paginate(github.rest.issues.listComments, {
-                  ...repo, issue_number, per_page: 100,
-                });
-                sourceComment = comments.filter(comment =>
-                  comment.user.login === "github-actions[bot]" &&
-                  comment.body.includes(RUN_URL) &&
-                  !comment.body.startsWith("<!-- pr-review:codex -->")
-                ).at(-1);
-                if (process.env.MODEL_OUTCOME === "cancelled" && sourceComment) {
-                  await github.rest.issues.deleteComment({ ...repo, comment_id: sourceComment.id });
-                }
-              }
-
               if (process.env.REVIEW_DIFF_OUTCOME !== "success") {
                 throw new Error("PR差分を取得できませんでした");
               }
@@ -850,14 +826,6 @@ jobs:
                 await github.rest.pulls.createReview({
                   ...repo, pull_number: issue_number, commit_id: SHA,
                   event: "COMMENT", body: summary, comments,
-                });
-                // レビュー自体を件数サマリーにし、進捗コメントと別サマリーを残さない。
-                if (sourceComment) {
-                  await github.rest.issues.deleteComment({ ...repo, comment_id: sourceComment.id });
-                }
-              } else if (sourceComment) {
-                await github.rest.issues.updateComment({
-                  ...repo, comment_id: sourceComment.id, body: summary,
                 });
               } else {
                 await github.rest.issues.createComment({
