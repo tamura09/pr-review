@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const { readFileSync, mkdtempSync, rmSync, existsSync, writeFileSync } = require('node:fs');
+const { readFileSync, mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { join } = require('node:path');
@@ -12,6 +12,16 @@ const defaultFindingsState = workflow.match(/      findings_state:\n[\s\S]*?    
 const script = workflow.match(/          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const publish = new AsyncFunction('github', 'context', 'core', 'process', 'require', script);
+const defaultDiff = `diff --git a/src/example.ts b/src/example.ts
+--- a/src/example.ts
++++ b/src/example.ts
+@@ -9 +9 @@
+-old
++new
+@@ -42 +42 @@
+-old
++new
+`;
 const runUrl = 'https://github.com/example/repo/actions/runs/123';
 const finding = {
   path: 'src/example.ts', line: 42, side: 'RIGHT',
@@ -27,6 +37,9 @@ async function run(options = {}) {
   const failures = [];
   const errors = [];
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-result-test-'));
+  mkdirSync(join(tempDir, 'pr-review'));
+  writeFileSync(join(tempDir, 'pr-review/pr.diff'), options.diff ?? defaultDiff);
+  writeFileSync(join(tempDir, 'pr-review/files.z'), options.files ?? 'M\0src/example.ts\0');
   const env = {
     RUNNER_TEMP: tempDir,
     SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
@@ -38,13 +51,18 @@ async function run(options = {}) {
   };
   const api = method => async params => {
     calls.push({ method, params });
-    if (options.fail === method) throw new Error(`Simulated ${method} failure`);
-    return { data: { id: 88, html_url: 'https://github.com/example/repo/pull/7#pullrequestreview-88' } };
+    if (options.rejectLine && method === 'createReview' && params.comments.length) {
+      throw Object.assign(new Error('Unprocessable Entity: Line could not be resolved'), { status: 422 });
+    }
+    if (options.fail === method) throw Object.assign(new Error(options.failMessage ?? `Simulated ${method} failure`), { status: options.failStatus });
+    return { data: { id: 88, html_url: method === 'createReviewComment'
+      ? `https://github.com/example/repo/pull/7#discussion_r${calls.length}`
+      : 'https://github.com/example/repo/pull/7#pullrequestreview-88' } };
   };
   const github = {
     paginate: async () => { throw new Error('Review history must not be fetched'); },
     rest: {
-      pulls: { createReview: api('createReview') },
+      pulls: { createReview: api('createReview'), createReviewComment: api('createReviewComment') },
       issues: {
         createComment: api('createComment'),
       },
@@ -59,7 +77,8 @@ async function run(options = {}) {
     return {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
       calls, failures, errors,
-      review: calls.find(call => call.method === 'createReview')?.params,
+      review: calls.findLast(call => call.method === 'createReview')?.params,
+      fileComments: calls.filter(call => call.method === 'createReviewComment').map(call => call.params),
       summary: calls.find(call => ['createReview', 'createComment'].includes(call.method))?.params,
       status: calls.find(call => call.method === 'createCommitStatus')?.params,
     };
@@ -279,4 +298,159 @@ test('Claude uses agent mode with only local read tools and no automatic comment
   assert.match(claudeStep, /--allowedTools "Read,Grep,Glob"/);
   assert.match(claudeStep, /--mcp-config '\{"mcpServers":\{\}\}'/);
   assert.match(claudeStep, /--strict-mcp-config/);
+});
+
+for (const isCodex of [false, true]) {
+  test(`${isCodex ? 'Codex' : 'Claude'}: reproduce 213-line file with invalid lines 253, 282, and 291`, async () => {
+    const script = 'scripts/lockfile_summary.py';
+    const workflowPath = '.github/workflows/renovate.yml';
+    const diff = `diff --git a/${script} b/${script}\nnew file mode 100644\n--- /dev/null\n+++ b/${script}\n@@ -0,0 +1,213 @@\n` +
+      Array.from({ length: 213 }, (_, i) => `+line ${i + 1}\n`).join('') +
+      `diff --git a/${workflowPath} b/${workflowPath}\n--- a/${workflowPath}\n+++ b/${workflowPath}\n@@ -265,3 +265,16 @@\n context\n context\n context\n` +
+      Array.from({ length: 13 }, () => '+added\n').join('');
+    const findings = [
+      { ...finding, path: script, line: 282 },
+      { ...finding, path: workflowPath, line: 279 },
+      { ...finding, path: script, line: 291 },
+      { ...finding, path: script, line: 253 },
+    ];
+    const output = await run({
+      isCodex, diff, files: `A\0${script}\0M\0${workflowPath}\0`,
+      result: { summary: '4 findings', findings },
+    });
+    assert.equal(output.failures.length, 0);
+    assert.equal(output.status.state, 'failure');
+    assert.equal(output.fileComments.length, 3);
+    assert.equal(output.review.comments.length, 1);
+    assert.equal(output.review.comments[0].line, 279);
+    assert.equal(output.review.comments[0].path, workflowPath);
+    for (const [i, comment] of output.fileComments.entries()) {
+      assert.equal(comment.subject_type, 'file');
+      assert.equal(comment.path, script);
+      assert.equal(comment.commit_id, 'reviewed-head');
+      assert.equal('line' in comment, false);
+      assert.equal('side' in comment, false);
+      assert.ok(comment.body.includes(`${[282, 291, 253][i]}行`));
+    }
+    assert.match(output.review.body, /指摘 4件/);
+    assert.equal((output.review.body.match(/#discussion_r/g) || []).length, 3);
+    assert.equal(output.calls.some(call => call.method === 'createComment'), false);
+  });
+}
+
+test('existing lines outside the hunks are posted as file-level review threads', async () => {
+  const output = await run({ result: { ...result, findings: [{ ...finding, line: 20 }] } });
+  assert.equal(output.fileComments.length, 1);
+  assert.equal(output.review.comments.length, 0);
+  assert.equal(output.failures.length, 0);
+});
+
+test('context is valid on RIGHT and deletions only on LEFT', async () => {
+  const diff = 'diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,3 @@\n context\n-old\n+new\n tail\n';
+  const findings = [
+    { ...finding, line: 11, side: 'LEFT' },
+    { ...finding, line: 11 },
+    { ...finding, line: 10 },
+    { ...finding, line: 10, side: 'LEFT' },
+  ];
+  const output = await run({ diff, result: { ...result, findings } });
+  assert.deepEqual(output.review.comments.map(comment => [comment.side, comment.line]), [
+    ['LEFT', 11], ['RIGHT', 11], ['RIGHT', 10],
+  ]);
+  assert.equal(output.fileComments.length, 1);
+  assert.match(output.fileComments[0].body, /LEFT 10行/);
+});
+
+test('hunk content resembling patch headers does not change the file', async () => {
+  const diff = 'diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -1,2 +1,2 @@\n--- old\n-plain\n+++ new\n+plain\n';
+  const output = await run({ diff, result: { ...result, findings: [{ ...finding, line: 1 }] } });
+  assert.equal(output.review.comments[0].line, 1);
+  assert.equal(output.fileComments.length, 0);
+});
+
+test('rename without textual changes falls back using the current path', async () => {
+  const output = await run({
+    files: 'R100\0old.ts\0new.ts\0',
+    diff: 'diff --git a/old.ts b/new.ts\nsimilarity index 100%\nrename from old.ts\nrename to new.ts\n',
+    result: { ...result, findings: [{ ...finding, path: 'old.ts', line: 1 }] },
+  });
+  assert.equal(output.fileComments[0].path, 'new.ts');
+  assert.equal(output.failures.length, 0);
+});
+
+test('a GitHub position rejection retries line findings as file-level threads', async () => {
+  const output = await run({ rejectLine: true });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.status.state, 'failure');
+  assert.deepEqual(output.calls.map(call => call.method), [
+    'createReview', 'createReviewComment', 'createReview', 'createCommitStatus',
+  ]);
+  assert.equal(output.review.comments.length, 0);
+  assert.match(output.review.body, /#discussion_r/);
+});
+
+test('unrelated HTTP 422 errors are not retried as position failures', async () => {
+  const output = await run({ fail: 'createReview', failStatus: 422, failMessage: 'Validation Failed: spammed' });
+  assert.equal(output.fileComments.length, 0);
+  assert.equal(output.status.state, 'error');
+  assert.equal(output.failures.length, 1);
+});
+
+test('file-thread API failure remains an error and preserves the final result', async () => {
+  const value = { ...result, findings: [{ ...finding, line: 999 }] };
+  const output = await run({ fail: 'createReviewComment', result: value });
+  assert.equal(output.review, undefined);
+  assert.equal(output.status.state, 'error');
+  assert.equal(output.savedResult, jsonBlock(value));
+});
+
+test('unknown paths fail explicitly without attaching findings to an unrelated file', async () => {
+  const output = await run({ result: { ...result, findings: [{ ...finding, path: 'not-in-pr.ts' }] } });
+  assert.equal(output.fileComments.length, 0);
+  assert.equal(output.review, undefined);
+  assert.equal(output.status.state, 'error');
+  assert.match(output.status.description, /not-in-pr\.ts/);
+  assert.ok(output.savedResult);
+});
+
+test('real Git patches preserve quoted paths, renames, deleted files, and binary files', async () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-path-test-'));
+  const git = (...args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
+    cwd: tempDir, encoding: 'utf8', stdio: 'pipe',
+    env: { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com',
+      GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com', GIT_CONFIG_GLOBAL: '/dev/null' },
+  });
+  try {
+    git('init', '-b', 'main');
+    const original = Array.from({ length: 100 }, (_, i) => `line ${i + 1}\n`).join('');
+    writeFileSync(join(tempDir, 'old.txt'), original);
+    writeFileSync(join(tempDir, 'removed.txt'), 'removed\n');
+    git('add', '.');
+    git('commit', '-m', 'Initial files');
+    git('mv', 'old.txt', 'new.txt');
+    writeFileSync(join(tempDir, 'new.txt'), original.replace('line 100\n', 'changed\n'));
+    git('rm', 'removed.txt');
+    const names = ['with space.txt', 'tab\tname.txt', 'quote"name.txt', 'back\\slash.txt', '日本語.txt', 'new\nline.txt'];
+    for (const name of names) writeFileSync(join(tempDir, name), 'added\n');
+    writeFileSync(join(tempDir, 'binary.bin'), Buffer.from([0, 1, 0]));
+    git('add', '.');
+    const diff = git('diff', '--cached', '--no-ext-diff', '--no-color', '--unified=3', '--src-prefix=a/', '--dst-prefix=b/');
+    const files = git('diff', '--cached', '--name-status', '-z', '--find-renames');
+    const findings = [
+      ...names.map(path => ({ ...finding, path, line: 1 })),
+      { ...finding, path: 'old.txt', line: 100, side: 'LEFT' },
+      { ...finding, path: 'removed.txt', line: 1, side: 'LEFT' },
+      { ...finding, path: 'binary.bin', line: 1 },
+    ];
+    const output = await run({ diff, files, result: { ...result, findings } });
+    assert.equal(output.failures.length, 0);
+    assert.equal(output.review.comments.length, names.length + 2);
+    assert.deepEqual(output.review.comments.slice(0, names.length).map(c => c.path), names);
+    assert.equal(output.review.comments[names.length].path, 'new.txt');
+    assert.equal(output.review.comments[names.length + 1].path, 'removed.txt');
+    assert.equal(output.fileComments.length, 1);
+    assert.equal(output.fileComments[0].path, 'binary.bin');
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
