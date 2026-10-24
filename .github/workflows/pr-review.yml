@@ -156,6 +156,8 @@ on:
 
 permissions:
   contents: read
+  # 同じ workflow run の前回 attempt の保存結果を復元するため
+  actions: read
   pull-requests: write
   issues: write
   # claude-review / codex-review チェックを PR のチェック一覧に出すため
@@ -198,6 +200,78 @@ jobs:
           # ベースブランチとの差分を取るため履歴ごと取得する
           fetch-depth: 0
 
+      # 投稿の再試行では、前回の結果と差分を復元してモデルを起動しない。
+      - name: Restore review result for publication retry
+        id: restore_review
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEWER_KIND: ${{ matrix.reviewer }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            core.setOutput("restored", "false");
+            const attempt = Number(process.env.RUN_ATTEMPT);
+            if (attempt === 1) return;
+            const { SHA, RUN_URL, REVIEWER_KIND } = process.env;
+            const prefix = `pr-review-result-${REVIEWER_KIND}-`;
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId, per_page: 100,
+            });
+            const previous = artifacts.filter(item => item.name.startsWith(prefix) &&
+              /^\d+$/.test(item.name.slice(prefix.length)) &&
+              Number(item.name.slice(prefix.length)) < attempt)
+              .sort((a, b) => Number(b.name.slice(prefix.length)) - Number(a.name.slice(prefix.length)))[0];
+            if (!previous) {
+              // 投稿後のキャンセル等で artifact が残らなかった場合も、重複投稿はしない。
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
+              });
+              if (reviews.some(item => item.user?.login === "github-actions[bot]" &&
+                  item.commit_id === SHA && item.body?.includes(`[Workflow run](${RUN_URL})`) &&
+                  item.body?.includes(`<!-- pr-review:summary:`) &&
+                  item.body?.includes(REVIEWER_KIND === "codex" ? "Codex ·" : "Claude ·"))) {
+                throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
+              }
+              return;
+            }
+            if (previous.expired) throw new Error("保存済みレビュー結果の artifact が期限切れです");
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const { execFileSync } = require("node:child_process");
+            const dir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
+            fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+            const zip = path.join(dir, "retry.zip");
+            try {
+              const { data } = await github.rest.actions.downloadArtifact({
+                ...context.repo, artifact_id: previous.id, archive_format: "zip",
+              });
+              fs.writeFileSync(zip, Buffer.from(data), { mode: 0o600 });
+              // パスを展開せず、決められた4ファイルの内容だけを読む。
+              const read = name => execFileSync("unzip", ["-p", zip, name], { maxBuffer: 100 * 1024 * 1024 });
+              const metadata = JSON.parse(read("publication.json").toString("utf8"));
+              if (metadata.sha !== SHA || metadata.run_url !== RUN_URL ||
+                  metadata.reviewer !== `${REVIEWER_KIND}-review` || typeof metadata.model_label !== "string") {
+                throw new Error("保存済みレビュー結果の run・SHA・reviewer が一致しません");
+              }
+              const name = REVIEWER_KIND === "codex" ? "codex.md" : "claude.json";
+              const raw = read(name);
+              const diff = read("pr.diff");
+              const files = read("files.z");
+              const diffDir = path.join(process.env.RUNNER_TEMP, "pr-review");
+              fs.mkdirSync(diffDir, { recursive: true, mode: 0o700 });
+              for (const [target, contents] of [[path.join(dir, name), raw],
+                  [path.join(diffDir, "pr.diff"), diff], [path.join(diffDir, "files.z"), files]]) {
+                fs.writeFileSync(target, contents, { mode: 0o600 });
+              }
+              core.setOutput("reviewer", metadata.model_label);
+              core.setOutput("restored", "true");
+            } finally {
+              fs.rmSync(zip, { force: true });
+            }
+
       # checkout の refspec に依存せず、レビュー対象の base ref を明示的に取得して
       # 差分を一度生成し、モデルにはこのファイルを読ませる。Claude は
       # 読み取り専用ツールだけを使い git diff を実行できないので、ファイルで渡す必要が
@@ -205,6 +279,7 @@ jobs:
       # PR コメントに残す。
       - name: Prepare PR diff
         id: review_diff
+        if: steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true'
         continue-on-error: true
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -283,6 +358,7 @@ jobs:
       # 受けてフラグに落とす。
       - name: Decide where the token comes from
         id: token_source
+        if: steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true'
         # `a && b || c` で選ぶと、Codex の leg で secret が空のとき Claude の
         # secret に落ちるので、シェル側で選ぶ
         env:
@@ -411,6 +487,7 @@ jobs:
         timeout-minutes: ${{ inputs.claude_timeout_minutes }}
         if: >-
           always() &&
+          steps.restore_review.outputs.restored != 'true' &&
           matrix.reviewer == 'claude' &&
           steps.effort.outcome == 'success' &&
           (steps.token_source.outputs.from_ssm == 'false' ||
@@ -543,6 +620,7 @@ jobs:
         timeout-minutes: ${{ inputs.codex_timeout_minutes }}
         if: >-
           always() &&
+          steps.restore_review.outputs.restored != 'true' &&
           steps.codex_auth.outcome == 'success' &&
           steps.codex_node.outcome == 'success' &&
           steps.codex_install.outcome == 'success'
@@ -715,7 +793,7 @@ jobs:
 
       # 両方の leg が同じ失敗をするので、コメントは Claude の leg だけが出す
       - name: Report PR diff preparation failure
-        if: ${{ always() && matrix.reviewer == 'claude' && steps.review_diff.outcome != 'success' }}
+        if: ${{ always() && matrix.reviewer == 'claude' && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome != 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -745,14 +823,16 @@ jobs:
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
+          RESTORE_OUTCOME: ${{ steps.restore_review.outcome }}
+          RESTORED: ${{ steps.restore_review.outputs.restored }}
           MODEL_OUTCOME: ${{ matrix.reviewer == 'codex' && steps.codex.outcome || steps.claude.outcome }}
           CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
           CLAUDE_REVIEW: ${{ steps.claude.outputs.structured_output }}
           IS_CODEX: ${{ matrix.reviewer == 'codex' }}
           REVIEWER: >-
-            ${{ matrix.reviewer == 'codex' &&
+            ${{ steps.restore_review.outputs.reviewer || (matrix.reviewer == 'codex' &&
             format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
-            format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort) }}
+            format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort)) }}
         with:
           script: |
             const { SHA, RUN_URL, FINDINGS_STATE, REVIEWER } = process.env;
@@ -761,19 +841,23 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
             const footer = `---\n_${REVIEWER} [Workflow run](${RUN_URL})_`;
-            const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, posted: [] };
+            const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, posted: [] };
             let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
 
             try {
-              if (process.env.REVIEW_DIFF_OUTCOME !== "success") {
+              if (process.env.RESTORE_OUTCOME !== "success") {
+                throw new Error("保存済みレビュー結果を復元できませんでした");
+              }
+              const restored = process.env.RESTORED === "true";
+              if (!restored && process.env.REVIEW_DIFF_OUTCOME !== "success") {
                 throw new Error("PR差分を取得できませんでした");
               }
-              if (process.env.EFFORT_OUTCOME !== "success") {
+              if (!restored && process.env.EFFORT_OUTCOME !== "success") {
                 throw new Error("effort を決められませんでした");
               }
-              if (process.env.MODEL_OUTCOME !== "success") {
+              if (!restored && process.env.MODEL_OUTCOME !== "success") {
                 throw new Error("レビューを完了できませんでした");
               }
               if (!["success", "failure"].includes(FINDINGS_STATE)) {
@@ -781,17 +865,24 @@ jobs:
               }
 
               // コメント用の HTML 加工を経ていないモデルの最終結果だけを使う。
-              const raw = (isCodex ? process.env.CODEX_REVIEW : process.env.CLAUDE_REVIEW) || "";
-              if (!raw.trim()) {
-                throw new Error("モデルのレビュー結果が空です");
-              }
-              // 投稿失敗時にも指摘本文を回収できるよう、最終結果だけを保存する。
-              // ツールの実行履歴や認証情報を含む execution_file は保存しない。
               const fs = require("node:fs");
               const path = require("node:path");
               const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
+              const resultPath = path.join(resultDir, isCodex ? "codex.md" : "claude.json");
+              const raw = restored ? fs.readFileSync(resultPath, "utf8") :
+                (isCodex ? process.env.CODEX_REVIEW : process.env.CLAUDE_REVIEW) || "";
+              if (!raw.trim()) {
+                throw new Error("モデルのレビュー結果が空です");
+              }
+              // 投稿失敗時にも同じ結果で再試行できるよう、最終結果と差分を保存する。
+              // ツールの実行履歴や認証情報を含む execution_file は保存しない。
               fs.mkdirSync(resultDir, { recursive: true, mode: 0o700 });
-              fs.writeFileSync(path.join(resultDir, isCodex ? "codex.md" : "claude.json"), raw, { mode: 0o600 });
+              fs.writeFileSync(resultPath, raw, { mode: 0o600 });
+              // base branch が動いた後の再実行でも、元の行位置を検証する。
+              for (const name of ["pr.diff", "files.z"]) {
+                fs.copyFileSync(path.join(process.env.RUNNER_TEMP, "pr-review", name), path.join(resultDir, name));
+                fs.chmodSync(path.join(resultDir, name), 0o600);
+              }
 
               savePublication = () => fs.writeFileSync(path.join(resultDir, "publication.json"),
                 JSON.stringify(publication, null, 2), { mode: 0o600 });

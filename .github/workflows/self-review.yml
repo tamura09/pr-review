@@ -21,6 +21,8 @@ on:
 # 呼び出される側の permissions は呼び出し側を超えられない
 permissions:
   contents: read
+  # 同じ workflow run の保存結果を復元するため
+  actions: read
   pull-requests: write
   issues: write
   # claude-review / codex-review チェックを PR のチェック一覧に出すため
@@ -75,7 +77,8 @@ jobs:
         - 差分外の行番号がファイル単位の解決可能スレッドに変換されるか。
           削除行・コンテキスト行・リネーム・引用付きパスの判定を取り違えていないか。
           行位置以外の API エラーを成功扱いにしていないか。
-          途中失敗の再実行で同一指摘が重複せず、投稿済み URL を回収できるか。
+          途中失敗の再実行で保存済み結果と差分を復元し、モデルを再実行しないか。
+          同一指摘が重複せず、一括・個別の投稿済み URL を回収できるか。
           GitHub が拒否した位置だけをファイル単位に切り替えているか
         - README と examples/pr-review.yml が、実際の入力名・既定値・権限と
           一致しているか。ワークフローを変えたら両方の追随が要る

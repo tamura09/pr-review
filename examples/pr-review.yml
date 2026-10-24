@@ -10,6 +10,8 @@ on:
 # レビューの投稿に失敗する。
 permissions:
   contents: read
+  # 同じ workflow run の保存結果を復元するため
+  actions: read
   pull-requests: write
   issues: write
   # claude-review / codex-review チェックを PR のチェック一覧に出すため
