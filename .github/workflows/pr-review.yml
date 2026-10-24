@@ -732,7 +732,7 @@ jobs:
           gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
             -f body="${body}" >/dev/null
 
-      # モデルの結果を検証し、1指摘1スレッドとして一括投稿してから件数を表示する。
+      # モデルの結果を検証し、1指摘1スレッドで投稿してから件数をチェックに表示する。
       # 通常コメントへの返信には解決ボタンがないため、pull request review を使う。
       # 再利用可能ワークフローの checkout 先は呼び出し側なので、処理はここに置く。
       - name: Publish review threads and status
@@ -761,6 +761,8 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
             const footer = `---\n_${REVIEWER} [Workflow run](${RUN_URL})_`;
+            const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, posted: [] };
+            let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
 
@@ -790,6 +792,10 @@ jobs:
               const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
               fs.mkdirSync(resultDir, { recursive: true, mode: 0o700 });
               fs.writeFileSync(path.join(resultDir, isCodex ? "codex.md" : "claude.json"), raw, { mode: 0o600 });
+
+              savePublication = () => fs.writeFileSync(path.join(resultDir, "publication.json"),
+                JSON.stringify(publication, null, 2), { mode: 0o600 });
+              savePublication();
 
               let result;
               if (isCodex) {
@@ -865,6 +871,11 @@ jobs:
                   }
                 }
               }
+              const { createHash } = require("node:crypto");
+              const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+              // run URL は再実行でも変わらない。別の run / SHA / reviewer とは共有しない。
+              const publicationKey = hash([RUN_URL, SHA, statusContext]);
+              const summaryMarker = `<!-- pr-review:summary:${publicationKey} -->`;
               const lineComments = [];
               const fileComments = [];
               findings.forEach((finding, index) => {
@@ -876,10 +887,12 @@ jobs:
                 }
                 const file = files.get(finding.path);
                 if (!file) throw new Error(`指摘のファイルが PR 差分にありません: ${finding.path}`);
+                const marker = `<!-- pr-review:finding:${hash([publicationKey, index, file.path,
+                  finding.line, finding.side, finding.body.trim()])} -->`;
                 const comment = {
                   path: file.path, line: finding.line, side: finding.side,
-                  body: `${finding.body.trim()}\n\n_${REVIEWER}_`,
-                  index: index + 1,
+                  body: `${finding.body.trim()}\n\n_${REVIEWER}_\n${marker}`,
+                  index: index + 1, marker,
                 };
                 if (file[finding.side].has(finding.line)) lineComments.push(comment);
                 else fileComments.push(comment);
@@ -888,40 +901,100 @@ jobs:
               const verdict = findings.length
                 ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
                 : "**✅ 指摘なし**";
-              const fileLinks = [];
+              const fileLinks = new Map();
               const summary = () => `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n` +
-                (fileLinks.length ? `${fileLinks.join("\n")}\n\n` : "") + footer;
-              async function postFileComment(comment) {
-                const { data: posted } = await github.rest.pulls.createReviewComment({
-                  ...repo, pull_number: issue_number, commit_id: SHA,
-                  path: comment.path, subject_type: "file",
-                  body: `${comment.body}\n\n> 指定位置（${comment.side} ${comment.line}行）を差分内の行に紐付けられないため、ファイル全体への指摘として投稿しています。`,
-                });
-                fileLinks.push(`- [ファイル全体への指摘 ${comment.index}](${posted.html_url})`);
+                [...fileLinks].sort(([a], [b]) => a - b)
+                  .map(([index, url]) => `- [ファイル全体への指摘 ${index}](${url})\n`).join("") +
+                (fileLinks.size ? "\n" : "") + footer + `\n${summaryMarker}`;
+              function record(kind, posted) {
+                publication.posted.push({ kind, id: posted.id, url: posted.html_url });
+                savePublication();
+              }
+              function positionRejected(error) {
+                const detail = `${error.message} ${JSON.stringify(error.response?.data || {})}`;
+                return error.status === 422 && /line could not be resolved/i.test(detail);
               }
               if (findings.length) {
-                for (const comment of fileComments) await postFileComment(comment);
-                const request = comments => github.rest.pulls.createReview({
-                  ...repo, pull_number: issue_number, commit_id: SHA,
-                  event: "COMMENT", body: summary(), comments,
-                });
-                try {
-                  await request(lineComments.map(({ index, ...comment }) => comment));
-                } catch (error) {
-                  // GitHub 側の差分判定と一致しなかった場合も、本文を失わずスレッドにする。
-                  const detail = `${error.message} ${JSON.stringify(error.response?.data || {})}`;
-                  if (!lineComments.length || error.status !== 422 || !/line could not be resolved/i.test(detail)) throw error;
-                  for (const comment of lineComments) await postFileComment(comment);
-                  await request([]);
+                const params = { ...repo, pull_number: issue_number, per_page: 100 };
+                // 再実行時は公開済みの同一指摘を再利用する。履歴はモデルには渡さない。
+                const [reviews, comments] = await Promise.all([
+                  github.paginate(github.rest.pulls.listReviews, params),
+                  github.paginate(github.rest.pulls.listReviewComments, params),
+                ]);
+                let review = reviews.find(item => item.body?.includes(summaryMarker) && item.state !== "PENDING");
+                const remaining = [];
+                for (const comment of [...lineComments, ...fileComments]) {
+                  const posted = comments.find(item => !item.in_reply_to_id && item.body?.includes(comment.marker));
+                  if (!posted) remaining.push(comment);
+                  else {
+                    record("comment", posted);
+                    if (posted.subject_type === "file") fileLinks.set(comment.index, posted.html_url);
+                  }
                 }
+                let pendingLines = remaining.filter(comment => lineComments.includes(comment));
+                const pendingFiles = remaining.filter(comment => fileComments.includes(comment));
+                if (!review) {
+                  const request = comments => github.rest.pulls.createReview({
+                    ...repo, pull_number: issue_number, commit_id: SHA,
+                    event: "COMMENT", body: summary(), comments,
+                  });
+                  try {
+                    ({ data: review } = await request(pendingLines.map(({ index, marker, ...comment }) => comment)));
+                    pendingLines = [];
+                  } catch (error) {
+                    if (!pendingLines.length || !positionRejected(error)) throw error;
+                    // まずサマリーを確定し、拒否された行だけを後で個別に特定する。
+                    ({ data: review } = await request([]));
+                  }
+                }
+                record("summary", review);
+                async function updateSummary() {
+                  await github.rest.pulls.updateReview({
+                    ...repo, pull_number: issue_number, review_id: review.id, body: summary(),
+                  });
+                }
+                async function postFileComment(comment, reason) {
+                  const { data: posted } = await github.rest.pulls.createReviewComment({
+                    ...repo, pull_number: issue_number, commit_id: SHA,
+                    path: comment.path, subject_type: "file",
+                    body: `${comment.body}\n\n> ${reason}（${comment.side} ${comment.line}行）。ファイル全体への指摘として投稿しています。`,
+                  });
+                  record("comment", posted);
+                  fileLinks.set(comment.index, posted.html_url);
+                  await updateSummary();
+                }
+                for (const comment of pendingLines) {
+                  try {
+                    const { index, marker, ...line } = comment;
+                    const { data: posted } = await github.rest.pulls.createReviewComment({
+                      ...repo, pull_number: issue_number, commit_id: SHA, ...line,
+                    });
+                    record("comment", posted);
+                  } catch (error) {
+                    if (!positionRejected(error)) throw error;
+                    await postFileComment(comment, "GitHub が行位置を拒否しました");
+                  }
+                }
+                for (const comment of pendingFiles) {
+                  await postFileComment(comment, "指定位置を差分内の行に紐付けられません");
+                }
+                // 前回の投稿後に更新が失敗したサマリーも、再実行でリンクを復元する。
+                if (reviews.includes(review)) await updateSummary();
               } else {
                 await github.rest.issues.createComment({ ...repo, issue_number, body: summary() });
               }
+              publication.complete = true;
+              savePublication();
               state = findings.length ? FINDINGS_STATE : "success";
               description = findings.length
                 ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
                 : "指摘なし";
             } catch (error) {
+              publication.error = String(error.message);
+              savePublication();
+              if (publication.posted.length) {
+                core.error(`投稿済みレビュー・スレッド（再実行時に再利用）: ${publication.posted.map(item => item.url).join(" ")}`);
+              }
               core.error(error.message);
               description = String(error.message || "レビューを完了できませんでした")
                 .replace(/[\r\n]+/g, " ").slice(0, 130);

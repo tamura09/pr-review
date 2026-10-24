@@ -49,23 +49,49 @@ async function run(options = {}) {
     CLAUDE_REVIEW: options.claudeReview ?? JSON.stringify(options.result ?? result),
     ...options.env,
   };
+  const server = options.server ?? { reviews: [], comments: [], nextId: 88 };
+  const fetches = [];
+  const rejected = params => options.rejectLine || options.rejectLines?.includes(params.line);
   const api = method => async params => {
     calls.push({ method, params });
-    if (options.rejectLine && method === 'createReview' && params.comments.length) {
+    if ((method === 'createReview' && params.comments.some(rejected)) ||
+        (method === 'createReviewComment' && params.subject_type !== 'file' && rejected(params))) {
       throw Object.assign(new Error('Unprocessable Entity: Line could not be resolved'), { status: 422 });
     }
-    if (options.fail === method) throw Object.assign(new Error(options.failMessage ?? `Simulated ${method} failure`), { status: options.failStatus });
-    return { data: { id: 88, html_url: method === 'createReviewComment'
-      ? `https://github.com/example/repo/pull/7#discussion_r${calls.length}`
-      : 'https://github.com/example/repo/pull/7#pullrequestreview-88' } };
+    const count = calls.filter(call => call.method === method).length;
+    if (options.fail === method && (!options.failAt || options.failAt === count)) {
+      throw Object.assign(new Error(options.failMessage ?? `Simulated ${method} failure`), { status: options.failStatus });
+    }
+    const posted = { ...params, id: server.nextId++ };
+    if (method === 'createReview') {
+      posted.state = 'COMMENTED';
+      posted.html_url = `https://github.com/example/repo/pull/7#pullrequestreview-${posted.id}`;
+      server.reviews.push(posted);
+      for (const comment of params.comments) {
+        const id = server.nextId++;
+        server.comments.push({ ...comment, id, subject_type: 'line',
+          html_url: `https://github.com/example/repo/pull/7#discussion_r${id}` });
+      }
+    } else if (method === 'createReviewComment') {
+      posted.subject_type ??= 'line';
+      posted.html_url = `https://github.com/example/repo/pull/7#discussion_r${posted.id}`;
+      server.comments.push(posted);
+    } else if (method === 'updateReview') {
+      server.reviews.find(review => review.id === params.review_id).body = params.body;
+    }
+    if (options.loseResponse === method) throw new Error(`Simulated ${method} response lost`);
+    return { data: { ...posted } };
   };
   const github = {
-    paginate: async () => { throw new Error('Review history must not be fetched'); },
+    paginate: async (method, params) => {
+      fetches.push({ method, params });
+      if (options.fail === method) throw new Error(`Simulated ${method} failure`);
+      return structuredClone(method === 'listReviews' ? server.reviews : server.comments);
+    },
     rest: {
-      pulls: { createReview: api('createReview'), createReviewComment: api('createReviewComment') },
-      issues: {
-        createComment: api('createComment'),
-      },
+      pulls: { createReview: api('createReview'), createReviewComment: api('createReviewComment'),
+        updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments' },
+      issues: { createComment: api('createComment') },
       repos: { createCommitStatus: api('createCommitStatus') },
     },
   };
@@ -76,10 +102,14 @@ async function run(options = {}) {
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
     return {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
-      calls, failures, errors,
-      review: calls.findLast(call => call.method === 'createReview')?.params,
-      fileComments: calls.filter(call => call.method === 'createReviewComment').map(call => call.params),
-      summary: calls.find(call => ['createReview', 'createComment'].includes(call.method))?.params,
+      publication: existsSync(join(tempDir, 'pr-review-results/publication.json'))
+        ? JSON.parse(readFileSync(join(tempDir, 'pr-review-results/publication.json'), 'utf8')) : undefined,
+      calls, failures, errors, server, fetches,
+      review: calls.findLast(call => call.method === 'createReview')
+        ? { ...calls.findLast(call => call.method === 'createReview').params,
+            body: server.reviews.at(-1)?.body ?? calls.findLast(call => call.method === 'createReview').params.body } : undefined,
+      fileComments: calls.filter(call => call.method === 'createReviewComment' && call.params.subject_type === 'file').map(call => call.params),
+      summary: server.reviews.at(-1) ?? calls.find(call => call.method === 'createComment')?.params,
       status: calls.find(call => call.method === 'createCommitStatus')?.params,
     };
   } finally {
@@ -378,12 +408,12 @@ test('rename without textual changes falls back using the current path', async (
   assert.equal(output.failures.length, 0);
 });
 
-test('a GitHub position rejection retries line findings as file-level threads', async () => {
+test('a GitHub position rejection retries each line and falls back only after individual rejection', async () => {
   const output = await run({ rejectLine: true });
   assert.equal(output.failures.length, 0);
   assert.equal(output.status.state, 'failure');
   assert.deepEqual(output.calls.map(call => call.method), [
-    'createReview', 'createReviewComment', 'createReview', 'createCommitStatus',
+    'createReview', 'createReview', 'createReviewComment', 'createReviewComment', 'updateReview', 'createCommitStatus',
   ]);
   assert.equal(output.review.comments.length, 0);
   assert.match(output.review.body, /#discussion_r/);
@@ -399,9 +429,11 @@ test('unrelated HTTP 422 errors are not retried as position failures', async () 
 test('file-thread API failure remains an error and preserves the final result', async () => {
   const value = { ...result, findings: [{ ...finding, line: 999 }] };
   const output = await run({ fail: 'createReviewComment', result: value });
-  assert.equal(output.review, undefined);
+  assert.equal(output.review.comments.length, 0);
   assert.equal(output.status.state, 'error');
   assert.equal(output.savedResult, jsonBlock(value));
+  assert.equal(output.publication.posted.length, 1);
+  assert.match(output.errors[0], /pullrequestreview/);
 });
 
 test('unknown paths fail explicitly without attaching findings to an unrelated file', async () => {
@@ -412,6 +444,126 @@ test('unknown paths fail explicitly without attaching findings to an unrelated f
   assert.match(output.status.description, /not-in-pr\.ts/);
   assert.ok(output.savedResult);
 });
+
+test('summary failure publishes no file threads, including after a batch position rejection', async () => {
+  const value = { ...result, findings: [finding, { ...finding, line: 999 }] };
+  for (const rejectLine of [false, true]) {
+    const output = await run({ result: value, rejectLine, fail: 'createReview', failAt: rejectLine ? 2 : 1 });
+    assert.equal(output.server.comments.length, 0);
+    assert.equal(output.server.reviews.length, 0);
+    assert.equal(output.fileComments.length, 0);
+    assert.equal(output.status.state, 'error');
+  }
+});
+
+test('one rejected position preserves other valid line threads and distinguishes the reason', async () => {
+  const value = { ...result, findings: [finding, { ...finding, line: 9 }] };
+  const output = await run({ result: value, rejectLines: [42] });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.server.reviews.length, 1);
+  assert.equal(output.server.comments.length, 2);
+  assert.equal(output.fileComments.length, 1);
+  assert.match(output.fileComments[0].body, /GitHub が行位置を拒否しました/);
+  assert.doesNotMatch(output.fileComments[0].body, /差分内の行に紐付けられません/);
+  assert.equal(output.server.comments.find(comment => comment.subject_type === 'line').line, 9);
+  assert.match(output.summary.body, /指摘 2件/);
+});
+
+test('partial file publication is logged and resumes without duplicate summaries or threads', async () => {
+  const value = { ...result, findings: [finding, { ...finding, line: 998 }, { ...finding, line: 999 }] };
+  const first = await run({ result: value, fail: 'createReviewComment', failAt: 2 });
+  assert.equal(first.status.state, 'error');
+  assert.equal(first.server.reviews.length, 1);
+  assert.equal(first.server.comments.length, 2);
+  assert.equal(first.publication.posted.length, 2);
+  assert.match(first.publication.posted[0].url, /pullrequestreview/);
+  assert.match(first.publication.posted[1].url, /discussion_r/);
+  assert.equal(first.publication.error, 'Simulated createReviewComment failure');
+  assert.ok(first.errors.some(message => message.includes(first.publication.posted[1].url)));
+
+  const resumed = await run({ result: value, server: first.server });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.status.state, 'failure');
+  assert.equal(resumed.server.reviews.length, 1);
+  assert.equal(resumed.server.comments.length, 3);
+  assert.equal(resumed.calls.filter(call => call.method === 'createReview').length, 0);
+  assert.equal(resumed.fileComments.length, 1);
+  assert.equal(resumed.publication.complete, true);
+  assert.equal((resumed.summary.body.match(/#discussion_r/g) || []).length, 2);
+});
+
+test('a failed summary link update is repaired without reposting the published file thread', async () => {
+  const value = { ...result, findings: [{ ...finding, line: 999 }] };
+  const first = await run({ result: value, fail: 'updateReview' });
+  assert.equal(first.status.state, 'error');
+  assert.equal(first.server.comments.length, 1);
+  assert.equal(first.publication.posted.length, 2);
+  const resumed = await run({ result: value, server: first.server });
+  assert.equal(resumed.server.reviews.length, 1);
+  assert.equal(resumed.server.comments.length, 1);
+  assert.equal(resumed.fileComments.length, 0);
+  assert.equal(resumed.failures.length, 0);
+  assert.match(resumed.summary.body, /#discussion_r/);
+});
+
+test('a partial individual line retry reuses the valid thread on the next attempt', async () => {
+  const value = { ...result, findings: [{ ...finding, line: 9 }, finding] };
+  const first = await run({ result: value, rejectLines: [42], fail: 'createReviewComment', failAt: 3 });
+  assert.equal(first.status.state, 'error');
+  assert.equal(first.server.comments.length, 1);
+  assert.equal(first.server.comments[0].line, 9);
+  const resumed = await run({ result: value, rejectLines: [42], server: first.server });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.server.reviews.length, 1);
+  assert.equal(resumed.server.comments.length, 2);
+  assert.equal(resumed.fileComments.length, 1);
+  assert.equal(resumed.server.comments.filter(comment => comment.subject_type === 'line').length, 1);
+});
+
+test('a completed retry creates no new threads even if an existing one was resolved', async () => {
+  const first = await run();
+  first.server.comments[0].is_resolved = true;
+  const resumed = await run({ server: first.server });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.server.comments.length, 1);
+  assert.equal(resumed.server.reviews.length, 1);
+  assert.equal(resumed.status.state, 'failure');
+  assert.deepEqual(resumed.calls.map(call => call.method), ['updateReview', 'createCommitStatus']);
+});
+
+for (const method of ['createReview', 'createReviewComment']) {
+  test(`${method} response loss is recovered from GitHub without duplicate threads`, async () => {
+    const value = { ...result, findings: [{ ...finding, line: 999 }] };
+    const first = await run({ result: value, loseResponse: method });
+    assert.equal(first.status.state, 'error');
+    const resumed = await run({ result: value, server: first.server });
+    assert.equal(resumed.failures.length, 0);
+    assert.equal(resumed.server.reviews.length, 1);
+    assert.equal(resumed.server.comments.length, 1);
+    assert.match(resumed.summary.body, /#discussion_r/);
+  });
+}
+
+test('publication identities do not collide across reviewers, heads, or workflow runs', async () => {
+  for (const options of [{ isCodex: false }, { env: { SHA: 'another-head' } }, { env: { RUN_URL: runUrl + '4' } }]) {
+    const first = await run();
+    const second = await run({ ...options, server: first.server });
+    assert.equal(second.failures.length, 0);
+    assert.equal(second.server.reviews.length, 2);
+    assert.equal(second.server.comments.length, 2);
+  }
+});
+
+for (const method of ['listReviews', 'listReviewComments']) {
+  test(`${method} failure cannot publish duplicate threads without reading the previous attempt`, async () => {
+    const output = await run({ fail: method });
+    assert.equal(output.status.state, 'error');
+    assert.equal(output.server.comments.length, 0);
+    assert.equal(output.server.reviews.length, 0);
+    assert.equal(output.fetches.length, 2);
+    assert.ok(output.fetches.every(fetch => fetch.params.per_page === 100));
+  });
+}
 
 test('real Git patches preserve quoted paths, renames, deleted files, and binary files', async () => {
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-path-test-'));
