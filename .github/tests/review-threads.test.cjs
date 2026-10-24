@@ -1,5 +1,7 @@
 const assert = require('node:assert/strict');
-const { readFileSync } = require('node:fs');
+const { readFileSync, mkdtempSync, rmSync, existsSync, writeFileSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const { execFileSync } = require('node:child_process');
 const { join } = require('node:path');
 const { test } = require('node:test');
 
@@ -7,10 +9,9 @@ const { test } = require('node:test');
 // repository, so the publisher cannot import a script from this repository.
 const workflow = readFileSync(join(__dirname, '../workflows/pr-review.yml'), 'utf8');
 const defaultFindingsState = workflow.match(/      findings_state:\n[\s\S]*?        default: "([^"]+)"/)[1];
-const script = workflow.split('          script: |\n').at(-1)
-  .split('\n').map(line => line.replace(/^ {12}/, '')).join('\n');
+const script = workflow.match(/          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-const publish = new AsyncFunction('github', 'context', 'core', 'process', script);
+const publish = new AsyncFunction('github', 'context', 'core', 'process', 'require', script);
 const runUrl = 'https://github.com/example/repo/actions/runs/123';
 const finding = {
   path: 'src/example.ts', line: 42, side: 'RIGHT',
@@ -26,11 +27,14 @@ async function run(options = {}) {
   const calls = [];
   const failures = [];
   const errors = [];
+  const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-result-test-'));
   const env = {
+    RUNNER_TEMP: tempDir,
     SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
     REVIEWER: isCodex ? 'Codex · test-model · effort medium' : 'Claude · test-model · effort medium',
     IS_CODEX: String(isCodex), REVIEW_DIFF_OUTCOME: 'success',
     EFFORT_OUTCOME: 'success', MODEL_OUTCOME: 'success', CODEX_REVIEW: raw,
+    CLAUDE_REVIEW: options.claudeReview ?? JSON.stringify(options.result ?? result),
     ...options.env,
   };
   const api = method => async params => {
@@ -53,15 +57,21 @@ async function run(options = {}) {
       repos: { createCommitStatus: api('createCommitStatus') },
     },
   };
-  await publish(github, {
-    repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } },
-  }, { error: message => errors.push(message), setFailed: message => failures.push(message) }, { env });
-  return {
-    calls, failures, errors,
-    review: calls.find(call => call.method === 'createReview')?.params,
-    summary: calls.find(call => ['createReview', 'createComment', 'updateComment'].includes(call.method))?.params,
-    status: calls.find(call => call.method === 'createCommitStatus')?.params,
-  };
+  try {
+    await publish(github, {
+      repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } },
+    }, { error: message => errors.push(message), setFailed: message => failures.push(message) }, { env }, require);
+    const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
+    return {
+      savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
+      calls, failures, errors,
+      review: calls.find(call => call.method === 'createReview')?.params,
+      summary: calls.find(call => ['createReview', 'createComment', 'updateComment'].includes(call.method))?.params,
+      status: calls.find(call => call.method === 'createCommitStatus')?.params,
+    };
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 for (const isCodex of [false, true]) {
@@ -95,7 +105,7 @@ for (const isCodex of [false, true]) {
 
   test(`${reviewer}: no findings creates no threads and removes model commentary`, async () => {
     const raw = `確認しました\n${jsonBlock({ summary: '確認結果は表示しない', findings: [] })}\n追加の指摘はありません`;
-    const output = await run({ isCodex, raw });
+    const output = await run({ isCodex, raw, result: { summary: '確認結果は表示しない', findings: [] } });
     assert.equal(output.review, undefined);
     assert.ok(output.summary.body.includes('**✅ 指摘なし**'));
     assert.ok(!output.summary.body.includes('確認'));
@@ -154,10 +164,11 @@ for (const key of ['REVIEW_DIFF_OUTCOME', 'EFFORT_OUTCOME', 'MODEL_OUTCOME']) {
   });
 }
 
-test('missing Claude source comment is an error', async () => {
+test('Claude can publish structured output without a progress comment', async () => {
   const output = await run({ isCodex: false, sourceComments: [] });
-  assert.equal(output.status.state, 'error');
-  assert.equal(output.summary, undefined);
+  assert.equal(output.status.state, 'failure');
+  assert.equal(output.review.comments.length, 1);
+  assert.equal(output.failures.length, 0);
 });
 
 for (const fail of ['createReview', 'createComment', 'updateComment', 'deleteComment']) {
@@ -168,6 +179,7 @@ for (const fail of ['createReview', 'createComment', 'updateComment', 'deleteCom
     });
     assert.equal(output.status.state, 'error');
     assert.equal(output.failures.length, 1);
+    assert.equal(output.status.description, `Simulated ${fail} failure`);
     if (fail === 'createReview') {
       assert.equal(output.calls.some(call => ['createComment', 'updateComment'].includes(call.method)), false);
     }
@@ -199,4 +211,94 @@ test('invalid findings_state fails rather than posting a misleading status', asy
   assert.equal(output.review, undefined);
   assert.equal(output.status.state, 'error');
   assert.equal(output.failures.length, 1);
+});
+
+for (const isCodex of [false, true]) {
+  test(`${isCodex ? 'Codex' : 'Claude'} preserves the final result when review publication fails`, async () => {
+    const output = await run({ isCodex, fail: 'createReview' });
+    assert.equal(output.savedResult, isCodex ? jsonBlock(result) : JSON.stringify(result));
+    assert.equal(output.status.state, 'error');
+    assert.match(output.status.description, /createReview/);
+  });
+}
+
+test('Claude preserves HTML entities from structured output despite a corrupted tracking comment', async () => {
+  const original = { summary: 'エンティティ処理の不具合', findings: [{
+    ...finding, body: '**引用符の扱い**\n入力 `&#34;` / `&#10;` / `&#96;` をそのまま扱ってください。',
+  }] };
+  const corrupted = JSON.stringify(original).replaceAll('&#34;', '"').replaceAll('&#10;', '\n');
+  assert.throws(() => JSON.parse(corrupted));
+  const output = await run({
+    isCodex: false, result: original,
+    sourceComments: [comment(1, `\`\`\`json\n${corrupted}\n\`\`\`\n${runUrl}`)],
+  });
+  assert.ok(output.review.comments[0].body.startsWith(original.findings[0].body));
+  assert.equal(output.savedResult, JSON.stringify(original));
+  assert.equal(output.failures.length, 0);
+});
+
+for (const claudeReview of ['', '{', 'null', '{"summary":""}']) {
+  test(`invalid structured Claude result ${JSON.stringify(claudeReview)} never falls back to the comment`, async () => {
+    const output = await run({ isCodex: false, claudeReview });
+    assert.equal(output.review, undefined);
+    assert.equal(output.status.state, 'error');
+    assert.equal(output.failures.length, 1);
+  });
+}
+
+for (const [key, description] of [
+  ['REVIEW_DIFF_OUTCOME', 'PR差分を取得できませんでした'],
+  ['EFFORT_OUTCOME', 'effort を決められませんでした'],
+  ['MODEL_OUTCOME', 'レビューを完了できませんでした'],
+]) {
+  test(`${key} preserves its specific failure reason in the status`, async () => {
+    const output = await run({ env: { [key]: 'failure' } });
+    assert.equal(output.status.description, description);
+  });
+}
+
+test('prepared diff stays aligned with PR head when base adds lines above the change', () => {
+  assert.match(workflow, /uses: actions\/checkout@[^\n]+\n        with:\n(?:          #[^\n]*\n)*          ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
+  const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-diff-test-'));
+  const origin = join(tempDir, 'origin');
+  const checkout = join(tempDir, 'checkout');
+  const git = (cwd, ...args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], {
+    cwd, encoding: 'utf8', stdio: 'pipe',
+    env: { ...process.env, GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com',
+      GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com', GIT_CONFIG_GLOBAL: '/dev/null' },
+  }).trim();
+  try {
+    git(tempDir, 'init', '-b', 'main', origin);
+    const base = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`).join('\n') + '\n';
+    writeFileSync(join(origin, 'file.txt'), base);
+    git(origin, 'add', 'file.txt');
+    git(origin, 'commit', '-m', 'Initial file');
+    git(origin, 'checkout', '-b', 'feature');
+    writeFileSync(join(origin, 'file.txt'), base.replace('line 30\n', 'changed line\n'));
+    git(origin, 'commit', '-am', 'PR change');
+    const head = git(origin, 'rev-parse', 'HEAD');
+    git(origin, 'checkout', 'main');
+    writeFileSync(join(origin, 'file.txt'), `new base line\n${base}`);
+    git(origin, 'commit', '-am', 'Base adds a line');
+    git(origin, 'checkout', '-b', 'merge-result');
+    git(origin, 'merge', '--no-edit', 'feature');
+    const merged = git(origin, 'rev-parse', 'HEAD');
+    git(tempDir, 'clone', origin, checkout);
+    git(checkout, 'checkout', '--detach', head);
+    const prepareScript = workflow.match(/      - name: Prepare PR diff\n[\s\S]*?        run: \|\n((?: {10}[^\n]*\n|\n)*)/)[1]
+      .replace(/^ {10}/gm, '');
+    execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir },
+    });
+    const actual = readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim();
+    assert.equal(actual, git(checkout, 'diff', `origin/main...${head}`));
+    const changedLine = diff => {
+      const hunk = diff.match(/@@ .* \+(\d+),(\d+) @@/);
+      return Number(hunk[1]) + Number(hunk[2]) - 1;
+    };
+    assert.equal(changedLine(actual), 30);
+    assert.equal(changedLine(git(checkout, 'diff', `origin/main...${merged}`)), 31);
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
 });
