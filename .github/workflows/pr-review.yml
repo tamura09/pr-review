@@ -1,6 +1,7 @@
 # Claude と Codex (OpenAI) の2つで PR をレビューする再利用可能ワークフロー。
 #
-# 2つは matrix の別の leg として並列に走り、それぞれがコメントを1件投稿して
+# 2つは matrix の別の leg として並列に走り、それぞれが件数サマリーと指摘ごとの
+# レビュースレッドを投稿して
 # PR のチェック一覧に claude-review / codex-review を出す。片方が落ちても
 # もう片方のレビューは届く。
 #
@@ -77,11 +78,11 @@ on:
       findings_state:
         description: >-
           指摘があったときに claude-review / codex-review チェックに付ける状態。
-          failure だと赤バツで一目で分かるが PR 全体が赤くなる。
-          success にすると常に緑で、件数は説明文だけに出る
+          既定は success。マージの可否はスレッドの解決必須設定で制御する。
+          failure にすると、スレッドを解決してもチェックは失敗のままになる
         type: string
         required: false
-        default: "failure"
+        default: "success"
       runs_on:
         description: "実行するランナー"
         type: string
@@ -441,25 +442,21 @@ jobs:
             判断するのは人間です。あなたの仕事は、人間が見落とすと困るものを挙げること。
 
             ## 出力の形式
-            本文の冒頭に、必ず次のどちらかの行をそのままの書式で入れてください。
-            この行は PR のチェック一覧に出す判定として機械的に読み取られるので、
-            **書式を変えたり省略したりしないこと。**
+            次の JSON を、必ず1つの ```json コードブロックとして出力してください。
+            JSON の外に前置き、進捗、確認結果、褒め言葉、結びは書かないでください。
+            ワークフローが件数サマリーと、1指摘ごとのレビュースレッドに変換します。
 
-            - 指摘が1件もない: `**✅ 指摘なし**`
-            - 指摘がある: `**⚠️ 指摘 N件** — 最も重いものを一言で`
+            ```json
+            {"summary":"最も重い指摘を一言で","findings":[{"path":"src/example.ts","line":42,"side":"RIGHT","body":"**指摘の見出し**\n具体的にどんな入力・状態でどう壊れるかと、必要な修正を数行で説明。"}]}
+            ```
 
-            `N` は指摘の件数の数字です。軽微なものでも、指摘として書いたなら
-            件数に含めます。どちらの行も無い場合はレビュー失敗として扱われます。
-
-            そのあとは指摘だけを深刻な順に並べます。**1指摘あたり数行に収めること。**
-            前置き、変更内容の要約、問題がない箇所、褒め言葉、結び、進捗チェックリストは
-            書かないでください。「〜を確認しました」「追加の指摘はありません」のような
-            確認結果の報告も書かないでください。
-
-            2回目以降のレビューでも、前回の指摘が直ったかの報告は書かないでください。
-            直っていれば何も書かず、直っていなければ今回の指摘として書き直します。
-
-            指摘がなければ、他に書きたいことがあっても verdict 行だけで終えてください。
+            - `findings` は深刻な順。1要素が1指摘で、`body` は数行に収めます。
+            - `path` はリポジトリ相対パス、`line` は差分に表示される実際の行番号です。
+              追加行・変更後・コンテキスト行は `side: "RIGHT"`、削除行は `side: "LEFT"`。
+              差分の外にある問題は、その問題に直接関係する差分内の行に付けてください。
+            - 指摘なしなら `{"summary":"","findings":[]}` だけをコードブロックに入れます。
+            - 再レビューでも、前回の指摘が直ったかの報告は不要です。
+              直っていなければ、今回の指摘として含めてください。
 
             ## レビュー範囲
             ベースブランチ `${{ github.event.pull_request.base.ref }}` との差分を
@@ -596,34 +593,21 @@ jobs:
             判断するのは人間です。あなたの仕事は、人間が見落とすと困るものを挙げること。
 
             ## 出力の形式
-            本文の冒頭に、必ず次のどちらかの行をそのままの書式で入れてください。
-            この行は PR のチェック一覧に出す判定として機械的に読み取られるので、
-            **書式を変えたり省略したりしないこと。**
+            次の JSON を、必ず1つの ```json コードブロックとして出力してください。
+            JSON の外に前置き、進捗、確認結果、褒め言葉、結びは書かないでください。
+            ワークフローが件数サマリーと、1指摘ごとのレビュースレッドに変換します。
 
-            - 指摘が1件もない: `**✅ 指摘なし**`
-            - 指摘がある: `**⚠️ 指摘 N件** — 最も重いものを一言で`
+            ```json
+            {"summary":"最も重い指摘を一言で","findings":[{"path":"src/example.ts","line":42,"side":"RIGHT","body":"**指摘の見出し**\n具体的にどんな入力・状態でどう壊れるかと、必要な修正を数行で説明。"}]}
+            ```
 
-            `N` は指摘の件数の数字です。軽微なものでも、指摘として書いたなら
-            件数に含めます。どちらの行も無い場合はレビュー失敗として扱われます。
-
-            そのあとは指摘だけを並べます。**コメントに書いてよいのは verdict 行と
-            指摘そのものだけ**で、**1指摘あたり数行に収めること。**
-
-            次のものは書かないでください。
-
-            - 前置き、レビューの進め方や作業手順の説明
-            - 確認した内容の報告 (「〜を確認しました」「〜は問題ありません」
-              「〜は正しく動作します」など、指摘ではない確認結果)
-            - 変更内容の要約、全体の所感、褒め言葉、結びの一文
-            - 前回までのレビューで出した指摘が直っているかの報告
-              (「〜は解消を確認しました」など)。直っていれば何も書かない。
-              直っていなければ、その指摘を今回の指摘として書き直す
-
-            同じ PR を2回目以降にレビューするときも同じです。前回との差分の
-            説明や、前回の指摘の消化状況は書かないでください。
-
-            指摘がない場合は、他に書きたいことがあっても冒頭の verdict 行
-            だけで終えます。
+            - `findings` は深刻な順。1要素が1指摘で、`body` は数行に収めます。
+            - `path` はリポジトリ相対パス、`line` は差分に表示される実際の行番号です。
+              追加行・変更後・コンテキスト行は `side: "RIGHT"`、削除行は `side: "LEFT"`。
+              差分の外にある問題は、その問題に直接関係する差分内の行に付けてください。
+            - 指摘なしなら `{"summary":"","findings":[]}` だけをコードブロックに入れます。
+            - 再レビューでも、前回の指摘が直ったかの報告は不要です。
+              直っていなければ、今回の指摘として含めてください。
 
             ## レビュー範囲
             下の「PR 差分」がベースブランチとの差分です。**この差分を必ず読んでから**
@@ -644,7 +628,7 @@ jobs:
             - 意味の変わらない書式や命名の好みは指摘しない。
             - `AGENTS.md` と `CLAUDE.md` はこのリポジトリの前提を理解するための文脈として読む。
               ただし規約違反そのものは指摘の対象にしない。
-            - 深刻なものから順に並べる。**指摘がなければ verdict 行だけで終える。**
+            - 深刻なものから順に並べる。指摘がなければ `findings` を空にする。
               無理に何か見つけようとしないこと。
 
             ## 入力の扱い
@@ -731,28 +715,6 @@ jobs:
             } >> "${GITHUB_ENV}"
           fi
 
-      # Claude のコメントと同じ実行 URL を含むので、判定のステップが見分けられるよう
-      # 本文の先頭に目印の HTML コメントを入れる。判定は先頭一致で見るので、
-      # 前に何か足すと Claude のコメントとして扱われる。
-      - name: Post the Codex review
-        if: ${{ always() && steps.codex.outcome == 'success' && steps.codex.outputs.final-message != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
-          REVIEWER: ${{ format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          body="<!-- pr-review:codex -->
-          ${CODEX_REVIEW}
-
-          ---
-          _${REVIEWER} [Workflow run](${RUN_URL})_"
-          gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
-            -f body="${body}" >/dev/null
-
       # 両方の leg が同じ失敗をするので、コメントは Claude の leg だけが出す
       - name: Report PR diff preparation failure
         if: ${{ always() && matrix.reviewer == 'claude' && steps.review_diff.outcome != 'success' }}
@@ -772,117 +734,122 @@ jobs:
           gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
             -f body="${body}" >/dev/null
 
-      # コメントを開かなくても結果が分かるよう、PR のチェック一覧に1行出す。
-      #
-      # 判定は各 leg のモデルが投稿したコメント冒頭の verdict 行から読み取る。
-      # Claude と Codex の出力書式を同じに固定し、チェックは claude-review /
-      # codex-review に分けて出す。
-      #
-      # 2つの leg のコメントはどちらも同じ実行 URL を含むので、Codex のコメントの
-      # 先頭にだけ入れた目印の有無で見分ける。Claude が落ちた場合は、その進捗コメント
-      # (エラー表示に書き換わったもの) を拾い、verdict 行が無いので error になる。
-      #
-      # モデルの実行が落ちた場合も error として出したいので always()。
-      #
-      # 指摘なしのときは、コメントを verdict 行だけに書き換える。プロンプトで禁じても
-      # モデルは「前回の指摘は修正済み」「追加の指摘はありません」のような確認結果を
-      # 書き足すことがあり、指摘なしのコメントに文章が付くと読み手が中身を読まされる。
-      - name: レビュー結果をチェックとして出す
+      # モデルの結果を検証し、1指摘1スレッドとして一括投稿してから件数を表示する。
+      # 通常コメントへの返信には解決ボタンがないため、pull request review を使う。
+      # 再利用可能ワークフローの checkout 先は呼び出し側なので、処理はここに置く。
+      - name: Publish review threads and status
         if: always()
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          RUN_ID: ${{ github.run_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
-          CONTEXT: ${{ matrix.reviewer }}-review
+          MODEL_OUTCOME: ${{ matrix.reviewer == 'codex' && steps.codex.outcome || steps.claude.outcome }}
+          CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
           IS_CODEX: ${{ matrix.reviewer == 'codex' }}
           REVIEWER: >-
             ${{ matrix.reviewer == 'codex' &&
             format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
             format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort) }}
-        run: |
-          # 途中で失敗してもチェックだけは必ず出したいので -e は付けない
-          set -uo pipefail
+        with:
+          script: |
+            const { SHA, RUN_URL, FINDINGS_STATE, REVIEWER } = process.env;
+            const isCodex = process.env.IS_CODEX === "true";
+            const statusContext = isCodex ? "codex-review" : "claude-review";
+            const repo = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const footer = `---\n_${REVIEWER} [Workflow run](${RUN_URL})_`;
+            let state = "error";
+            let description = "レビューを完了できませんでした";
 
-          state=error
-          description="レビューを完了できませんでした"
+            try {
+              if (process.env.REVIEW_DIFF_OUTCOME !== "success") {
+                throw new Error("PR差分を取得できませんでした");
+              }
+              if (process.env.EFFORT_OUTCOME !== "success") {
+                throw new Error("effort を決められませんでした");
+              }
+              if (process.env.MODEL_OUTCOME !== "success") {
+                throw new Error("レビューを完了できませんでした");
+              }
+              if (!["success", "failure"].includes(FINDINGS_STATE)) {
+                throw new Error("findings_state は success / failure を指定してください");
+              }
 
-          if [ "${REVIEW_DIFF_OUTCOME}" != "success" ]; then
-            description="PR差分を取得できませんでした"
-          elif [ "${EFFORT_OUTCOME}" != "success" ]; then
-            description="effort を決められませんでした"
-          else
-            # この実行でこの leg が投稿したコメントだけを拾う (本文に実行URLが入って
-            # いて、目印の有無が leg と一致する)。目印は先頭だけを見る。Claude が
-            # 指摘の中で目印の文字列を引用しても Codex 扱いにしないため。--paginate の --jq はページごとに
-            # 評価されるので、1コメント1行の JSON で出して最後の行を取る
-            comment=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
-              --jq ".[] | select(.user.login == \"github-actions[bot]\")
-                        | select(.body | contains(\"/actions/runs/${RUN_ID}\"))
-                        | select((.body | startswith(\"<!-- pr-review:codex -->\")) == ${IS_CODEX})
-                        | {id, body} | @json" 2>/dev/null | tail -n 1) || comment=""
-            comment_id=$(jq -r '.id // empty' <<< "$comment" 2>/dev/null) || comment_id=""
-            body=$(jq -r '.body // empty' <<< "$comment" 2>/dev/null) || body=""
+              let sourceComment;
+              let raw = process.env.CODEX_REVIEW || "";
+              if (!isCodex) {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  ...repo, issue_number, per_page: 100,
+                });
+                sourceComment = comments.filter(comment =>
+                  comment.user.login === "github-actions[bot]" &&
+                  comment.body.includes(RUN_URL) &&
+                  !comment.body.startsWith("<!-- pr-review:codex -->")
+                ).at(-1);
+                raw = sourceComment?.body || "";
+              }
 
-            if [ -n "$body" ]; then
-              # JavaScript はシェルで展開しない。
-              # shellcheck disable=SC2016
-              out=$(BODY="$body" node -e '
-                const body = process.env.BODY || "";
-                const onFindings = process.env.FINDINGS_STATE || "failure";
-                const clean = /\*\*\s*✅\s*指摘なし\s*\*\*/.test(body);
-                const m = body.match(
-                  /\*\*\s*⚠️\s*指摘\s*(\d+)\s*件\s*\*\*\s*[—―–\-]?\s*(.*)/,
-                );
-                if (clean && !m) {
-                  process.stdout.write("success\t指摘なし");
-                } else if (m) {
-                  const headline = (m[2] || "").trim().slice(0, 100);
-                  const desc = `指摘 ${m[1]}件${headline ? ": " + headline : ""}`;
-                  process.stdout.write(onFindings + "\t" + desc.slice(0, 130));
+              const blocks = [...raw.matchAll(/^```json\s*\n([\s\S]*?)^```[ \t]*$/gm)];
+              if (blocks.length !== 1) {
+                throw new Error("レビュー結果の JSON ブロックが不正です");
+              }
+              const result = JSON.parse(blocks[0][1]);
+              if (!result || !Array.isArray(result.findings) || typeof result.summary !== "string") {
+                throw new Error("レビュー結果の形式が不正です");
+              }
+              const findings = result.findings;
+              const comments = findings.map(finding => {
+                if (!finding || typeof finding.path !== "string" || !finding.path.trim() ||
+                    !Number.isSafeInteger(finding.line) || finding.line < 1 ||
+                    !["LEFT", "RIGHT"].includes(finding.side) ||
+                    typeof finding.body !== "string" || !finding.body.trim()) {
+                  throw new Error("指摘のパス・行番号・本文が不正です");
                 }
-              ' 2>/dev/null) || out=""
-              if [ -n "$out" ]; then
-                state=${out%%$'\t'*}
-                description=${out#*$'\t'}
-                # 「指摘なし」になるのは verdict が指摘なしのときだけ
-                # (指摘ありは findings_state に関わらず「指摘 N件」になる)
-                if [ "${description}" = "指摘なし" ] && [ -n "${comment_id}" ]; then
-                  marker=""
-                  if [ "${IS_CODEX}" = "true" ]; then
-                    marker="<!-- pr-review:codex -->
-          "
-                  fi
-                  clean_body="${marker}**✅ 指摘なし**
+                return {
+                  path: finding.path, line: finding.line, side: finding.side,
+                  body: `${finding.body.trim()}\n\n_${REVIEWER}_`,
+                };
+              });
+              const headline = result.summary.replace(/[\r\n]+/g, " ").trim();
+              const verdict = findings.length
+                ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
+                : "**✅ 指摘なし**";
+              let summary = `${verdict}\n\n${footer}`;
 
-          ---
-          _${REVIEWER} [Workflow run](${RUN_URL})_"
-                  gh api --method PATCH "repos/${GH_REPO}/issues/comments/${comment_id}" \
-                    -f body="${clean_body}" >/dev/null \
-                    || echo "コメントを verdict 行だけに書き換えられなかった"
-                fi
-              else
-                echo "コメントに verdict 行が見つからなかった"
-              fi
-            else
-              echo "この実行のコメントが見つからなかった"
-            fi
-          fi
+              if (findings.length) {
+                // 全指摘を1回の API 呼び出しで投稿する。無効な差分位置を通常コメントに
+                // フォールバックすると解決必須を回避するため、その場合は error にする。
+                const { data: review } = await github.rest.pulls.createReview({
+                  ...repo, pull_number: issue_number, commit_id: SHA,
+                  event: "COMMENT", body: footer, comments,
+                });
+                summary = `${verdict}\n\n[指摘スレッドを確認](${review.html_url})\n\n${footer}`;
+              }
 
-          echo "${CONTEXT}: ${state} / ${description}"
-          gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
-            -f state="${state}" \
-            -f context="${CONTEXT}" \
-            -f description="${description}" \
-            -f target_url="${RUN_URL}" >/dev/null
+              if (sourceComment) {
+                await github.rest.issues.updateComment({
+                  ...repo, comment_id: sourceComment.id, body: summary,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  ...repo, issue_number,
+                  body: `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${summary}`,
+                });
+              }
+              state = findings.length ? FINDINGS_STATE : "success";
+              description = findings.length
+                ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
+                : "指摘なし";
+            } catch (error) {
+              core.error(error.message);
+              description = "レビュー結果の取得・スレッド投稿に失敗しました";
+              core.setFailed(description);
+            }
 
-          # モデルの実行を continue-on-error にしているため、レビューが
-          # 完了しなかった場合はここで job 自体も失敗させる。
-          if [ "${state}" = "error" ]; then
-            exit 1
-          fi
+            await github.rest.repos.createCommitStatus({
+              ...repo, sha: SHA, state, context: statusContext,
+              description, target_url: RUN_URL,
+            });

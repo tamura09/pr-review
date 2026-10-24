@@ -3,7 +3,8 @@
 Claude (既定は Opus 5.5) と
 [Codex の GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
 の2つに、同じ PR を並列でレビューさせる再利用可能ワークフロー。それぞれが別の
-コメントを投稿し、別のチェック (`claude-review` / `codex-review`) を出す。
+件数サマリーと、1指摘につき1つの解決可能なレビュースレッドを投稿し、
+別のチェック (`claude-review` / `codex-review`) を出す。
 **レビューを投稿するだけで、マージも承認もしない。** 判断は人間がする。
 
 effort はどちらも PR の変更行数で切り替える (→ [effort の決め方](#effort-の決め方))。
@@ -187,15 +188,17 @@ Claude と Codex は matrix の別の leg (`review / claude`・`review / codex`)
 落ちても、もう片方のレビューはそのまま届く。各 leg は自分のモデルの認証情報しか
 SSM から読まない。
 
-Claude は `track_progress` 付きで動き、進捗コメントを最終的なレビューに書き換える。
-失敗した場合、そのコメントはエラー表示のまま残る。
+Claude は `track_progress` 付きで動き、進捗コメントに JSON 形式で結果を返す。
+Codex は GPT-6 Astra・read-only サンドボックスで差分と関連コードを読み、同じ形式の
+最終回答を返す。後続の共通ステップが JSON を検証し、件数サマリーと各指摘の
+レビュースレッドを `github-actions[bot]` として投稿する。
 
-Codex は GPT-6 Astra・read-only サンドボックスで差分と関連コードを読み、最終回答を
-`github-actions[bot]` の PR コメントとして投稿する。コメント末尾に workflow run URL を
-付ける。Claude と同じ verdict 書式で投稿するので、判定の読み取りは共通。どちらの
-コメントも同じ run URL を含むため、Codex のコメントには目印の HTML コメント
-(`<!-- pr-review:codex -->`) を先頭に入れ、先頭一致で見分けている。Claude が指摘の
-中でこの文字列を引用しても取り違えない。
+Claude の進捗コメントは件数サマリーに書き換え、Codex はサマリーを新規投稿する。
+指摘本文はサマリーにまとめず、差分の該当行に1件ずつ投稿する。サマリーには
+スレッドへのリンク、モデル名、effort、workflow run URL を付ける。
+失敗した場合はチェックを `error` にし、Claude の進捗コメントはそのまま残す。
+Codex のサマリーには目印の HTML コメント (`<!-- pr-review:codex -->`) を先頭に入れ、
+Claude の進捗コメントと取り違えないようにする。
 
 Codex を止めて Claude だけにしたい場合は `codex_review: false` にする。
 
@@ -238,7 +241,7 @@ Renovate の実行 (毎日 08:00 JST、または手で dispatch) が1回挟ま�
 レビューされることになる。
 
 `extra_instructions` で、式展開の `run:` への直接埋め込み、`permissions` の
-広さ、トークンのログ漏れ、verdict 行の書式とそれを読む正規表現のずれ、
+広さ、トークンのログ漏れ、モデルが返す JSON と投稿処理の形式のずれ、
 README と `examples/pr-review.yml` の追随漏れを見るよう足してある。
 
 **信頼境界はこのリポジトリへの push 権限。** `pull_request` ではワークフローが
@@ -272,34 +275,57 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 - 意味の変わらない書式・命名の好みは指摘しない
 - 1指摘あたり数行に収める。前置き・作業手順の説明は書かない
 - 確認した内容 (「〜を確認しました」「〜は問題ありません」) は書かない。
-  コメントに載るのは verdict 行と指摘だけ
+  投稿するのは件数サマリーと指摘だけ
 - 2回目以降のレビューでも、前回の指摘が直ったかの報告は書かない。
   直っていなければ今回の指摘として書き直す
-- 指摘がなければ verdict 行だけで終える
+- 指摘がなければ空の `findings` を返し、サマリーには「指摘なし」だけを表示する
 
 ## 結果の見え方
 
-コメントを開かなくても分かるよう、**PR のチェック一覧に `claude-review` と
-`codex-review` を出す。** 表示はどちらも同じ形。
+各モデルが `**⚠️ 指摘 N件** — 要約` のサマリーコメントを1件投稿し、
+指摘ごとに差分の該当行へ独立したレビュースレッドを作る。各スレッドで返信と
+**Resolve conversation** が使える。指摘なしの場合は `**✅ 指摘なし**` とフッターだけを
+投稿する。件数はモデルの申告ではなく、検証した `findings` の要素数から決める。
+
+PR のチェック一覧にも `claude-review` と `codex-review` を出す。
 
 | 状態 | 表示 |
 | --- | --- |
 | 指摘なし | ✅ `claude-review — 指摘なし` |
-| 指摘あり | ❌ `claude-review — 指摘 3件: <最も重いものの要約>` |
-| レビュー失敗 | ❌ `claude-review — レビューを完了できませんでした` |
+| 指摘あり | ✅ `claude-review — 指摘 3件: <最も重いものの要約>` |
+| レビュー失敗 | ❌ `claude-review — レビュー結果の取得・スレッド投稿に失敗しました` |
 
 2つのモデルの指摘は突き合わせない。片方だけが挙げた指摘も、そのまま人間が読む。
+再レビューでも過去のスレッドは自動で解決・削除しない。修正済み、または対応不要と
+判断した指摘は、人間がスレッドを解決する。同じ問題を再度指摘した場合も新しい
+スレッドになるため、過去の未解決スレッドも含めて確認する。
 
-指摘があっても PR 全体を赤くしたくない場合は `findings_state: success` にする。
-件数と要約は説明文に出たまま、状態だけ緑になる。
+モデルの失敗、JSON の形式不正、差分に付けられない行番号、API の投稿失敗は
+`error` とし、ジョブも失敗させる。通常コメントへのフォールバックは行わない。
+全指摘のスレッドとサマリーの投稿が完了してから成功チェックを出す。
 
-判定はコメント冒頭の verdict 行 (`**✅ 指摘なし**` / `**⚠️ 指摘 N件** — 要約`) を
-読み取っている。この行が無い場合やモデルの実行が落ちた場合は、そのチェックを
-`error` として報告するので、失敗が「指摘なし」に見えることはない。
+### 未解決スレッドがある間はマージを禁止する
 
-指摘なしのときは、判定のあとでコメント本文を verdict 行とフッターだけに書き換える。
-プロンプトで禁じても、モデルは「前回の指摘は修正済み」「追加の指摘はありません」の
-ような確認結果を書き足すことがあるため。指摘ありのコメントには手を入れない。
+**呼び出し側の各リポジトリで**、対象ブランチの保護ルールに
+[Require conversation resolution before merging](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-conversation-resolution-before-merging)
+を設定する。Rulesets を使う場合は **Require a pull request before merging** の
+**Require conversation resolution before merging** を有効にする。
+これにより、このワークフローの指摘を含む未解決のレビュースレッドがある間は
+マージできない。通常の PR コメントへの返信には、この解決必須設定は適用されない。
+
+レビュー完了前やレビュー失敗時のマージも止める場合は、
+**Require status checks to pass before merging** に `claude-review` と `codex-review` を
+登録する。`codex_review: false` または `codex_fallback: false` の場合は `claude-review`
+だけを必須にする。fork、draft、`skip_authors` 対象の PR ではチェックを投稿しないため、
+必須チェックを登録する場合は、それらの PR が待機したままになる運用にも注意する。
+管理者や bypass 権限にも制限を適用するかは、ブランチ保護・Ruleset 側で設定する。
+ワークフロー自体はリポジトリの保護設定を変更しない。
+
+`findings_state` の既定値は `success`。チェックはレビューの完了を表し、マージの可否は
+未解決スレッドで制御する。以前の既定値 `failure` からの変更になる。
+`findings_state: failure` を明示した場合は従来どおり赤になるが、スレッドを解決しても
+コミットのチェック状態は変わらない。解決によってマージ可能にしたい場合は、
+`success` を使う。
 
 判定用のファイルを Claude に書かせる方式は取れない。`track_progress` を使うと
 タグモードになり、ツールが明示的な allowlist (`Read` / `Grep` / `Glob` / `LS` と
@@ -321,7 +347,7 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 | `claude_timeout_minutes` | number | `20` | Claude のステップのタイムアウト。超えたら `claude-review` を error にする |
 | `skip_authors` | string | `dependabot[bot],renovate[bot],tamura09-renovate[bot]` | レビューをスキップする作成者。カンマ区切り |
 | `skip_draft` | boolean | `true` | draft の PR をスキップするか |
-| `findings_state` | string | `failure` | 指摘があったときの `claude-review` / `codex-review` チェックの状態。`success` にすると常に緑 |
+| `findings_state` | string | `success` | 指摘があったときのチェック状態。マージ制御にはスレッド解決必須を使う。`failure` にするとスレッドを解決しても赤のまま |
 | `runs_on` | string | `ubuntu-latest` | 実行するランナー |
 | `aws_role_to_assume` | string | `arn:aws:iam::222165754930:role/github-actions-pr-review` | トークンを読むために OIDC で引くロール |
 | `aws_region` | string | `ap-northeast-1` | パラメータのあるリージョン |
