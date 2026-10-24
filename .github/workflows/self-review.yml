@@ -27,8 +27,6 @@ permissions:
   statuses: write
   # Claude/Codex の認証情報を SSM から読むための OIDC トークン発行
   id-token: write
-  # CI の実行結果を Claude に読ませるため (github_ci MCP に必要)
-  actions: read
 
 concurrency:
   group: self-review-${{ github.event.pull_request.number }}
@@ -38,12 +36,24 @@ concurrency:
 # ロールの信頼ポリシーが repo:tamura09/*:pull_request なので、このリポジトリも
 # そのまま対象に入る。
 jobs:
+  validate:
+    name: Review publisher tests
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - run: node --test .github/tests/review-threads.test.cjs
+
   review:
     uses: ./.github/workflows/pr-review.yml
     with:
       extra_instructions: |
-        このリポジトリの中身は GitHub Actions のワークフローと、その使い方を
-        書いた README・サンプルだけです。次を重点的に見てください。
+        このリポジトリの中身は GitHub Actions のワークフロー、そのテストと、
+        使い方を書いた README・サンプルです。次を重点的に見てください。
 
         - 式展開 (`github.event.*` や `inputs.*` の値) を `run:` のスクリプトに
           直接埋めていないか。env 経由で受けないとシェルに注入できる
@@ -54,10 +64,13 @@ jobs:
         - 各 leg が自分のモデルの認証情報だけを読んでいるか (Claude の leg で Codex の
           auth.json を読んでいないか、その逆も)。各モデルの実行前に AWS の一時認証情報を
           消し、Codex refresh 後だけ auth.json を SSM へ戻しているか
-        - Claude と Codex のコメントを判定ステップが取り違えないか (目印の有無と leg の
-          対応)。claude-review / codex-review が leg ごとに1つずつ出るか
+        - Claude の構造化出力と Codex の最終回答を投稿ステップが取り違えないか。
+          claude-review / codex-review が leg ごとに1つずつ出るか
         - effort を決める変更行数の数え方と閾値の比較が、README の説明と一致しているか
-        - 呼び出され側のプロンプトが出力させる verdict 行の書式と、それを読む
-          チェック出力ステップの正規表現が食い違っていないか
+        - 両モデルが返す JSON の形式と投稿ステップのパーサーが一致しているか。
+          各指摘が解決可能なレビュースレッドになり、投稿失敗時にチェックが error になるか
+        - 差分・関連コード・投稿先のコミットが同じ PR head になっているか。
+          Claude の結果を HTML 加工済みコメントから取得していないか。
+          投稿失敗時の artifact に、最終結果以外の実行履歴や認証情報が入らないか
         - README と examples/pr-review.yml が、実際の入力名・既定値・権限と
           一致しているか。ワークフローを変えたら両方の追随が要る
