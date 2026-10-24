@@ -1,7 +1,7 @@
 # pr-review
 
 Claude (既定は Opus 5.5) と
-[Codex の GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)
+[Codex の GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
 の2つに、同じ PR を並列でレビューさせる再利用可能ワークフロー。それぞれが別の
 件数サマリーと、1指摘につき1つの解決可能なレビュースレッドを投稿し、
 別のチェック (`claude-review` / `codex-review`) を出す。
@@ -164,7 +164,7 @@ secret に入れる場合も、手元の `~/.codex/auth.json` ではなく
 ## effort の決め方
 
 ベースブランチとの差分の変更行数 (追加 + 削除) で effort を決める。Claude と
-GPT-6 Astra は effort の段階名 (`low`〜`max`) が同じなので、両方に同じ値を渡す。
+GPT-6.1 Sol は effort の段階名 (`low`〜`max`) が同じなので、両方に同じ値を渡す。
 
 | 変更行数 | effort |
 | --- | --- |
@@ -189,7 +189,7 @@ Claude と Codex は matrix の別の leg (`review / claude`・`review / codex`)
 SSM から読まない。
 
 Claude は `track_progress` 付きで動き、進捗コメントに JSON 形式で結果を返す。
-Codex は GPT-6 Astra・read-only サンドボックスで差分と関連コードを読み、同じ形式の
+Codex は GPT-6.1 Sol・read-only サンドボックスで差分と関連コードを読み、同じ形式の
 最終回答を返す。後続の共通ステップが JSON を検証し、件数サマリーと各指摘の
 レビュースレッドを `github-actions[bot]` として投稿する。
 
@@ -348,13 +348,13 @@ PR のチェック一覧にも `claude-review` と `codex-review` を出す。
 | `skip_authors` | string | `dependabot[bot],renovate[bot],tamura09-renovate[bot]` | レビューをスキップする作成者。カンマ区切り |
 | `skip_draft` | boolean | `true` | draft の PR をスキップするか |
 | `findings_state` | string | `success` | 指摘があったときのチェック状態。マージ制御にはスレッド解決必須を使う。`failure` にするとスレッドを解決しても赤のまま |
-| `runs_on` | string | `ubuntu-latest` | 実行するランナー |
+| `runs_on` | string | `ubuntu-26.04-arm` | 実行するランナー |
 | `aws_role_to_assume` | string | `arn:aws:iam::222165754930:role/github-actions-pr-review` | トークンを読むために OIDC で引くロール |
 | `aws_region` | string | `ap-northeast-1` | パラメータのあるリージョン |
 | `oauth_token_parameter` | string | `/pr-review/oauth-token` | トークンを入れた SSM パラメータ名 |
 | `codex_review` | boolean | `true` | Claude と並べて Codex でもレビューするか |
 | `codex_fallback` | boolean | `true` | 廃止。`false` を渡すと `codex_review: false` と同じ。v1 の呼び出し側を壊さないために残してある |
-| `codex_model` | string | `gpt-6-astra` | Codex のレビューに使う OpenAI モデル |
+| `codex_model` | string | `gpt-6.1-sol` | Codex のレビューに使う OpenAI モデル |
 | `codex_effort` | string | `""` | Codex の reasoning effort。空文字なら `effort` と同じ決め方 |
 | `codex_timeout_minutes` | number | `20` | Codex のステップのタイムアウト。超えたら `codex-review` を error にする |
 | `codex_auth_parameter` | string | `/pr-review/codex-auth-json` | Codex `auth.json` を入れた SSM パラメータ名 |

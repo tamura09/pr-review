@@ -87,7 +87,7 @@ on:
         description: "実行するランナー"
         type: string
         required: false
-        default: "ubuntu-latest"
+        default: "ubuntu-26.04-arm"
       aws_role_to_assume:
         description: >-
           Claude/Codex の認証情報を SSM から読むために OIDC で引く IAM ロール。
@@ -120,7 +120,7 @@ on:
         description: "Codex のレビューに使う OpenAI モデル"
         type: string
         required: false
-        default: "gpt-6-astra"
+        default: "gpt-6.1-sol"
       codex_effort:
         description: >-
           Codex の reasoning effort (low / medium / high / xhigh / max)。
@@ -423,7 +423,7 @@ jobs:
         continue-on-error: true
         # Opus 5.5 は Claude Code 2.1.280 以上でないと claude_code_version_too_old で
         # 起動直後に落ちる。v1.0.232 は 2.1.280 を入れる (v1.0.231 は 2.1.278)。
-        uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
+        uses: anthropics/claude-code-action@a26b07d8c778b0c43f64618e5fd29fd0f8af72e8 # v1.0.250
         with:
           claude_code_oauth_token: ${{ secrets.claude_code_oauth_token || steps.oauth_token.outputs.token }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -502,7 +502,7 @@ jobs:
         id: codex_node
         if: ${{ always() && steps.codex_auth.outcome == 'success' }}
         continue-on-error: true
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
 
@@ -513,10 +513,11 @@ jobs:
           steps.codex_auth.outcome == 'success' &&
           steps.codex_node.outcome == 'success'
         continue-on-error: true
-        # ubuntu-24.04 は AppArmor で非特権ユーザー名前空間の権限を落とすため、
-        # Codex の read-only サンドボックス (bwrap) が `bwrap: loopback: Failed
-        # RTM_NEWADDR: Operation not permitted` で失敗し、シェルコマンドが1つも
-        # 動かない。Codex は差分しか読めないままレビューを返す。
+        # ubuntu-24.04 以降 (既定の ubuntu-26.04-arm も) は AppArmor で非特権
+        # ユーザー名前空間の権限を落とすため、Codex の read-only サンドボックス
+        # (bwrap) が `bwrap: loopback: Failed RTM_NEWADDR: Operation not
+        # permitted` で失敗し、シェルコマンドが1つも動かない。Codex は差分しか
+        # 読めないままレビューを返す。
         # OS の bubblewrap を入れて (PATH に無いと Codex は同梱の bwrap を使う)、
         # その /usr/bin/bwrap にだけ userns を許すプロファイルを読み込む。
         # ランナー全体の制限 (kernel.apparmor_restrict_unprivileged_userns) は
@@ -533,7 +534,7 @@ jobs:
           }
           PROFILE
           sudo apparmor_parser --replace /etc/apparmor.d/bwrap
-          npm install --global @openai/codex@0.155.0
+          npm install --global @openai/codex@0.162.0
 
       # Claude と同じく、失敗しても job は止めず最後のステップで codex-review を
       # error にする。Codex は read-only のサンドボックスでシェルを使えるので、
