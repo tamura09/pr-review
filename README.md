@@ -130,7 +130,6 @@ permissions:
   statuses: write
   # Claude/Codex の認証情報を SSM から読むための OIDC トークン発行
   id-token: write
-  # CI の実行結果を Claude に読ませるため (github_ci MCP に必要)
 
 concurrency:
   group: pr-review-${{ github.event.pull_request.number }}
