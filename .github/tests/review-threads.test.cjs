@@ -989,6 +989,47 @@ for (const options of [{ raw: 'not JSON' },
   });
 }
 
+for (const isCodex of [false, true]) {
+  for (const findings of [[finding], []]) {
+    test(`${isCodex ? 'Codex' : 'Claude'}: an older invalid artifact cannot hide a later posted summary with ${findings.length} findings`, async () => {
+      const invalid = await run({ isCodex, raw: 'not JSON', claudeReview: '{' });
+      assert.equal(invalid.publication.restorable, false);
+      assert.equal(invalid.publication.posted.length, 0);
+      // Attempt 2 published, then lost its artifact. Attempt 3 can only see attempt 1's invalid result.
+      const published = await run({ isCodex, result: { summary: '', findings } });
+      const recovered = await recover({ artifactFiles: invalid.artifactFiles,
+        env: { RUN_ATTEMPT: '3', REVIEWER_KIND: isCodex ? 'codex' : 'claude' },
+        reviews: published.server.reviews, issueComments: published.server.issueComments });
+      assert.match(recovered.error.message, /保存結果がありません/);
+      assert.equal(recovered.outputs.restored, 'false');
+      assert.equal(recovered.raw, undefined);
+      assert.equal(recovered.zipRemoved, true);
+      assert.equal(recovered.calls.filter(call => ['listReviews', 'listIssueComments'].includes(call.method)).length, 2);
+    });
+  }
+}
+
+for (const env of [{ SHA: 'another-head' }, { RUN_URL: runUrl + '4' }]) {
+  test(`an old invalid artifact still allows regeneration when only another publication exists: ${JSON.stringify(env)}`, async () => {
+    const invalid = await run({ raw: 'not JSON' });
+    const published = await run({ env });
+    const recovered = await recover({ artifactFiles: invalid.artifactFiles, env: { RUN_ATTEMPT: '3' },
+      reviews: published.server.reviews });
+    assert.equal(recovered.error, undefined);
+    assert.equal(recovered.outputs.restored, 'false');
+  });
+}
+
+for (const fail of ['listReviews', 'listIssueComments']) {
+  test(`regeneration from an invalid artifact is blocked when ${fail} cannot confirm publication state`, async () => {
+    const invalid = await run({ raw: 'not JSON' });
+    const recovered = await recover({ artifactFiles: invalid.artifactFiles, fail, env: { RUN_ATTEMPT: '3' } });
+    assert.match(recovered.error.message, /Simulated/);
+    assert.equal(recovered.outputs.restored, 'false');
+    assert.equal(recovered.zipRemoved, true);
+  });
+}
+
 test('an invalid result marked as already posted cannot silently invoke the model again', async () => {
   const first = await run();
   first.artifactFiles['publication.json'] = Buffer.from(JSON.stringify({ ...first.publication, restorable: false }));

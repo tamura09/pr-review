@@ -224,8 +224,8 @@ jobs:
               /^\d+$/.test(item.name.slice(prefix.length)) &&
               Number(item.name.slice(prefix.length)) < attempt)
               .sort((a, b) => Number(b.name.slice(prefix.length)) - Number(a.name.slice(prefix.length)))[0];
-            if (!previous) {
-              // 投稿後のキャンセル等で artifact が残らなかった場合も、重複投稿はしない。
+            async function ensureUnpublished() {
+              // 古い不正結果の artifact が残っていても、後続 attempt の投稿を確認する。
               const [reviews, comments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
@@ -241,6 +241,9 @@ jobs:
                   item.body?.includes(REVIEWER_KIND === "codex" ? "Codex ·" : "Claude ·"))) {
                 throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
               }
+            }
+            if (!previous) {
+              await ensureUnpublished();
               return;
             }
             if (previous.expired) throw new Error("保存済みレビュー結果の artifact が期限切れです");
@@ -264,7 +267,10 @@ jobs:
               }
               if (metadata.restorable !== true) {
                 // JSON・パス等の検証不正で未投稿なら、モデルを再実行して回復させる。
-                if (metadata.restorable === false && Array.isArray(metadata.posted) && !metadata.posted.length) return;
+                if (metadata.restorable === false && Array.isArray(metadata.posted) && !metadata.posted.length) {
+                  await ensureUnpublished();
+                  return;
+                }
                 throw new Error("保存済み結果を安全に再実行できるか判定できませんでした");
               }
               const name = REVIEWER_KIND === "codex" ? "codex.md" : "claude.json";
