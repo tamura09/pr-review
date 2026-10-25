@@ -156,6 +156,8 @@ on:
 
 permissions:
   contents: read
+  # 同じ workflow run の前回 attempt の保存結果を復元するため
+  actions: read
   pull-requests: write
   issues: write
   # claude-review / codex-review チェックを PR のチェック一覧に出すため
@@ -198,6 +200,95 @@ jobs:
           # ベースブランチとの差分を取るため履歴ごと取得する
           fetch-depth: 0
 
+      # 投稿の再試行では、前回の結果と差分を復元してモデルを起動しない。
+      - name: Restore review result for publication retry
+        id: restore_review
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEWER_KIND: ${{ matrix.reviewer }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            core.setOutput("restored", "false");
+            const attempt = Number(process.env.RUN_ATTEMPT);
+            if (attempt === 1) return;
+            const { SHA, RUN_URL, REVIEWER_KIND } = process.env;
+            const prefix = `pr-review-result-${REVIEWER_KIND}-`;
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: context.runId, per_page: 100,
+            });
+            const previous = artifacts.filter(item => item.name.startsWith(prefix) &&
+              /^\d+$/.test(item.name.slice(prefix.length)) &&
+              Number(item.name.slice(prefix.length)) < attempt)
+              .sort((a, b) => Number(b.name.slice(prefix.length)) - Number(a.name.slice(prefix.length)))[0];
+            async function ensureUnpublished() {
+              // 古い不正結果の artifact が残っていても、後続 attempt の投稿を確認する。
+              const [reviews, comments] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, {
+                  ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  ...context.repo, issue_number: context.payload.pull_request.number, per_page: 100,
+                }),
+              ]);
+              if ([...reviews, ...comments].some(item => item.user?.login === "github-actions[bot]" &&
+                  (item.commit_id === SHA || item.body?.includes(`<!-- pr-review:head:${SHA} -->`)) &&
+                  item.body?.includes(`[Workflow run](${RUN_URL})`) &&
+                  item.body?.includes(`<!-- pr-review:summary:`) &&
+                  item.body?.includes(REVIEWER_KIND === "codex" ? "Codex ·" : "Claude ·"))) {
+                throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
+              }
+            }
+            if (!previous) {
+              await ensureUnpublished();
+              return;
+            }
+            if (previous.expired) throw new Error("保存済みレビュー結果の artifact が期限切れです");
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const { execFileSync } = require("node:child_process");
+            const dir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
+            fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+            const zip = path.join(dir, "retry.zip");
+            try {
+              const { data } = await github.rest.actions.downloadArtifact({
+                ...context.repo, artifact_id: previous.id, archive_format: "zip",
+              });
+              fs.writeFileSync(zip, Buffer.from(data), { mode: 0o600 });
+              // パスを展開せず、決められた4ファイルの内容だけを読む。
+              const read = name => execFileSync("unzip", ["-p", zip, name], { maxBuffer: 100 * 1024 * 1024 });
+              const metadata = JSON.parse(read("publication.json").toString("utf8"));
+              if (metadata.sha !== SHA || metadata.run_url !== RUN_URL ||
+                  metadata.reviewer !== `${REVIEWER_KIND}-review` || typeof metadata.model_label !== "string") {
+                throw new Error("保存済みレビュー結果の run・SHA・reviewer が一致しません");
+              }
+              if (metadata.restorable !== true) {
+                // JSON・パス等の検証不正で未投稿なら、モデルを再実行して回復させる。
+                if (metadata.restorable === false && Array.isArray(metadata.posted) && !metadata.posted.length) {
+                  await ensureUnpublished();
+                  return;
+                }
+                throw new Error("保存済み結果を安全に再実行できるか判定できませんでした");
+              }
+              const name = REVIEWER_KIND === "codex" ? "codex.md" : "claude.json";
+              const raw = read(name);
+              const diff = read("pr.diff");
+              const files = read("files.z");
+              const diffDir = path.join(process.env.RUNNER_TEMP, "pr-review");
+              fs.mkdirSync(diffDir, { recursive: true, mode: 0o700 });
+              for (const [target, contents] of [[path.join(dir, name), raw],
+                  [path.join(diffDir, "pr.diff"), diff], [path.join(diffDir, "files.z"), files]]) {
+                fs.writeFileSync(target, contents, { mode: 0o600 });
+              }
+              core.setOutput("reviewer", metadata.model_label);
+              core.setOutput("restored", "true");
+            } finally {
+              fs.rmSync(zip, { force: true });
+            }
+
       # checkout の refspec に依存せず、レビュー対象の base ref を明示的に取得して
       # 差分を一度生成し、モデルにはこのファイルを読ませる。Claude は
       # 読み取り専用ツールだけを使い git diff を実行できないので、ファイルで渡す必要が
@@ -205,6 +296,7 @@ jobs:
       # PR コメントに残す。
       - name: Prepare PR diff
         id: review_diff
+        if: steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true'
         continue-on-error: true
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -214,7 +306,10 @@ jobs:
           git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
           git merge-base "${base}" HEAD >/dev/null
           install -d -m 700 "${RUNNER_TEMP}/pr-review"
-          git diff --no-ext-diff "${base}...HEAD" > "${RUNNER_TEMP}/pr-review/pr.diff"
+          git diff --no-ext-diff --no-color --unified=3 --src-prefix=a/ --dst-prefix=b/ \
+            "${base}...HEAD" > "${RUNNER_TEMP}/pr-review/pr.diff"
+          git diff --name-status -z --find-renames "${base}...HEAD" \
+            > "${RUNNER_TEMP}/pr-review/files.z"
 
       # 変更行数 (追加 + 削除) で effort を決める。小さい PR に high を
       # 使うと利用枠を無駄に食い、大きい PR に low を使うと見落とす。
@@ -280,6 +375,7 @@ jobs:
       # 受けてフラグに落とす。
       - name: Decide where the token comes from
         id: token_source
+        if: steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true'
         # `a && b || c` で選ぶと、Codex の leg で secret が空のとき Claude の
         # secret に落ちるので、シェル側で選ぶ
         env:
@@ -408,6 +504,7 @@ jobs:
         timeout-minutes: ${{ inputs.claude_timeout_minutes }}
         if: >-
           always() &&
+          steps.restore_review.outputs.restored != 'true' &&
           matrix.reviewer == 'claude' &&
           steps.effort.outcome == 'success' &&
           (steps.token_source.outputs.from_ssm == 'false' ||
@@ -540,6 +637,7 @@ jobs:
         timeout-minutes: ${{ inputs.codex_timeout_minutes }}
         if: >-
           always() &&
+          steps.restore_review.outputs.restored != 'true' &&
           steps.codex_auth.outcome == 'success' &&
           steps.codex_node.outcome == 'success' &&
           steps.codex_install.outcome == 'success'
@@ -712,7 +810,7 @@ jobs:
 
       # 両方の leg が同じ失敗をするので、コメントは Claude の leg だけが出す
       - name: Report PR diff preparation failure
-        if: ${{ always() && matrix.reviewer == 'claude' && steps.review_diff.outcome != 'success' }}
+        if: ${{ always() && matrix.reviewer == 'claude' && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome != 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -729,7 +827,7 @@ jobs:
           gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
             -f body="${body}" >/dev/null
 
-      # モデルの結果を検証し、1指摘1スレッドとして一括投稿してから件数を表示する。
+      # モデルの結果を検証し、1指摘1スレッドで投稿してから件数をチェックに表示する。
       # 通常コメントへの返信には解決ボタンがないため、pull request review を使う。
       # 再利用可能ワークフローの checkout 先は呼び出し側なので、処理はここに置く。
       - name: Publish review threads and status
@@ -742,14 +840,16 @@ jobs:
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
+          RESTORE_OUTCOME: ${{ steps.restore_review.outcome }}
+          RESTORED: ${{ steps.restore_review.outputs.restored }}
           MODEL_OUTCOME: ${{ matrix.reviewer == 'codex' && steps.codex.outcome || steps.claude.outcome }}
           CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
           CLAUDE_REVIEW: ${{ steps.claude.outputs.structured_output }}
           IS_CODEX: ${{ matrix.reviewer == 'codex' }}
           REVIEWER: >-
-            ${{ matrix.reviewer == 'codex' &&
+            ${{ steps.restore_review.outputs.reviewer || (matrix.reviewer == 'codex' &&
             format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
-            format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort) }}
+            format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort)) }}
         with:
           script: |
             const { SHA, RUN_URL, FINDINGS_STATE, REVIEWER } = process.env;
@@ -758,17 +858,23 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
             const footer = `---\n_${REVIEWER} [Workflow run](${RUN_URL})_`;
+            const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
+            let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
 
             try {
-              if (process.env.REVIEW_DIFF_OUTCOME !== "success") {
+              if (process.env.RESTORE_OUTCOME !== "success") {
+                throw new Error("保存済みレビュー結果を復元できませんでした");
+              }
+              const restored = process.env.RESTORED === "true";
+              if (!restored && process.env.REVIEW_DIFF_OUTCOME !== "success") {
                 throw new Error("PR差分を取得できませんでした");
               }
-              if (process.env.EFFORT_OUTCOME !== "success") {
+              if (!restored && process.env.EFFORT_OUTCOME !== "success") {
                 throw new Error("effort を決められませんでした");
               }
-              if (process.env.MODEL_OUTCOME !== "success") {
+              if (!restored && process.env.MODEL_OUTCOME !== "success") {
                 throw new Error("レビューを完了できませんでした");
               }
               if (!["success", "failure"].includes(FINDINGS_STATE)) {
@@ -776,17 +882,28 @@ jobs:
               }
 
               // コメント用の HTML 加工を経ていないモデルの最終結果だけを使う。
-              const raw = (isCodex ? process.env.CODEX_REVIEW : process.env.CLAUDE_REVIEW) || "";
-              if (!raw.trim()) {
-                throw new Error("モデルのレビュー結果が空です");
-              }
-              // 投稿失敗時にも指摘本文を回収できるよう、最終結果だけを保存する。
-              // ツールの実行履歴や認証情報を含む execution_file は保存しない。
               const fs = require("node:fs");
               const path = require("node:path");
               const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
+              const resultPath = path.join(resultDir, isCodex ? "codex.md" : "claude.json");
+              const raw = restored ? fs.readFileSync(resultPath, "utf8") :
+                (isCodex ? process.env.CODEX_REVIEW : process.env.CLAUDE_REVIEW) || "";
+              if (!raw.trim()) {
+                throw new Error("モデルのレビュー結果が空です");
+              }
+              // 投稿失敗時にも同じ結果で再試行できるよう、最終結果と差分を保存する。
+              // ツールの実行履歴や認証情報を含む execution_file は保存しない。
               fs.mkdirSync(resultDir, { recursive: true, mode: 0o700 });
-              fs.writeFileSync(path.join(resultDir, isCodex ? "codex.md" : "claude.json"), raw, { mode: 0o600 });
+              fs.writeFileSync(resultPath, raw, { mode: 0o600 });
+              // base branch が動いた後の再実行でも、元の行位置を検証する。
+              for (const name of ["pr.diff", "files.z"]) {
+                fs.copyFileSync(path.join(process.env.RUNNER_TEMP, "pr-review", name), path.join(resultDir, name));
+                fs.chmodSync(path.join(resultDir, name), 0o600);
+              }
+
+              savePublication = () => fs.writeFileSync(path.join(resultDir, "publication.json"),
+                JSON.stringify(publication, null, 2), { mode: 0o600 });
+              savePublication();
 
               let result;
               if (isCodex) {
@@ -802,41 +919,234 @@ jobs:
                 throw new Error("レビュー結果の形式が不正です");
               }
               const findings = result.findings;
-              const comments = findings.map(finding => {
+              // files.z と pr.diff はモデルに渡したものと同じスナップショット。
+              // GitHub API の現在の PR 差分を使うと、後続 push と混ざるため使わない。
+              const files = new Map();
+              const oldFiles = new Map();
+              if (findings.length) {
+                const tokens = fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/files.z"), "utf8").split("\0");
+                const aliases = [];
+                for (let i = 0; i < tokens.length - 1;) {
+                  const status = tokens[i++];
+                  const oldPath = tokens[i++];
+                  const newPath = /^[RC]/.test(status) ? tokens[i++] : oldPath;
+                  if (!status || !oldPath || !newPath) throw new Error("変更ファイル一覧が不正です");
+                  const file = { path: newPath, LEFT: new Set(), RIGHT: new Set() };
+                  files.set(newPath, file);
+                  // 新規追加・コピーには変更前の自分のパスがない。
+                  if (!/^[AC]/.test(status)) oldFiles.set(oldPath, file);
+                  if (oldPath !== newPath) aliases.push([oldPath, file]);
+                }
+                for (const [oldPath, file] of aliases) {
+                  if (!files.has(oldPath)) files.set(oldPath, file);
+                }
+
+                // Git の引用付きパスは C エスケープと UTF-8 の8進数表現を含む。
+                function diffPath(value) {
+                  value = value.replace(/\t$/, "");
+                  if (value.startsWith('"')) {
+                    const escapes = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+                    value = Buffer.concat([...value.slice(1, -1).matchAll(/\\([0-7]{1,3}|.)|[^\\]+/gs)].map(match =>
+                      match[1] === undefined ? Buffer.from(match[0]) : Buffer.from([
+                        /^[0-7]+$/.test(match[1]) ? parseInt(match[1], 8) : escapes[match[1]],
+                      ])
+                    )).toString("utf8");
+                  }
+                  return value === "/dev/null" ? null : value.slice(2);
+                }
+                let oldPath, file, left = 0, right = 0, oldRemaining = 0, newRemaining = 0;
+                const diff = fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/pr.diff"), "utf8");
+                for (const line of diff.split("\n")) {
+                  if (line.startsWith("diff --git ")) {
+                    oldPath = undefined;
+                    file = undefined;
+                    oldRemaining = newRemaining = 0;
+                    continue;
+                  }
+                  const hunk = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+                  if (hunk) {
+                    left = Number(hunk[1]); right = Number(hunk[3]);
+                    oldRemaining = Number(hunk[2] ?? 1); newRemaining = Number(hunk[4] ?? 1);
+                  } else if (oldRemaining || newRemaining) {
+                    if (line.startsWith("-")) {
+                      file?.LEFT.add(left++); oldRemaining--;
+                    } else if (line.startsWith("+")) {
+                      file?.RIGHT.add(right++); newRemaining--;
+                    } else if (line.startsWith(" ")) {
+                      file?.RIGHT.add(right++); left++; oldRemaining--; newRemaining--;
+                    }
+                  } else if (line.startsWith("--- ")) {
+                    oldPath = diffPath(line.slice(4));
+                  } else if (line.startsWith("+++ ")) {
+                    const newPath = diffPath(line.slice(4));
+                    file = newPath === null ? oldFiles.get(oldPath) : files.get(newPath);
+                  }
+                }
+              }
+              const { createHash } = require("node:crypto");
+              const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+              // 再実行でモデルの結果が変わった場合は、前回のサマリーを上書きしない。
+              // フィールド順だけが変わった同じ結果は、同じ投稿として扱う。
+              const resultKey = hash([result.summary, findings.map(finding =>
+                [finding?.path, finding?.line, finding?.side, finding?.body])]);
+              const publicationKey = hash([RUN_URL, SHA, statusContext, resultKey]);
+              publication.result_key = resultKey;
+              const summaryMarker = `<!-- pr-review:summary:${publicationKey} -->`;
+              const lineComments = [];
+              const fileComments = [];
+              findings.forEach((finding, index) => {
                 if (!finding || typeof finding.path !== "string" || !finding.path.trim() ||
                     !Number.isSafeInteger(finding.line) || finding.line < 1 ||
                     !["LEFT", "RIGHT"].includes(finding.side) ||
                     typeof finding.body !== "string" || !finding.body.trim()) {
                   throw new Error("指摘のパス・行番号・本文が不正です");
                 }
-                return {
-                  path: finding.path, line: finding.line, side: finding.side,
-                  body: `${finding.body.trim()}\n\n_${REVIEWER}_`,
+                // LEFT の旧パスと RIGHT の現行パスは別の名前空間で解決する。
+                // リネーム元のパスが新規ファイルに再利用されていても、削除行は元のファイルに付ける。
+                const file = finding.side === "LEFT"
+                  ? oldFiles.get(finding.path) ?? files.get(finding.path)
+                  : files.get(finding.path);
+                if (!file) throw new Error(`指摘のファイルが PR 差分にありません: ${finding.path}`);
+                const marker = `<!-- pr-review:finding:${hash([publicationKey, index, file.path,
+                  finding.line, finding.side, finding.body.trim()])} -->`;
+                const comment = {
+                  path: file.path, line: finding.line, side: finding.side,
+                  body: `${finding.body.trim()}\n\n_${REVIEWER}_\n${marker}`,
+                  index: index + 1, marker,
                 };
+                if (file[finding.side].has(finding.line)) lineComments.push(comment);
+                else fileComments.push(comment);
               });
+              publication.restorable = true;
+              savePublication();
               const headline = result.summary.replace(/[\r\n]+/g, " ").trim();
               const verdict = findings.length
                 ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
                 : "**✅ 指摘なし**";
-              const summary = `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n${footer}`;
-
-              if (findings.length) {
-                // 全指摘を1回の API 呼び出しで投稿する。無効な差分位置を通常コメントに
-                // フォールバックすると解決必須を回避するため、その場合は error にする。
-                await github.rest.pulls.createReview({
-                  ...repo, pull_number: issue_number, commit_id: SHA,
-                  event: "COMMENT", body: summary, comments,
-                });
-              } else {
-                await github.rest.issues.createComment({
-                  ...repo, issue_number, body: summary,
-                });
+              const fileLinks = new Map();
+              const summary = () => `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n` +
+                [...fileLinks].sort(([a], [b]) => a - b)
+                  .map(([index, url]) => `- [ファイル全体への指摘 ${index}](${url})\n`).join("") +
+                (fileLinks.size ? "\n" : "") + footer + `\n${summaryMarker}\n<!-- pr-review:head:${SHA} -->`;
+              function record(kind, posted) {
+                publication.posted.push({ kind, id: posted.id, url: posted.html_url });
+                savePublication();
               }
+              function positionRejected(error) {
+                const detail = `${error.message} ${JSON.stringify(error.response?.data || {})}`;
+                const errors = error.response?.data?.errors;
+                return error.status === 422 && (
+                  /\bline (?:could not be resolved|must be part of the diff)\b/i.test(detail) ||
+                  (Array.isArray(errors) && errors.some(item => item?.field === "line" &&
+                    /\bmust be part of the diff\b/i.test(item.message || "")))
+                );
+              }
+              // マーカーだけでなく投稿者も確認する。通常コメントにも同じ判定を使う。
+              const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
+              if (findings.length) {
+                const params = { ...repo, pull_number: issue_number, per_page: 100 };
+                // 再実行時は公開済みの同一指摘を再利用する。履歴はモデルには渡さない。
+                const [reviews, comments] = await Promise.all([
+                  github.paginate(github.rest.pulls.listReviews, params),
+                  github.paginate(github.rest.pulls.listReviewComments, params),
+                ]);
+                let review = reviews.find(item => isPublisher(item) &&
+                  item.body?.includes(summaryMarker) && item.state !== "PENDING");
+                const remaining = [];
+                for (const comment of [...lineComments, ...fileComments]) {
+                  const posted = comments.find(item => isPublisher(item) &&
+                    !item.in_reply_to_id && item.body?.includes(comment.marker));
+                  if (!posted) remaining.push(comment);
+                  else {
+                    record("comment", posted);
+                    if (posted.subject_type === "file") fileLinks.set(comment.index, posted.html_url);
+                  }
+                }
+                let pendingLines = remaining.filter(comment => lineComments.includes(comment));
+                const pendingFiles = remaining.filter(comment => fileComments.includes(comment));
+                let batchedLines = [];
+                if (!review) {
+                  const request = comments => github.rest.pulls.createReview({
+                    ...repo, pull_number: issue_number, commit_id: SHA,
+                    event: "COMMENT", body: summary(), comments,
+                  });
+                  try {
+                    ({ data: review } = await request(pendingLines.map(({ index, marker, ...comment }) => comment)));
+                    batchedLines = pendingLines;
+                    pendingLines = [];
+                  } catch (error) {
+                    if (!pendingLines.length || !positionRejected(error)) throw error;
+                    // まずサマリーを確定し、拒否された行だけを後で個別に特定する。
+                    ({ data: review } = await request([]));
+                  }
+                }
+                record("summary", review);
+                if (batchedLines.length) {
+                  // createReview の応答にはコメントがないため、後続投稿の前に URL を回収する。
+                  const postedComments = await github.paginate(github.rest.pulls.listCommentsForReview, {
+                    ...repo, pull_number: issue_number, review_id: review.id, per_page: 100,
+                  });
+                  for (const comment of batchedLines) {
+                    const posted = postedComments.find(item => isPublisher(item) &&
+                      !item.in_reply_to_id && item.body?.includes(comment.marker));
+                    if (!posted) throw new Error("一括投稿済みの指摘 URL を取得できませんでした");
+                    record("comment", posted);
+                  }
+                }
+                async function updateSummary() {
+                  await github.rest.pulls.updateReview({
+                    ...repo, pull_number: issue_number, review_id: review.id, body: summary(),
+                  });
+                }
+                async function postFileComment(comment, reason) {
+                  const { data: posted } = await github.rest.pulls.createReviewComment({
+                    ...repo, pull_number: issue_number, commit_id: SHA,
+                    path: comment.path, subject_type: "file",
+                    body: `${comment.body}\n\n> ${reason}（${comment.side} ${comment.line}行）。ファイル全体への指摘として投稿しています。`,
+                  });
+                  record("comment", posted);
+                  fileLinks.set(comment.index, posted.html_url);
+                  await updateSummary();
+                }
+                for (const comment of pendingLines) {
+                  try {
+                    const { index, marker, ...line } = comment;
+                    const { data: posted } = await github.rest.pulls.createReviewComment({
+                      ...repo, pull_number: issue_number, commit_id: SHA, ...line,
+                    });
+                    record("comment", posted);
+                  } catch (error) {
+                    if (!positionRejected(error)) throw error;
+                    await postFileComment(comment, "GitHub が行位置を拒否しました");
+                  }
+                }
+                for (const comment of pendingFiles) {
+                  await postFileComment(comment, "指定位置を差分内の行に紐付けられません");
+                }
+                // 前回の投稿後に更新が失敗したサマリーも、再実行でリンクを復元する。
+                if (reviews.includes(review)) await updateSummary();
+              } else {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  ...repo, issue_number, per_page: 100,
+                });
+                let posted = comments.find(item => isPublisher(item) && item.body?.includes(summaryMarker));
+                if (!posted) {
+                  ({ data: posted } = await github.rest.issues.createComment({ ...repo, issue_number, body: summary() }));
+                }
+                record("summary", posted);
+              }
+              publication.complete = true;
+              savePublication();
               state = findings.length ? FINDINGS_STATE : "success";
               description = findings.length
                 ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
                 : "指摘なし";
             } catch (error) {
+              publication.error = String(error.message);
+              savePublication();
+              if (publication.posted.length) {
+                core.error(`投稿済みレビュー・スレッド（再実行時に再利用）: ${publication.posted.map(item => item.url).join(" ")}`);
+              }
               core.error(error.message);
               description = String(error.message || "レビューを完了できませんでした")
                 .replace(/[\r\n]+/g, " ").slice(0, 130);
@@ -848,8 +1158,9 @@ jobs:
               description, target_url: RUN_URL,
             });
 
-      - name: Preserve review result after publication failure
-        if: ${{ always() && steps.publish_review.outcome == 'failure' }}
+      # 成功した leg も保存し、Re-run all jobs でも同じ結果を再利用する。
+      - name: Preserve review result and publication state
+        if: ${{ always() && steps.publish_review.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pr-review-result-${{ matrix.reviewer }}-${{ github.run_attempt }}

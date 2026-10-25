@@ -10,6 +10,9 @@ on:
 # レビューの投稿に失敗する。
 permissions:
   contents: read
+  # 既存利用者も参照先の更新前に追加する（未指定だと workflow が起動しない）
+  # 同じ workflow run の保存結果を復元するため
+  actions: read
   pull-requests: write
   issues: write
   # claude-review / codex-review チェックを PR のチェック一覧に出すため
@@ -24,6 +27,7 @@ concurrency:
 
 # マージ制御は呼び出し側のブランチ保護または Ruleset で設定する。
 # Require conversation resolution before merging を有効にすると未解決スレッドで止まる。
+# 指定行が差分外の指摘も、ファイル単位の解決可能スレッドとして残る。
 # レビュー完了も必須にする場合は claude-review / codex-review を必須チェックにする。
 # codex_review: false / codex_fallback: false なら claude-review だけを必須にする。
 # スキップ対象の PR にはチェックが出ないため、必須化すると待機し続ける点に注意。
