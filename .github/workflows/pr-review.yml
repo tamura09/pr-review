@@ -226,11 +226,17 @@ jobs:
               .sort((a, b) => Number(b.name.slice(prefix.length)) - Number(a.name.slice(prefix.length)))[0];
             if (!previous) {
               // 投稿後のキャンセル等で artifact が残らなかった場合も、重複投稿はしない。
-              const reviews = await github.paginate(github.rest.pulls.listReviews, {
-                ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
-              });
-              if (reviews.some(item => item.user?.login === "github-actions[bot]" &&
-                  item.commit_id === SHA && item.body?.includes(`[Workflow run](${RUN_URL})`) &&
+              const [reviews, comments] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, {
+                  ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
+                }),
+                github.paginate(github.rest.issues.listComments, {
+                  ...context.repo, issue_number: context.payload.pull_request.number, per_page: 100,
+                }),
+              ]);
+              if ([...reviews, ...comments].some(item => item.user?.login === "github-actions[bot]" &&
+                  (item.commit_id === SHA || item.body?.includes(`<!-- pr-review:head:${SHA} -->`)) &&
+                  item.body?.includes(`[Workflow run](${RUN_URL})`) &&
                   item.body?.includes(`<!-- pr-review:summary:`) &&
                   item.body?.includes(REVIEWER_KIND === "codex" ? "Codex ·" : "Claude ·"))) {
                 throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
@@ -255,6 +261,11 @@ jobs:
               if (metadata.sha !== SHA || metadata.run_url !== RUN_URL ||
                   metadata.reviewer !== `${REVIEWER_KIND}-review` || typeof metadata.model_label !== "string") {
                 throw new Error("保存済みレビュー結果の run・SHA・reviewer が一致しません");
+              }
+              if (metadata.restorable !== true) {
+                // JSON・パス等の検証不正で未投稿なら、モデルを再実行して回復させる。
+                if (metadata.restorable === false && Array.isArray(metadata.posted) && !metadata.posted.length) return;
+                throw new Error("保存済み結果を安全に再実行できるか判定できませんでした");
               }
               const name = REVIEWER_KIND === "codex" ? "codex.md" : "claude.json";
               const raw = read(name);
@@ -841,7 +852,7 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
             const footer = `---\n_${REVIEWER} [Workflow run](${RUN_URL})_`;
-            const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, posted: [] };
+            const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
             let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
@@ -992,6 +1003,8 @@ jobs:
                 if (file[finding.side].has(finding.line)) lineComments.push(comment);
                 else fileComments.push(comment);
               });
+              publication.restorable = true;
+              savePublication();
               const headline = result.summary.replace(/[\r\n]+/g, " ").trim();
               const verdict = findings.length
                 ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
@@ -1000,7 +1013,7 @@ jobs:
               const summary = () => `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n` +
                 [...fileLinks].sort(([a], [b]) => a - b)
                   .map(([index, url]) => `- [ファイル全体への指摘 ${index}](${url})\n`).join("") +
-                (fileLinks.size ? "\n" : "") + footer + `\n${summaryMarker}`;
+                (fileLinks.size ? "\n" : "") + footer + `\n${summaryMarker}\n<!-- pr-review:head:${SHA} -->`;
               function record(kind, posted) {
                 publication.posted.push({ kind, id: posted.id, url: posted.html_url });
                 savePublication();
@@ -1014,6 +1027,8 @@ jobs:
                     /\bmust be part of the diff\b/i.test(item.message || "")))
                 );
               }
+              // マーカーだけでなく投稿者も確認する。通常コメントにも同じ判定を使う。
+              const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
               if (findings.length) {
                 const params = { ...repo, pull_number: issue_number, per_page: 100 };
                 // 再実行時は公開済みの同一指摘を再利用する。履歴はモデルには渡さない。
@@ -1021,8 +1036,6 @@ jobs:
                   github.paginate(github.rest.pulls.listReviews, params),
                   github.paginate(github.rest.pulls.listReviewComments, params),
                 ]);
-                // マーカーは公開値から計算できるため、GITHUB_TOKEN の投稿者も照合する。
-                const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
                 let review = reviews.find(item => isPublisher(item) &&
                   item.body?.includes(summaryMarker) && item.state !== "PENDING");
                 const remaining = [];
@@ -1099,7 +1112,14 @@ jobs:
                 // 前回の投稿後に更新が失敗したサマリーも、再実行でリンクを復元する。
                 if (reviews.includes(review)) await updateSummary();
               } else {
-                await github.rest.issues.createComment({ ...repo, issue_number, body: summary() });
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  ...repo, issue_number, per_page: 100,
+                });
+                let posted = comments.find(item => isPublisher(item) && item.body?.includes(summaryMarker));
+                if (!posted) {
+                  ({ data: posted } = await github.rest.issues.createComment({ ...repo, issue_number, body: summary() }));
+                }
+                record("summary", posted);
               }
               publication.complete = true;
               savePublication();
@@ -1124,8 +1144,9 @@ jobs:
               description, target_url: RUN_URL,
             });
 
-      - name: Preserve review result after publication failure
-        if: ${{ always() && steps.publish_review.outcome == 'failure' }}
+      # 成功した leg も保存し、Re-run all jobs でも同じ結果を再利用する。
+      - name: Preserve review result and publication state
+        if: ${{ always() && steps.publish_review.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pr-review-result-${{ matrix.reviewer }}-${{ github.run_attempt }}

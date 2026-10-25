@@ -58,6 +58,7 @@ async function run(options = {}) {
     writeFileSync(join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json'), options.restoredRaw);
   }
   const server = options.server ?? { reviews: [], comments: [], nextId: 88 };
+  server.issueComments ??= [];
   const fetches = [];
   const rejected = params => options.rejectLine || options.rejectLines?.includes(params.line);
   const api = method => async params => {
@@ -94,6 +95,9 @@ async function run(options = {}) {
       posted.subject_type ??= 'line';
       posted.html_url = `https://github.com/example/repo/pull/7#discussion_r${posted.id}`;
       server.comments.push(posted);
+    } else if (method === 'createComment') {
+      posted.html_url = `https://github.com/example/repo/pull/7#issuecomment-${posted.id}`;
+      server.issueComments.push(posted);
     } else if (method === 'updateReview') {
       server.reviews.find(review => review.id === params.review_id).body = params.body;
     }
@@ -104,7 +108,7 @@ async function run(options = {}) {
     paginate: async (method, params) => {
       fetches.push({ method, params });
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
-      const rows = method === 'listReviews' ? server.reviews : method === 'listCommentsForReview'
+      const rows = method === 'listIssueComments' ? server.issueComments : method === 'listReviews' ? server.reviews : method === 'listCommentsForReview'
         ? server.comments.filter(comment => comment.pull_request_review_id === params.review_id) : server.comments;
       return structuredClone(rows);
     },
@@ -112,14 +116,15 @@ async function run(options = {}) {
       pulls: { createReview: api('createReview'), createReviewComment: api('createReviewComment'),
         updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments',
         listCommentsForReview: 'listCommentsForReview' },
-      issues: { createComment: api('createComment') },
+      issues: { createComment: api('createComment'), listComments: 'listIssueComments' },
       repos: { createCommitStatus: api('createCommitStatus') },
     },
   };
   try {
-    await publish(github, {
+    let thrown;
+    try { await publish(github, {
       repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } },
-    }, { error: message => errors.push(message), setFailed: message => failures.push(message) }, { env }, require);
+    }, { error: message => errors.push(message), setFailed: message => failures.push(message) }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
     return {
       artifactFiles: Object.fromEntries(['codex.md', 'claude.json', 'publication.json', 'pr.diff', 'files.z']
@@ -128,12 +133,12 @@ async function run(options = {}) {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
       publication: existsSync(join(tempDir, 'pr-review-results/publication.json'))
         ? JSON.parse(readFileSync(join(tempDir, 'pr-review-results/publication.json'), 'utf8')) : undefined,
-      calls, failures, errors, server, fetches,
+      calls, failures, errors, server, fetches, thrown,
       review: calls.findLast(call => call.method === 'createReview')
         ? { ...calls.findLast(call => call.method === 'createReview').params,
             body: summaryReviews(server).at(-1)?.body ?? calls.findLast(call => call.method === 'createReview').params.body } : undefined,
       fileComments: calls.filter(call => call.method === 'createReviewComment' && call.params.subject_type === 'file').map(call => call.params),
-      summary: summaryReviews(server).at(-1) ?? calls.find(call => call.method === 'createComment')?.params,
+      summary: summaryReviews(server).at(-1) ?? server.issueComments.at(-1),
       status: calls.find(call => call.method === 'createCommitStatus')?.params,
     };
   } finally {
@@ -162,13 +167,13 @@ async function recover(options = {}) {
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
       return method === 'listWorkflowRunArtifacts' ? (options.artifacts ?? [
         { id: 1, name: `pr-review-result-${env.REVIEWER_KIND}-1`, expired: false },
-      ]) : (options.reviews ?? []);
+      ]) : method === 'listIssueComments' ? (options.issueComments ?? []) : (options.reviews ?? []);
     },
     rest: { actions: { listWorkflowRunArtifacts: 'listWorkflowRunArtifacts', downloadArtifact: async params => {
       calls.push({ method: 'downloadArtifact', params });
       if (options.fail === 'downloadArtifact') throw new Error('Simulated downloadArtifact failure');
       return { data: archive };
-    } }, pulls: { listReviews: 'listReviews' } },
+    } }, pulls: { listReviews: 'listReviews' }, issues: { listComments: 'listIssueComments' } },
   };
   let error;
   try {
@@ -859,6 +864,102 @@ test('individual comment API creates additional COMMENTED reviews with no separa
     assert.equal(review.body, '');
     assert.notEqual(review.id, output.summary.id);
   }
+});
+
+for (const isCodex of [false, true]) {
+  for (const mode of ['createCommitStatus', 'createComment']) {
+    test(`${isCodex ? 'Codex' : 'Claude'}: no-findings publication recovers after ${mode} without another comment`, async () => {
+      const value = { summary: '', findings: [] };
+      const first = await run({ isCodex, result: value,
+        ...(mode === 'createCommitStatus' ? { fail: mode } : { loseResponse: mode }) });
+      if (mode === 'createCommitStatus') assert.match(first.thrown.message, /createCommitStatus/);
+      else assert.equal(first.failures.length, 1);
+      assert.equal(first.server.issueComments.length, 1);
+      const recovered = await recover({ artifactFiles: first.artifactFiles,
+        env: { REVIEWER_KIND: isCodex ? 'codex' : 'claude' } });
+      assert.equal(recovered.error, undefined);
+      assert.equal(recovered.outputs.restored, 'true');
+      const resumed = await run({ isCodex, server: first.server, restoredRaw: recovered.raw,
+        env: { RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
+      assert.equal(resumed.thrown, undefined);
+      assert.equal(resumed.failures.length, 0);
+      assert.equal(resumed.status.state, 'success');
+      assert.equal(resumed.server.issueComments.length, 1);
+      assert.equal(resumed.calls.some(call => call.method === 'createComment'), false);
+      assert.deepEqual(resumed.publication.posted, [{ kind: 'summary',
+        id: first.server.issueComments[0].id, url: first.server.issueComments[0].html_url }]);
+    });
+  }
+}
+
+test('copied no-findings markers from another author are not reused', async () => {
+  const value = { summary: '', findings: [] };
+  const first = await run({ result: value });
+  first.server.issueComments[0].user = { login: 'mallory', type: 'User' };
+  const next = await run({ result: value, server: first.server });
+  assert.equal(next.failures.length, 0);
+  assert.equal(next.server.issueComments.length, 2);
+  assert.equal(next.publication.posted[0].id, next.server.issueComments[1].id);
+});
+
+test('missing artifact detection includes no-findings comments and is scoped to the head', async () => {
+  const first = await run({ result: { summary: '', findings: [] } });
+  const output = await recover({ artifacts: [], issueComments: first.server.issueComments });
+  assert.match(output.error.message, /保存結果がありません/);
+  const otherHead = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { SHA: 'another-head' } });
+  assert.equal(otherHead.error, undefined);
+  const otherReviewer = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
+  assert.equal(otherReviewer.error, undefined);
+});
+
+for (const findings of [[finding], []]) {
+  test(`successful result with ${findings.length} findings is retained and survives rerunning all jobs`, async () => {
+    const first = await run({ result: { summary: '', findings } });
+    assert.equal(first.publication.complete, true);
+    assert.equal(first.publication.restorable, true);
+    const recovered = await recover({ artifactFiles: first.artifactFiles });
+    assert.equal(recovered.error, undefined);
+    assert.equal(recovered.outputs.restored, 'true');
+    const next = await run({ server: first.server, restoredRaw: recovered.raw,
+      env: { RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
+    assert.equal(next.failures.length, 0);
+    assert.equal(next.status.state, first.status.state);
+    assert.equal(next.server.comments.length, findings.length);
+    assert.equal(next.server.issueComments.length, findings.length ? 0 : 1);
+  });
+}
+
+for (const options of [{ raw: 'not JSON' },
+  { result: { summary: '', findings: [{ ...finding, path: 'missing.ts' }] } },
+  { result: { summary: '', findings: [{ ...finding, line: 0 }] } }]) {
+  test(`validation failure permits a new model result on the same run: ${JSON.stringify(options)}`, async () => {
+    const first = await run(options);
+    assert.equal(first.status.state, 'error');
+    assert.equal(first.publication.restorable, false);
+    assert.equal(first.publication.posted.length, 0);
+    const recovered = await recover({ artifactFiles: first.artifactFiles });
+    assert.equal(recovered.error, undefined);
+    assert.equal(recovered.outputs.restored, 'false');
+    assert.equal(recovered.raw, undefined);
+    const next = await run({ result, server: first.server });
+    assert.equal(next.failures.length, 0);
+    assert.equal(next.status.state, 'failure');
+    assert.equal(next.server.comments.length, 1);
+  });
+}
+
+test('an invalid result marked as already posted cannot silently invoke the model again', async () => {
+  const first = await run();
+  first.artifactFiles['publication.json'] = Buffer.from(JSON.stringify({ ...first.publication, restorable: false }));
+  const recovered = await recover({ artifactFiles: first.artifactFiles });
+  assert.match(recovered.error.message, /判定できません/);
+  assert.equal(recovered.outputs.restored, 'false');
+});
+
+test('artifact upload runs after successful publication as well as failed publication', () => {
+  const section = workflow.slice(workflow.indexOf('      - name: Preserve review result and publication state'));
+  assert.match(section, /always\(\) && steps.publish_review.outcome != 'skipped'/);
+  assert.doesNotMatch(section, /steps.publish_review.outcome == 'failure'/);
 });
 
 test('real Git patches preserve quoted paths, renames, deleted files, and binary files', async () => {

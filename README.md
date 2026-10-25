@@ -12,6 +12,23 @@ effort はどちらも PR の変更行数で切り替える (→ [effort の決�
 Claude は API key ではなく、Pro / Max サブスクリプションの OAuth token を使う。
 Codex も OpenAI API key ではなく、`codex login` が保存する ChatGPT OAuth 認証を使う。
 
+## 既存利用者の移行: `actions: read` の追加（互換性に影響）
+
+保存結果の復元に伴い、呼び出し側の `permissions` に `actions: read` が必要になった。
+以前の README の例で導入済みの場合も、**参照するコミット・タグを更新する前に**
+呼び出し側へこの権限を追加してマージする。`@main` や自動追従する `@v1` の利用者は、
+この変更が main に入る前に呼び出し側を更新する。既存の他の権限は維持する。
+
+```yaml
+permissions:
+  actions: read
+  # contents / pull-requests / issues / statuses / id-token の既存指定も維持する
+```
+
+追加せずに更新すると、GitHub は呼び出される側の `actions: read` 要求を
+`actions: none` からの権限昇格として拒否し、workflow は起動せずレビューのチェックも出ない。
+呼び出し側を先に変更できない場合は、対応が終わるまで導入済みのコミット SHA を参照する。
+
 ## トークンの置き場所
 
 **呼び出し側のリポジトリには secret を置かない。** 認証情報は AWS の SSM
@@ -323,16 +340,19 @@ GitHub が一括投稿の行位置を拒否した場合は1件ずつ再試行し
 `error` とし、ジョブも失敗させる。通常の PR コメントへのフォールバックは行わない。
 全指摘のスレッドとサマリーの投稿が完了してから件数付きのチェックを出す。
 サマリーを確定してから、追加のファイル単位スレッドを投稿する。同じ workflow run の
-失敗したジョブを再実行すると、前回 attempt の artifact から最終結果と差分を復元し、
+ジョブを再実行すると、前回 attempt の artifact から検証済みの最終結果と差分を復元し、
 モデル・認証取得・差分生成をスキップして投稿だけを再試行する。元の差分も復元するため、
 その間に base branch が動いても行位置の判定は変わらない。投稿済みの指摘とサマリーは
 `github-actions[bot]` 自身の投稿だけを再利用する。モデルを改めて動かしたい場合は新しい
-workflow run を起動する。保存結果の期限切れ・取得失敗・run や SHA の不一致は `error`
+workflow run を起動する。JSON の形式・パス等の検証が不正で未投稿だった結果は
+`restorable: false` として保存し、再実行では復元せずモデルを動かして回復させる。
+保存結果の期限切れ・取得失敗・run や SHA の不一致は `error`
 になり、黙ってモデルを再実行しない。投稿済みなのに artifact が残らなかった場合も同様。
 
-最終結果を取得したあとで形式検証や投稿に失敗した場合は、最終結果・差分・変更ファイル一覧・
+最終結果を取得した attempt は成功・失敗のどちらでも、最終結果・差分・変更ファイル一覧・
 投稿記録を `pr-review-result-<claude|codex>-<実行attempt>` という workflow artifact に
-7日間保存する。復元には `actions: read` が必要なため、呼び出し側にも指定する。
+7日間保存する。成功した leg も保存するため、Re-run all jobs でも結果とチェック状態を再利用できる。
+指摘なしの通常コメントも投稿者・マーカーで照合し、再投稿せず URL を記録する。復元には `actions: read` が必要なため、呼び出し側にも指定する。
 `publication.json` には投稿済みレビュー・スレッドの URL と失敗理由を保存し、投稿済み URL
 はジョブログにも出力する。ツール実行履歴や認証情報を含む Claude の `execution_file`
 全体は保存しない。
