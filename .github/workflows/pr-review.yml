@@ -916,6 +916,7 @@ jobs:
               // files.z と pr.diff はモデルに渡したものと同じスナップショット。
               // GitHub API の現在の PR 差分を使うと、後続 push と混ざるため使わない。
               const files = new Map();
+              const oldFiles = new Map();
               if (findings.length) {
                 const tokens = fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/files.z"), "utf8").split("\0");
                 const aliases = [];
@@ -926,6 +927,8 @@ jobs:
                   if (!status || !oldPath || !newPath) throw new Error("変更ファイル一覧が不正です");
                   const file = { path: newPath, LEFT: new Set(), RIGHT: new Set() };
                   files.set(newPath, file);
+                  // 新規追加・コピーには変更前の自分のパスがない。
+                  if (!/^[AC]/.test(status)) oldFiles.set(oldPath, file);
                   if (oldPath !== newPath) aliases.push([oldPath, file]);
                 }
                 for (const [oldPath, file] of aliases) {
@@ -969,7 +972,8 @@ jobs:
                   } else if (line.startsWith("--- ")) {
                     oldPath = diffPath(line.slice(4));
                   } else if (line.startsWith("+++ ")) {
-                    file = files.get(diffPath(line.slice(4)) ?? oldPath);
+                    const newPath = diffPath(line.slice(4));
+                    file = newPath === null ? oldFiles.get(oldPath) : files.get(newPath);
                   }
                 }
               }
@@ -991,7 +995,11 @@ jobs:
                     typeof finding.body !== "string" || !finding.body.trim()) {
                   throw new Error("指摘のパス・行番号・本文が不正です");
                 }
-                const file = files.get(finding.path);
+                // LEFT の旧パスと RIGHT の現行パスは別の名前空間で解決する。
+                // リネーム元のパスが新規ファイルに再利用されていても、削除行は元のファイルに付ける。
+                const file = finding.side === "LEFT"
+                  ? oldFiles.get(finding.path) ?? files.get(finding.path)
+                  : files.get(finding.path);
                 if (!file) throw new Error(`指摘のファイルが PR 差分にありません: ${finding.path}`);
                 const marker = `<!-- pr-review:finding:${hash([publicationKey, index, file.path,
                   finding.line, finding.side, finding.body.trim()])} -->`;

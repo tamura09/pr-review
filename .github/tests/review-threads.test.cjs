@@ -482,6 +482,47 @@ test('rename without textual changes falls back using the current path', async (
   assert.equal(output.failures.length, 0);
 });
 
+for (const reversed of [false, true]) {
+  for (const isCodex of [false, true]) {
+    test(`${isCodex ? 'Codex' : 'Claude'}: LEFT rename source wins over a new file at the same path, reversed=${reversed}`, async () => {
+      const entries = ['R095\0old.ts\0new.ts\0', 'A\0old.ts\0'];
+      const diff = 'diff --git a/old.ts b/new.ts\nrename from old.ts\nrename to new.ts\n--- a/old.ts\n+++ b/new.ts\n@@ -42 +42 @@\n-removed\n+changed\n' +
+        'diff --git a/old.ts b/old.ts\nnew file mode 100644\n--- /dev/null\n+++ b/old.ts\n@@ -0,0 +1 @@\n+unrelated file\n';
+      const findings = [
+        { ...finding, path: 'old.ts', line: 42, side: 'LEFT' },
+        { ...finding, path: 'old.ts', line: 1, side: 'RIGHT' },
+        { ...finding, path: 'new.ts', line: 42, side: 'RIGHT' },
+        { ...finding, path: 'new.ts', line: 42, side: 'LEFT' },
+        { ...finding, path: 'old.ts', line: 99, side: 'LEFT' },
+      ];
+      const output = await run({ isCodex, diff, files: (reversed ? entries.reverse() : entries).join(''),
+        result: { ...result, findings } });
+      assert.equal(output.failures.length, 0);
+      assert.deepEqual(output.review.comments.map(comment => [comment.path, comment.side, comment.line]), [
+        ['new.ts', 'LEFT', 42], ['old.ts', 'RIGHT', 1], ['new.ts', 'RIGHT', 42], ['new.ts', 'LEFT', 42],
+      ]);
+      assert.equal(output.fileComments.length, 1);
+      assert.equal(output.fileComments[0].path, 'new.ts');
+      assert.match(output.fileComments[0].body, /LEFT 99行/);
+      assert.match(output.summary.body, /指摘 5件/);
+      assert.equal(output.status.state, 'failure');
+    });
+  }
+}
+
+test('a path used as both a rename source and destination resolves by side', async () => {
+  const diff = 'diff --git a/a.ts b/b.ts\n--- a/a.ts\n+++ b/b.ts\n@@ -3 +3 @@\n-old a\n+new b\n' +
+    'diff --git a/b.ts b/c.ts\n--- a/b.ts\n+++ b/c.ts\n@@ -9 +9 @@\n-old b\n+new c\n';
+  const output = await run({ files: 'R090\0a.ts\0b.ts\0R090\0b.ts\0c.ts\0', diff,
+    result: { ...result, findings: [
+      { ...finding, path: 'b.ts', line: 9, side: 'LEFT' },
+      { ...finding, path: 'b.ts', line: 3, side: 'RIGHT' },
+    ] } });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.fileComments.length, 0);
+  assert.deepEqual(output.review.comments.map(comment => [comment.path, comment.side]), [['c.ts', 'LEFT'], ['b.ts', 'RIGHT']]);
+});
+
 test('a GitHub position rejection retries each line and falls back only after individual rejection', async () => {
   const output = await run({ rejectLine: true });
   assert.equal(output.failures.length, 0);

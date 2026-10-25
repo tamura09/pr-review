@@ -431,6 +431,14 @@ Claude は読み取り専用ツールと構造化出力だけを使う。`--tool
   乗っ取られればロールは引ける。同じく Claude の OAuth token と
   `GITHUB_TOKEN` (action が `.git/config` の remote URL に入れる) も読める。
   これらは Claude に入る文章を push 権限の内側に絞ることで守っている (次項)
+- 復元用の `actions: read` も job 全体に付くため、Claude に渡す同じ `GITHUB_TOKEN`
+  にもこの権限がある。復元処理自身は同じ run だけを指定するが、トークンの権限は
+  run 単位には制限されず、private リポジトリでもそのリポジトリの全 workflow run の
+  [ログ](https://docs.github.com/en/rest/actions/workflow-runs#download-workflow-run-logs)と
+  [artifact](https://docs.github.com/en/rest/actions/artifacts#list-artifacts-for-a-repository)を
+  取得できる。他のワークフローの成果物も対象になる。モデルが乗っ取られてトークンを
+  読み出された場合、この範囲も読まれ得る。読み取り専用ツールや空の MCP 設定は、
+  トークン自体の権限を復元ステップだけに分離するものではない。
 - Claude は指定したプロンプトと checkout 済みのコード・差分を読む。PR のコメント・
   レビュー・行コメントは自動取得せず、MCP 経由で取得することもできない。
   fork の PR は動かないため、レビュー対象のコードを書けるのは push 権限を持つ人だけ
