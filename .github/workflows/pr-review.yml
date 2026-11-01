@@ -670,11 +670,12 @@ jobs:
         run: |
           set -euo pipefail
           output_file="${RUNNER_TEMP}/codex-final-message.md"
+          codex_runtime="$(npm root --global)/@openai/codex"
           permission_args=(
             --config 'approval_policy="never"'
             --config 'default_permissions="review"'
             --config "projects={\"${GITHUB_WORKSPACE}\"={trust_level=\"untrusted\"}}"
-            --config "permissions.review={filesystem={\":root\"=\"deny\",\":minimal\"=\"read\",\":workspace_roots\"=\"read\",\"${RUNNER_TEMP}/pr-review\"=\"read\",\"${CODEX_HOME}\"=\"deny\",\"/proc\"=\"deny\"},network={enabled=false}}"
+            --config "permissions.review={filesystem={\":root\"=\"deny\",\":minimal\"=\"read\",\"${codex_runtime}\"=\"read\",\":workspace_roots\"=\"read\",\"${RUNNER_TEMP}/pr-review\"=\"read\",\"${CODEX_HOME}\"=\"deny\",\"/proc\"=\"deny\"},network={enabled=false}}"
             --config 'shell_environment_policy.inherit="none"'
             --config 'shell_environment_policy.set={PATH="/usr/bin:/bin"}'
           )
