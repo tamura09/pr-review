@@ -217,10 +217,12 @@ Claude は `track_progress: false` の agent モードで、checkout 済みの P
 
 Codex は GPT-6.1 Sol で差分と関連コードを読み、同じ形式の最終回答を返す。
 [permission profile](https://learn.chatgpt.com/docs/permissions) で、checkout 先・差分と
-最小限の実行用ファイルだけを読み取り許可し、`CODEX_HOME` と `/proc` を明示的に拒否する。
+最小限の実行用ファイルだけを読み取り許可し、`CODEX_HOME` を明示的に拒否する。
 シェルにジョブの環境変数を引き継がず、書き込み・ネットワーク・承認による権限拡張も
 許可しない。モデル起動前に同じ CLI と profile で読み取りを試し、認証ファイル・元の認証の
-控え・認証ファイルへの symlink・ジョブの環境ファイルを読める場合はレビューを止める。
+控え・認証ファイルへの symlink・ジョブの環境ファイル・ホスト側プロセスの環境を
+読める場合はレビューを止める。Linux のサンドボックス内には独立した PID 名前空間の
+`/proc` があり、シェルの環境には固定した `PATH` だけを明示設定する。
 後続の共通ステップが両モデルの JSON を検証し、件数サマリーと各指摘の
 レビュースレッドを `github-actions[bot]` として投稿する。差分・関連コード・投稿先は
 同じ PR head のコミットに揃える。

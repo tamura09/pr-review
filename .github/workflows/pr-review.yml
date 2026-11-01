@@ -675,28 +675,30 @@ jobs:
             --config 'approval_policy="never"'
             --config 'default_permissions="review"'
             --config "projects={\"${GITHUB_WORKSPACE}\"={trust_level=\"untrusted\"}}"
-            --config "permissions.review={filesystem={\":root\"=\"deny\",\":minimal\"=\"read\",\"${codex_runtime}\"=\"read\",\":workspace_roots\"=\"read\",\"${RUNNER_TEMP}/pr-review\"=\"read\",\"${CODEX_HOME}\"=\"deny\",\"/proc\"=\"deny\"},network={enabled=false}}"
+            --config "permissions.review={filesystem={\":root\"=\"deny\",\":minimal\"=\"read\",\"${codex_runtime}\"=\"read\",\":workspace_roots\"=\"read\",\"${RUNNER_TEMP}/pr-review\"=\"read\",\"${CODEX_HOME}\"=\"deny\"},network={enabled=false}}"
             --config 'shell_environment_policy.inherit="none"'
             --config 'shell_environment_policy.set={PATH="/usr/bin:/bin"}'
           )
           # 実際の CLI と OS で読み取り境界を確認する。制限が効かない場合は起動しない。
           ln -s "${CODEX_HOME}/auth.json" "${RUNNER_TEMP}/pr-review/auth-probe"
           trap 'rm -f -- "${RUNNER_TEMP}/pr-review/auth-probe"' EXIT
+          export REVIEW_SANDBOX_SENTINEL=must-not-reach-review-tools
           # shellcheck disable=SC2016
           codex sandbox --permission-profile review "${permission_args[@]}" -- \
             /bin/bash -euc '
+              test -z "${REVIEW_SANDBOX_SENTINEL+x}"
               head -c 1 "$1" >/dev/null
               head -c 1 "$2" >/dev/null
               shift 2
               for protected_path; do
                 if head -c 1 "${protected_path}" >/dev/null 2>&1; then
-                  echo "Review sandbox can read a protected path" >&2
+                  echo "Review sandbox can read a protected path: ${protected_path}" >&2
                   exit 1
                 fi
               done
             ' probe "${GITHUB_WORKSPACE}/.git/HEAD" "${RUNNER_TEMP}/pr-review/pr.diff" \
             "${CODEX_HOME}/auth.json" "${CODEX_HOME}/auth-before.json" \
-            "${RUNNER_TEMP}/pr-review/auth-probe" "${GITHUB_ENV}" /proc/self/environ
+            "${RUNNER_TEMP}/pr-review/auth-probe" "${GITHUB_ENV}" "/proc/$$/environ"
           rm -f -- "${RUNNER_TEMP}/pr-review/auth-probe"
           args=(
             exec
