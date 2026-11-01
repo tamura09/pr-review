@@ -34,6 +34,7 @@ const finding = {
   body: '**境界値で失敗する**\n入力が 0 の場合に例外になるため、境界条件を修正してください。',
 };
 const result = { summary: '境界値で失敗する', findings: [finding] };
+const invalidResult = { summary: '', findings: [{ ...finding, path: 'missing.ts' }] };
 const jsonBlock = value => '```json\n' + JSON.stringify(value) + '\n```';
 
 async function run(options = {}) {
@@ -978,8 +979,7 @@ for (const findings of [[finding], []]) {
   });
 }
 
-for (const options of [{ raw: 'not JSON' },
-  { result: { summary: '', findings: [{ ...finding, path: 'missing.ts' }] } },
+for (const options of [{ result: { summary: '', findings: [{ ...finding, path: 'missing.ts' }] } },
   { result: { summary: '', findings: [{ ...finding, line: 0 }] } }]) {
   test(`validation failure permits a new model result on the same run: ${JSON.stringify(options)}`, async () => {
     const first = await run(options);
@@ -1000,7 +1000,7 @@ for (const options of [{ raw: 'not JSON' },
 for (const isCodex of [false, true]) {
   for (const findings of [[finding], []]) {
     test(`${isCodex ? 'Codex' : 'Claude'}: an older invalid artifact cannot hide a later posted summary with ${findings.length} findings`, async () => {
-      const invalid = await run({ isCodex, raw: 'not JSON', claudeReview: '{' });
+      const invalid = await run({ isCodex, result: invalidResult });
       assert.equal(invalid.publication.restorable, false);
       assert.equal(invalid.publication.posted.length, 0);
       // Attempt 2 published, then lost its artifact. Attempt 3 can only see attempt 1's invalid result.
@@ -1019,7 +1019,7 @@ for (const isCodex of [false, true]) {
 
 for (const env of [{ SHA: 'another-head' }, { RUN_URL: runUrl + '4' }]) {
   test(`an old invalid artifact still allows regeneration when only another publication exists: ${JSON.stringify(env)}`, async () => {
-    const invalid = await run({ raw: 'not JSON' });
+    const invalid = await run({ result: invalidResult });
     const published = await run({ env });
     const recovered = await recover({ artifactFiles: invalid.artifactFiles, env: { RUN_ATTEMPT: '3' },
       reviews: published.server.reviews });
@@ -1030,7 +1030,7 @@ for (const env of [{ SHA: 'another-head' }, { RUN_URL: runUrl + '4' }]) {
 
 for (const fail of ['listReviews', 'listIssueComments']) {
   test(`regeneration from an invalid artifact is blocked when ${fail} cannot confirm publication state`, async () => {
-    const invalid = await run({ raw: 'not JSON' });
+    const invalid = await run({ result: invalidResult });
     const recovered = await recover({ artifactFiles: invalid.artifactFiles, fail, env: { RUN_ATTEMPT: '3' } });
     assert.match(recovered.error.message, /Simulated/);
     assert.equal(recovered.outputs.restored, 'false');
@@ -1167,4 +1167,35 @@ test('review tools are confined and credentials survive only until the trusted p
   assert.match(codex, /codex sandbox --permission-profile review/);
   assert.doesNotMatch(codex, /--sandbox /);
   assert.ok(workflow.indexOf('- name: Remove Codex authentication') > workflow.indexOf('- name: Publish review threads and status'));
+});
+
+for (const isCodex of [false, true]) {
+  test(`${isCodex ? 'Codex' : 'Claude'}: malformed JSON with escaped credentials is discarded`, async () => {
+    const encoded = [...testToken].map(char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join('');
+    const broken = JSON.stringify({ summary: testToken, findings: [] }).replace(testToken, encoded).slice(0, -1);
+    const output = await run({ isCodex, raw: '```json\n' + broken + '\n```', claudeReview: broken });
+    assert.equal(output.status.state, 'error');
+    assert.deepEqual(Object.keys(output.artifactFiles), []);
+    assert.deepEqual(output.calls.map(call => call.method), ['createCommitStatus']);
+    assert.ok(!JSON.stringify(output).includes(encoded));
+    assert.ok(!JSON.stringify(output).includes(testToken));
+  });
+}
+test('multiple JSON blocks containing escaped credentials are discarded', async () => {
+  const encoded = [...testToken].map(char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join('');
+  const raw = jsonBlock({ summary: testToken, findings: [] }).replace(testToken, encoded) + '\n' + jsonBlock(result);
+  const output = await run({ raw });
+  assert.equal(output.status.state, 'error');
+  assert.deepEqual(Object.keys(output.artifactFiles), []);
+  assert.deepEqual(output.calls.map(call => call.method), ['createCommitStatus']);
+});
+test('discarded malformed results allow a new model execution when no publication exists', async () => {
+  const first = await run({ raw: 'not JSON' });
+  assert.equal(first.status.state, 'error');
+  assert.deepEqual(Object.keys(first.artifactFiles), []);
+  const recovered = await recover({ artifacts: [] });
+  assert.equal(recovered.error, undefined);
+  assert.equal(recovered.outputs.restored, 'false');
+  const next = await run({ server: first.server });
+  assert.equal(next.failures.length, 0);
 });

@@ -969,7 +969,7 @@ jobs:
               }
               assertNoSecrets(raw);
               // JSON のエスケープを解いた値も保存前に検査する。構文エラーに本文を含めない。
-              let result, invalidJson = false;
+              let result;
               try {
                 if (isCodex) {
                   const blocks = [...raw.matchAll(/^```json\s*\n([\s\S]*?)^```[ \t]*$/gm)];
@@ -979,7 +979,7 @@ jobs:
                   result = JSON.parse(raw);
                 }
               } catch {
-                invalidJson = true;
+                throw new Error("レビュー結果の JSON ブロックまたは JSON 構文が不正です");
               }
               function inspect(value) {
                 if (typeof value === "string") assertNoSecrets(value);
@@ -1002,7 +1002,6 @@ jobs:
               savePublication = () => fs.writeFileSync(path.join(resultDir, "publication.json"),
                 JSON.stringify(publication, null, 2), { mode: 0o600 });
               savePublication();
-              if (invalidJson) throw new Error("レビュー結果の JSON ブロックまたは JSON 構文が不正です");
 
               if (!result || !Array.isArray(result.findings) || typeof result.summary !== "string") {
                 throw new Error("レビュー結果の形式が不正です");
