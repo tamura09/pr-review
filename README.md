@@ -209,13 +209,30 @@ Claude は `track_progress: false` の agent モードで、checkout 済みの P
 切り替えずにレビューする。過去の PR コメント・レビュースレッドはプロンプトへ自動で
 取り込まないため、スレッドの差分が再実行のたびに積み上がることもない。
 使用するのは `Read` / `Grep` / `Glob` の読み取り専用ツールだけで、MCP は無効にする。
+`permissions.blockReadsOutsideWorkingDirectories` を有効にし、checkout 先と差分の
+ディレクトリ以外への読み取りを拒否する。PR 内の設定がアクセス範囲を広げないよう、
+設定ファイルの自動読み込みも無効にする。
 結果は `--json-schema` による `structured_output` から取得し、HTML 加工されたコメントは
 取得元に使わない。
 
-Codex は GPT-6.1 Sol・read-only サンドボックスで差分と関連コードを読み、同じ形式の
-最終回答を返す。後続の共通ステップが両モデルの JSON を検証し、件数サマリーと各指摘の
+Codex は GPT-6.1 Sol で差分と関連コードを読み、同じ形式の最終回答を返す。
+[permission profile](https://learn.chatgpt.com/docs/permissions) で、checkout 先・差分と
+最小限の実行用ファイルだけを読み取り許可し、`CODEX_HOME` と `/proc` を明示的に拒否する。
+シェルにジョブの環境変数を引き継がず、書き込み・ネットワーク・承認による権限拡張も
+許可しない。モデル起動前に同じ CLI と profile で読み取りを試し、認証ファイル・元の認証の
+控え・認証ファイルへの symlink・ジョブの環境ファイルを読める場合はレビューを止める。
+後続の共通ステップが両モデルの JSON を検証し、件数サマリーと各指摘の
 レビュースレッドを `github-actions[bot]` として投稿する。差分・関連コード・投稿先は
 同じ PR head のコミットに揃える。
+
+投稿と artifact 保存の前に、モデルの最終回答全体と JSON のエスケープを解いた各文字列を、
+Claude OAuth token または Codex の `access_token`・`refresh_token`・`id_token`・API key と
+照合する。Codex は起動前と refresh 後の両方を対象とする。一致した場合は結果を保存・投稿せず、
+チェックを error にする。認証ファイルは検査後に必ず削除する。再投稿用 artifact には
+トークンの長さと SHA-256 digest だけを保存し、再実行でも同じ検査を行う。検査記録のない
+旧 artifact は投稿せず、新しい workflow run での再レビューを要求する。この検査は
+トークン全体の一致を対象とし、分割・任意のエンコードによる漏えいまで検出するものではない。
+そのため、モデルの読み取り制限と併用する。
 
 指摘がある場合はレビュー本文に件数サマリーを載せ、指摘を1件ずつ解決可能な
 スレッドとして付ける。差分内の行を特定できない指摘はファイル単位のスレッドにし、

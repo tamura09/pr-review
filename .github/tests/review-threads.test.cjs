@@ -4,6 +4,9 @@ const { tmpdir } = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { join } = require('node:path');
 const { test } = require('node:test');
+const { createHash } = require('node:crypto');
+const testToken = 'test-oauth-secret-never-publish-0123456789';
+const fingerprint = token => ({ length: token.length, sha256: createHash('sha256').update(token).digest('hex') });
 
 // Execute the actual inline publisher. Reusable workflows check out the caller's
 // repository, so the publisher cannot import a script from this repository.
@@ -41,10 +44,14 @@ async function run(options = {}) {
   const errors = [];
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-result-test-'));
   mkdirSync(join(tempDir, 'pr-review'));
+  mkdirSync(join(tempDir, 'codex-home'));
+  for (const name of ['auth-before.json', 'auth.json']) {
+    writeFileSync(join(tempDir, 'codex-home', name), JSON.stringify(options[name] ?? { tokens: { access_token: testToken } }));
+  }
   writeFileSync(join(tempDir, 'pr-review/pr.diff'), options.diff ?? defaultDiff);
   writeFileSync(join(tempDir, 'pr-review/files.z'), options.files ?? 'M\0src/example.ts\0');
   const env = {
-    RUNNER_TEMP: tempDir,
+    RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken,
     SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
     REVIEWER: isCodex ? 'Codex · test-model · effort medium' : 'Claude · test-model · effort medium',
     IS_CODEX: String(isCodex), REVIEW_DIFF_OUTCOME: 'success',
@@ -55,6 +62,7 @@ async function run(options = {}) {
   };
   if (options.restoredRaw !== undefined) {
     mkdirSync(join(tempDir, 'pr-review-results'));
+    writeFileSync(join(tempDir, 'pr-review-results/publication.json'), JSON.stringify(options.restoredMetadata ?? { secret_fingerprints: [fingerprint(testToken)] }));
     writeFileSync(join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json'), options.restoredRaw);
   }
   const server = options.server ?? { reviews: [], comments: [], nextId: 88 };
@@ -1084,4 +1092,79 @@ test('real Git patches preserve quoted paths, renames, deleted files, and binary
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
+});
+
+for (const isCodex of [false, true]) {
+  for (const field of ['body', 'summary', 'path']) {
+    test(`${isCodex ? 'Codex' : 'Claude'}: refuses credentials in ${field} before any publication or artifact write`, async () => {
+      const result = { summary: field === 'summary' ? testToken : '', findings: [{ ...finding,
+        ...(field === 'summary' ? {} : { [field]: `prefix-${testToken}-suffix` }) }] };
+      const output = await run({ isCodex, result });
+      assert.equal(output.status.state, 'error');
+      assert.match(output.failures[0], /認証情報/);
+      assert.deepEqual(Object.keys(output.artifactFiles), []);
+      assert.deepEqual(output.calls.map(call => call.method), ['createCommitStatus']);
+      assert.ok(!JSON.stringify(output).includes(testToken));
+    });
+  }
+}
+for (const name of ['auth-before.json', 'auth.json']) {
+  for (const key of ['access_token', 'refresh_token', 'id_token', 'OPENAI_API_KEY']) {
+    test(`blocks ${key} from ${name}, including JSON-escaped content`, async () => {
+      const token = `${name}-${key}-secret-9876543210`;
+      const auth = { tokens: { access_token: testToken,
+        ...(key === 'OPENAI_API_KEY' ? {} : { [key]: token }) }, ...(key === 'OPENAI_API_KEY' ? { [key]: token } : {}) };
+      const raw = jsonBlock({ summary: '', findings: [{ ...finding, body: token }] })
+        .replaceAll(token, [...token].map(char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join(''));
+      const output = await run({ [name]: auth, raw });
+      assert.equal(output.status.state, 'error');
+      assert.match(output.failures[0], /認証情報/);
+      assert.deepEqual(Object.keys(output.artifactFiles), []);
+      assert.deepEqual(output.calls.map(call => call.method), ['createCommitStatus']);
+      assert.ok(!JSON.stringify(output).includes(token));
+    });
+  }
+}
+test('invalid JSON cannot leak credential text through a parser error', async () => {
+  const output = await run({ raw: `invalid: ${testToken}` });
+  assert.equal(output.status.state, 'error');
+  assert.deepEqual(Object.keys(output.artifactFiles), []);
+  assert.ok(!JSON.stringify(output).includes(testToken));
+});
+test('restored credential-bearing output is removed before re-upload', async () => {
+  const output = await run({ restoredRaw: jsonBlock({ summary: testToken, findings: [] }),
+    env: { RESTORED: 'true' } });
+  assert.equal(output.status.state, 'error');
+  assert.deepEqual(Object.keys(output.artifactFiles), []);
+  assert.deepEqual(output.calls.map(call => call.method), ['createCommitStatus']);
+});
+test('restored results without credential fingerprints cannot be published or re-uploaded', async () => {
+  const output = await run({ restoredRaw: jsonBlock(result), restoredMetadata: {}, env: { RESTORED: 'true' } });
+  assert.equal(output.status.state, 'error');
+  assert.deepEqual(Object.keys(output.artifactFiles), []);
+});
+test('retained results contain only token digests and keep the original and refreshed token guards', async () => {
+  const refreshed = 'fresh-access-secret-9876543210';
+  const first = await run({ 'auth.json': { tokens: { access_token: refreshed } } });
+  assert.equal(first.status.state, 'failure');
+  assert.deepEqual(first.publication.secret_fingerprints, [fingerprint(testToken), fingerprint(refreshed)]);
+  assert.ok(!JSON.stringify(first.artifactFiles).includes(testToken));
+  assert.ok(!JSON.stringify(first.artifactFiles).includes(refreshed));
+  const recovered = await recover({ artifactFiles: first.artifactFiles });
+  assert.equal(recovered.error, undefined);
+  const retry = await run({ restoredRaw: jsonBlock({ summary: refreshed, findings: [] }),
+    restoredMetadata: first.publication, env: { RESTORED: 'true' } });
+  assert.equal(retry.status.state, 'error');
+  assert.deepEqual(Object.keys(retry.artifactFiles), []);
+});
+test('review tools are confined and credentials survive only until the trusted publisher', () => {
+  const claude = workflow.match(/- name: Review with Claude[\s\S]*?- name: Set up Node.js/)[0];
+  assert.match(claude, /blockReadsOutsideWorkingDirectories":true/);
+  assert.match(claude, /--setting-sources ""/);
+  const codex = workflow.match(/- name: Review with Codex[\s\S]*?- name: Configure AWS/)[0];
+  assert.ok(codex.includes('\\":root\\"=\\"deny\\"'));
+  assert.match(codex, /shell_environment_policy\.inherit="none"/);
+  assert.match(codex, /codex sandbox --permission-profile review/);
+  assert.doesNotMatch(codex, /--sandbox /);
+  assert.ok(workflow.indexOf('- name: Remove Codex authentication') > workflow.indexOf('- name: Publish review threads and status'));
 });
