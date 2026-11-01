@@ -992,7 +992,9 @@ jobs:
               // 投稿失敗時にも同じ結果で再試行できるよう、最終結果と差分を保存する。
               // ツールの実行履歴や認証情報を含む execution_file は保存しない。
               fs.mkdirSync(resultDir, { recursive: true, mode: 0o700 });
-              fs.writeFileSync(resultPath, raw, { mode: 0o600 });
+              // JSON の外にある未解析テキストは保存しない。
+              const saved = isCodex ? "```json\n" + JSON.stringify(result) + "\n```" : JSON.stringify(result);
+              fs.writeFileSync(resultPath, saved, { mode: 0o600 });
               // base branch が動いた後の再実行でも、元の行位置を検証する。
               for (const name of ["pr.diff", "files.z"]) {
                 fs.copyFileSync(path.join(process.env.RUNNER_TEMP, "pr-review", name), path.join(resultDir, name));

@@ -1199,3 +1199,11 @@ test('discarded malformed results allow a new model execution when no publicatio
   const next = await run({ server: first.server });
   assert.equal(next.failures.length, 0);
 });
+
+test('Codex artifact excludes unparsed prose containing escaped credentials outside the JSON block', async () => {
+  const encoded = [...testToken].map(char => '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')).join('');
+  const output = await run({ raw: encoded + '\n' + jsonBlock(result) });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.savedResult, jsonBlock(result));
+  assert.ok(!JSON.stringify(output.artifactFiles).includes(encoded));
+});
