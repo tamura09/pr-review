@@ -676,6 +676,7 @@ jobs:
             --config "projects={\"${GITHUB_WORKSPACE}\"={trust_level=\"untrusted\"}}"
             --config "permissions.review={filesystem={\":root\"=\"deny\",\":minimal\"=\"read\",\":workspace_roots\"=\"read\",\"${RUNNER_TEMP}/pr-review\"=\"read\",\"${CODEX_HOME}\"=\"deny\",\"/proc\"=\"deny\"},network={enabled=false}}"
             --config 'shell_environment_policy.inherit="none"'
+            --config 'shell_environment_policy.set={PATH="/usr/bin:/bin"}'
           )
           # 実際の CLI と OS で読み取り境界を確認する。制限が効かない場合は起動しない。
           ln -s "${CODEX_HOME}/auth.json" "${RUNNER_TEMP}/pr-review/auth-probe"
