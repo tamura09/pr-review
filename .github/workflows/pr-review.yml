@@ -283,6 +283,7 @@ jobs:
                   [path.join(diffDir, "pr.diff"), diff], [path.join(diffDir, "files.z"), files]]) {
                 fs.writeFileSync(target, contents, { mode: 0o600 });
               }
+              fs.writeFileSync(path.join(dir, "publication.json"), JSON.stringify(metadata), { mode: 0o600 });
               core.setOutput("reviewer", metadata.model_label);
               core.setOutput("restored", "true");
             } finally {
@@ -474,6 +475,7 @@ jobs:
           install -d -m 700 "${RUNNER_TEMP}/codex-home"
           printf '%s\n' "${compact}" > "${RUNNER_TEMP}/codex-home/auth.json"
           chmod 600 "${RUNNER_TEMP}/codex-home/auth.json"
+          cp "${RUNNER_TEMP}/codex-home/auth.json" "${RUNNER_TEMP}/codex-home/auth-before.json"
           # Persist ステップが refresh の有無を見分けるため、refresh token の
           # digest だけを残す。auth.json 全体だと、refresh に失敗した実行でも
           # Codex が書き直した分だけ digest が変わる
@@ -519,6 +521,8 @@ jobs:
           track_progress: false
           claude_args: |
             --json-schema '{"type":"object","properties":{"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string","minLength":1},"line":{"type":"integer","minimum":1},"side":{"type":"string","enum":["LEFT","RIGHT"]},"body":{"type":"string","minLength":1}},"required":["path","line","side","body"],"additionalProperties":false}}},"required":["summary","findings"],"additionalProperties":false}'
+            --settings '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+            --setting-sources ""
             --tools "Read,Grep,Glob"
             --allowedTools "Read,Grep,Glob"
             --mcp-config '{"mcpServers":{}}'
@@ -666,12 +670,43 @@ jobs:
         run: |
           set -euo pipefail
           output_file="${RUNNER_TEMP}/codex-final-message.md"
+          codex_runtime="$(npm root --global)/@openai/codex"
+          permission_args=(
+            --config 'approval_policy="never"'
+            --config 'default_permissions="review"'
+            --config "projects={\"${GITHUB_WORKSPACE}\"={trust_level=\"untrusted\"}}"
+            --config "permissions.review={filesystem={\":root\"=\"deny\",\":minimal\"=\"read\",\"${codex_runtime}\"=\"read\",\":workspace_roots\"=\"read\",\"${RUNNER_TEMP}/pr-review\"=\"read\",\"${CODEX_HOME}\"=\"deny\"},network={enabled=false}}"
+            --config 'shell_environment_policy.inherit="none"'
+            --config 'shell_environment_policy.set={PATH="/usr/bin:/bin"}'
+          )
+          # 実際の CLI と OS で読み取り境界を確認する。制限が効かない場合は起動しない。
+          ln -s "${CODEX_HOME}/auth.json" "${RUNNER_TEMP}/pr-review/auth-probe"
+          trap 'rm -f -- "${RUNNER_TEMP}/pr-review/auth-probe"' EXIT
+          export REVIEW_SANDBOX_SENTINEL=must-not-reach-review-tools
+          # shellcheck disable=SC2016
+          codex sandbox --permission-profile review "${permission_args[@]}" -- \
+            /bin/bash -euc '
+              test -z "${REVIEW_SANDBOX_SENTINEL+x}"
+              head -c 1 "$1" >/dev/null
+              head -c 1 "$2" >/dev/null
+              shift 2
+              for protected_path; do
+                if head -c 1 "${protected_path}" >/dev/null 2>&1; then
+                  echo "Review sandbox can read a protected path: ${protected_path}" >&2
+                  exit 1
+                fi
+              done
+            ' probe "${GITHUB_WORKSPACE}/.git/HEAD" "${RUNNER_TEMP}/pr-review/pr.diff" \
+            "${CODEX_HOME}/auth.json" "${CODEX_HOME}/auth-before.json" \
+            "${RUNNER_TEMP}/pr-review/auth-probe" "${GITHUB_ENV}" "/proc/$$/environ"
+          rm -f -- "${RUNNER_TEMP}/pr-review/auth-probe"
           args=(
             exec
             --ignore-user-config
+            --ignore-rules
             --ephemeral
             --model "${CODEX_MODEL}"
-            --sandbox read-only
+            "${permission_args[@]}"
             --color never
             --config "model_reasoning_effort=${CODEX_EFFORT}"
             --output-last-message "${output_file}"
@@ -790,23 +825,14 @@ jobs:
             echo "Codex authentication did not change."
           fi
 
-      - name: Remove Codex authentication and AWS credentials
-        if: ${{ always() && steps.codex_auth.outcome == 'success' }}
-        env:
-          FROM_SSM: ${{ steps.token_source.outputs.from_ssm }}
+      - name: Remove AWS credentials after persisting authentication
+        if: ${{ always() && steps.token_source.outputs.from_ssm == 'true' }}
         run: |
-          auth_file="${RUNNER_TEMP}/codex-home/auth.json"
-          if [ -f "${auth_file}" ]; then
-            chmod u+w "${auth_file}"
-            rm -f -- "${auth_file}"
-          fi
-          if [ "${FROM_SSM}" = "true" ]; then
-            {
-              echo "AWS_ACCESS_KEY_ID="
-              echo "AWS_SECRET_ACCESS_KEY="
-              echo "AWS_SESSION_TOKEN="
-            } >> "${GITHUB_ENV}"
-          fi
+          {
+            echo "AWS_ACCESS_KEY_ID="
+            echo "AWS_SECRET_ACCESS_KEY="
+            echo "AWS_SESSION_TOKEN="
+          } >> "${GITHUB_ENV}"
 
       # 両方の leg が同じ失敗をするので、コメントは Claude の leg だけが出す
       - name: Report PR diff preparation failure
@@ -845,6 +871,8 @@ jobs:
           MODEL_OUTCOME: ${{ matrix.reviewer == 'codex' && steps.codex.outcome || steps.claude.outcome }}
           CODEX_REVIEW: ${{ steps.codex.outputs.final-message }}
           CLAUDE_REVIEW: ${{ steps.claude.outputs.structured_output }}
+          CODEX_AUTH_OUTCOME: ${{ steps.codex_auth.outcome }}
+          CLAUDE_TOKEN: ${{ matrix.reviewer == 'claude' && (secrets.claude_code_oauth_token || steps.oauth_token.outputs.token) || '' }}
           IS_CODEX: ${{ matrix.reviewer == 'codex' }}
           REVIEWER: >-
             ${{ steps.restore_review.outputs.reviewer || (matrix.reviewer == 'codex' &&
@@ -859,6 +887,10 @@ jobs:
             const issue_number = context.payload.pull_request.number;
             const footer = `---\n_${REVIEWER} [Workflow run](${RUN_URL})_`;
             const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
+            let secretsChecked = false;
             let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
@@ -882,19 +914,87 @@ jobs:
               }
 
               // コメント用の HTML 加工を経ていないモデルの最終結果だけを使う。
-              const fs = require("node:fs");
-              const path = require("node:path");
-              const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
               const resultPath = path.join(resultDir, isCodex ? "codex.md" : "claude.json");
               const raw = restored ? fs.readFileSync(resultPath, "utf8") :
                 (isCodex ? process.env.CODEX_REVIEW : process.env.CLAUDE_REVIEW) || "";
               if (!raw.trim()) {
                 throw new Error("モデルのレビュー結果が空です");
               }
+              // 元の認証と refresh 後の認証の両方を検査する。再投稿には digest だけを引き継ぐ。
+              const { createHash } = require("node:crypto");
+              const digest = value => createHash("sha256").update(value).digest("hex");
+              const fingerprints = [];
+              function addSecret(value) {
+                if (typeof value === "string" && value.length) {
+                  const sha256 = digest(value);
+                  if (!fingerprints.some(item => item.sha256 === sha256)) fingerprints.push({ length: value.length, sha256 });
+                }
+              }
+              if (restored) {
+                const metadata = JSON.parse(fs.readFileSync(path.join(resultDir, "publication.json"), "utf8"));
+                if (!Array.isArray(metadata.secret_fingerprints)) {
+                  fs.rmSync(resultDir, { recursive: true, force: true });
+                  throw new Error("認証情報の検査記録がありません。新しい workflow run で再レビューしてください");
+                }
+                fingerprints.push(...metadata.secret_fingerprints);
+              } else if (isCodex) {
+                if (process.env.CODEX_AUTH_OUTCOME !== "success") throw new Error("認証情報の検査を準備できませんでした");
+                for (const name of ["auth-before.json", "auth.json"]) {
+                  let auth;
+                  try {
+                    auth = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "codex-home", name), "utf8"));
+                  } catch {
+                    throw new Error("認証情報の検査を準備できませんでした");
+                  }
+                  for (const key of ["access_token", "refresh_token", "id_token"]) addSecret(auth.tokens?.[key]);
+                  addSecret(auth.OPENAI_API_KEY);
+                }
+              } else {
+                addSecret(process.env.CLAUDE_TOKEN);
+              }
+              if (!fingerprints.length) throw new Error("認証情報の検査対象がありません");
+              publication.secret_fingerprints = fingerprints;
+              function assertNoSecrets(text) {
+                for (const { length, sha256 } of fingerprints) {
+                  if (!Number.isSafeInteger(length) || length < 1 || !/^[a-f0-9]{64}$/.test(sha256)) {
+                    throw new Error("認証情報の検査記録が不正です");
+                  }
+                  for (let offset = 0; offset <= text.length - length; offset++) {
+                    if (digest(text.slice(offset, offset + length)) === sha256) {
+                      fs.rmSync(resultDir, { recursive: true, force: true });
+                      throw new Error("レビュー結果に認証情報を検出したため、投稿と保存を中止しました");
+                    }
+                  }
+                }
+              }
+              assertNoSecrets(raw);
+              // JSON のエスケープを解いた値も保存前に検査する。構文エラーに本文を含めない。
+              let result;
+              try {
+                if (isCodex) {
+                  const blocks = [...raw.matchAll(/^```json\s*\n([\s\S]*?)^```[ \t]*$/gm)];
+                  if (blocks.length !== 1) throw new Error("invalid JSON block");
+                  result = JSON.parse(blocks[0][1]);
+                } else {
+                  result = JSON.parse(raw);
+                }
+              } catch {
+                throw new Error("レビュー結果の JSON ブロックまたは JSON 構文が不正です");
+              }
+              function inspect(value) {
+                if (typeof value === "string") assertNoSecrets(value);
+                else if (value && typeof value === "object") {
+                  for (const [key, item] of Object.entries(value)) { assertNoSecrets(key); inspect(item); }
+                }
+              }
+              inspect(result);
+              secretsChecked = true;
               // 投稿失敗時にも同じ結果で再試行できるよう、最終結果と差分を保存する。
               // ツールの実行履歴や認証情報を含む execution_file は保存しない。
               fs.mkdirSync(resultDir, { recursive: true, mode: 0o700 });
-              fs.writeFileSync(resultPath, raw, { mode: 0o600 });
+              // JSON の外にある未解析テキストは保存しない。
+              const saved = isCodex ? "```json\n" + JSON.stringify(result) + "\n```" : JSON.stringify(result);
+              fs.writeFileSync(resultPath, saved, { mode: 0o600 });
               // base branch が動いた後の再実行でも、元の行位置を検証する。
               for (const name of ["pr.diff", "files.z"]) {
                 fs.copyFileSync(path.join(process.env.RUNNER_TEMP, "pr-review", name), path.join(resultDir, name));
@@ -905,16 +1005,6 @@ jobs:
                 JSON.stringify(publication, null, 2), { mode: 0o600 });
               savePublication();
 
-              let result;
-              if (isCodex) {
-                const blocks = [...raw.matchAll(/^```json\s*\n([\s\S]*?)^```[ \t]*$/gm)];
-                if (blocks.length !== 1) {
-                  throw new Error("レビュー結果の JSON ブロックが不正です");
-                }
-                result = JSON.parse(blocks[0][1]);
-              } else {
-                result = JSON.parse(raw);
-              }
               if (!result || !Array.isArray(result.findings) || typeof result.summary !== "string") {
                 throw new Error("レビュー結果の形式が不正です");
               }
@@ -983,7 +1073,6 @@ jobs:
                   }
                 }
               }
-              const { createHash } = require("node:crypto");
               const hash = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
               // 再実行でモデルの結果が変わった場合は、前回のサマリーを上書きしない。
               // フィールド順だけが変わった同じ結果は、同じ投稿として扱う。
@@ -1142,6 +1231,7 @@ jobs:
                 ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
                 : "指摘なし";
             } catch (error) {
+              if (!secretsChecked) fs.rmSync(resultDir, { recursive: true, force: true });
               publication.error = String(error.message);
               savePublication();
               if (publication.posted.length) {
@@ -1157,6 +1247,11 @@ jobs:
               ...repo, sha: SHA, state, context: statusContext,
               description, target_url: RUN_URL,
             });
+
+      - name: Remove Codex authentication
+        if: ${{ always() && matrix.reviewer == 'codex' }}
+        run: |
+          rm -f -- "${RUNNER_TEMP}/codex-home/auth.json" "${RUNNER_TEMP}/codex-home/auth-before.json"
 
       # 成功した leg も保存し、Re-run all jobs でも同じ結果を再利用する。
       - name: Preserve review result and publication state
