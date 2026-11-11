@@ -616,10 +616,15 @@ jobs:
         # OS の bubblewrap を入れて (PATH に無いと Codex は同梱の bwrap を使う)、
         # その /usr/bin/bwrap にだけ userns を許すプロファイルを読み込む。
         # ランナー全体の制限 (kernel.apparmor_restrict_unprivileged_userns) は
-        # 外さない
+        # 外さない。
+        # ubuntu-26.04-arm のイメージには bubblewrap が最初から入っているので、
+        # 無いときだけ apt を叩く。apt-get update は runner の DNS が死んでいると
+        # 失敗を警告で済ませたまま 3 分以上リトライし続ける
         run: |
-          sudo apt-get update --quiet
-          sudo apt-get install --yes --no-install-recommends bubblewrap
+          if [ ! -x /usr/bin/bwrap ]; then
+            sudo apt-get update --quiet
+            sudo apt-get install --yes --no-install-recommends bubblewrap
+          fi
           sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
           abi <abi/4.0>,
           include <tunables/global>
