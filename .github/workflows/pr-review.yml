@@ -1041,6 +1041,18 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
             const cleanComment = process.env.CLEAN_COMMENT || "own";
+            // 読み取りとチェックの書き込み (どちらも繰り返して害がない) だけを再試行する。
+            // 作成系の投稿は重複するので再試行しない
+            async function withRetry(call) {
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  return await call();
+                } catch (error) {
+                  if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+                  await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+                }
+              }
+            }
             let claudeLabel = process.env.CLAUDE_LABEL;
             let restoredMergeBase;
             const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
@@ -1416,6 +1428,12 @@ jobs:
               publication.complete = true;
               savePublication();
               findingsCount = findings.length;
+              // 後続の codex ジョブを走らせるかの判定に使う。投稿まで終わったときだけ、
+              // チェックを書く前に出す (チェックの書き込みが失敗しても Codex は走らせる)
+              core.setOutput("findings", String(findingsCount));
+              // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
+              core.setOutput("label", REVIEWER);
+              core.setOutput("diff_digest", diffDigest);
               state = findings.length ? FINDINGS_STATE : "success";
               description = findings.length
                 ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
@@ -1438,19 +1456,9 @@ jobs:
             // success を書くと、後続 run の失敗を古い結果で通してしまいうる
             let owned = state !== "success";
             try {
-              // 読み取りだけは、一時的な API エラーを再試行する
-              let statuses;
-              for (let attempt = 1; ; attempt++) {
-                try {
-                  statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                    ...repo, ref: SHA, per_page: 100,
-                  });
-                  break;
-                } catch (error) {
-                  if (attempt >= 3) throw error;
-                  await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-                }
-              }
+              const statuses = await withRetry(() => github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                ...repo, ref: SHA, per_page: 100,
+              }));
               const latest = statuses.find(item => item.context === statusContext);
               // 自分より後に開始した run (run ID が大きい) が書いたものだけを避ける。
               // 前回の run の結果は、今回の結果で確定させる
@@ -1461,19 +1469,12 @@ jobs:
             }
             // 通常は書けなかった分を finalize が error で確定させる
             if (owned) {
-              await github.rest.repos.createCommitStatus({
+              await withRetry(() => github.rest.repos.createCommitStatus({
                 ...repo, sha: SHA, state, context: statusContext,
                 description, target_url: RUN_URL,
-              });
+              }));
             } else {
               core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
-            }
-            // 後続の codex ジョブを走らせるかの判定に使う。投稿まで終わったときだけ出す
-            if (findingsCount !== undefined) {
-              core.setOutput("findings", String(findingsCount));
-              // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
-              core.setOutput("label", REVIEWER);
-              core.setOutput("diff_digest", diffDigest);
             }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。

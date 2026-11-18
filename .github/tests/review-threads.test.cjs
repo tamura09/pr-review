@@ -1546,3 +1546,9 @@ test('the publish step does not auto-retry create calls, and the comment dedupe 
   assert.doesNotMatch(report, /\| grep -q/);
   assert.match(report, /contains\(env\.MARKER\)/);
 });
+
+test('Codex gating outputs are set before the status write, which is retried', async () => {
+  const output = await run({ isCodex: false, result: { summary: '', findings: [] }, fail: 'createCommitStatus' });
+  assert.equal(output.outputs.findings, '0');
+  assert.equal(output.calls.filter(call => call.method === 'createCommitStatus').length, 3);
+});
