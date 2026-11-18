@@ -29,7 +29,8 @@ concurrency:
 # Require conversation resolution before merging を有効にすると未解決スレッドで止まる。
 # 指定行が差分外の指摘も、ファイル単位の解決可能スレッドとして残る。
 # レビュー完了も必須にする場合は claude-review / codex-review を必須チェックにする。
-# Codex は Claude の指摘が0件のときだけ走る。走らないときの codex-review は pending (未実行)。
+# Codex は Claude の指摘が0件のときだけ走る。走らないときの codex-review は「未実行」で、
+# 状態は指摘ありの claude-review と同じ (findings_state)。
 # codex_review: false / codex_fallback: false なら claude-review だけを必須にする。
 # スキップ対象の PR にはチェックが出ないため、必須化すると待機し続ける点に注意。
 #

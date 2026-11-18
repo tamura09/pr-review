@@ -1229,5 +1229,6 @@ test('findings output is published only after a completed review and gates the C
   assert.match(skip, /matrix\.reviewer == 'claude'/);
   assert.match(skip, /steps\.publish_review\.outputs\.findings != '0'/);
   assert.match(skip, /context=codex-review/);
-  assert.match(skip, /state=pending/);
+  assert.match(skip, /FINDINGS_STATE: \$\{\{ inputs\.findings_state \}\}/);
+  assert.match(skip, /state="\$\{FINDINGS_STATE\}"/);
 });

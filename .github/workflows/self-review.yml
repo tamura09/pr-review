@@ -69,7 +69,7 @@ jobs:
         - Claude の構造化出力と Codex の最終回答を投稿ステップが取り違えないか。
           claude-review / codex-review がジョブごとに1つずつ出るか
         - Codex のジョブが Claude の指摘0件のときだけ走るか。Claude が失敗したときに
-          走らないか。Codex を走らせないときの codex-review が pending (未実行) として出るか
+          走らないか。Codex を走らせないときの codex-review が「未実行」として findings_state の状態で出るか
         - effort を決める変更行数の数え方と閾値の比較が、README の説明と一致しているか
         - 両モデルが返す JSON の形式と投稿ステップのパーサーが一致しているか。
           各指摘が解決可能なレビュースレッドになり、投稿失敗時にチェックが error になるか

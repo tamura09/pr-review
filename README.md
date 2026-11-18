@@ -208,7 +208,7 @@ Codex は、Claude が「指摘なし」と言った PR を見直す二人目と
 | Claude の結果 | Codex | `codex-review` |
 | --- | --- | --- |
 | 指摘なし | 走る | Codex の結果 |
-| 指摘あり | 走らない | 🟡 pending `Claude の指摘 N件があるため未実行。0件になると Codex が走る` |
+| 指摘あり | 走らない | `Claude の指摘 N件があるため未実行。0件になると Codex が走る` (状態は `findings_state`) |
 | レビュー失敗 | 走らない | 出ない (`claude-review` が error) |
 
 指摘を直して push すると Claude から再レビューされ、0件になった時点で Codex が走る。
@@ -343,10 +343,10 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 投稿する。件数はモデルの申告ではなく、検証した `findings` の要素数から決める。
 
 PR のチェック一覧にも `claude-review` と `codex-review` を出す。Claude に指摘があって
-Codex を走らせなかったときは、`codex-review` を pending (未実行) で出す。Codex が一度も
-見ていない head を完了扱いにしないため。`findings_state: success` で Claude の指摘を
-残したままマージする運用でも、`codex-review` を必須にしていれば Codex のレビューを
-経るまではマージできない。
+Codex を走らせなかったときは、`codex-review` を「未実行」として、指摘ありの
+`claude-review` と同じ状態 (`findings_state`、既定は `failure`) で出す。`codex-review` を
+`claude-review` より緩くも厳しくもしないため。`findings_state: success` にすると、
+Claude の指摘を残したまま、Codex のレビューを経ずにマージできる。
 
 | 状態 | 表示 |
 | --- | --- |

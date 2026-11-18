@@ -6,7 +6,8 @@
 # 二人目として、Claude が「指摘なし」と言ったときにだけ Codex を使う。
 # それぞれが件数サマリーと指摘ごとのレビュースレッドを投稿して PR のチェック
 # 一覧に claude-review / codex-review を出す。Codex を走らせなかったときは
-# codex-review を pending にし、Codex が実際に見るまで完了扱いにしない。
+# codex-review を「未実行」として、指摘ありの claude-review と同じ状態
+# (findings_state) で出す。
 #
 # effort はどちらも PR の変更行数で決める (小さい PR は low、普段は medium、
 # 大きい PR は high)。
@@ -1266,10 +1267,12 @@ jobs:
             if (findingsCount !== undefined) core.setOutput("findings", String(findingsCount));
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
-      # success にすると、findings_state: success の呼び出し側では Codex が一度も
-      # 見ないまま必須チェックが揃ってマージできてしまう。Codex がまだ見ていない
-      # ことをそのまま示す pending にする。指摘を直して Claude が0件になれば、
-      # その head で Codex が走って本当の結果に置き換わる
+      # 状態は指摘ありの claude-review と同じ findings_state にする。codex-review を
+      # claude-review より緩くも厳しくもしないため。常に success だと failure の
+      # 呼び出し側でも Codex を経ずに揃って見え、pending だと success の呼び出し側で
+      # Claude の誤検知が残る PR が永久にマージできなくなる。
+      # 指摘を直して Claude が0件になれば、その head で Codex が走って本当の結果に
+      # 置き換わる
       - name: Mark Codex review as skipped
         if: >-
           always() &&
@@ -1282,11 +1285,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha }}
           FINDINGS: ${{ steps.publish_review.outputs.findings }}
+          # 投稿ステップが success / failure 以外を拒否してから findings を出すので、検証済み
+          FINDINGS_STATE: ${{ inputs.findings_state }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
-            -f state=pending \
+            -f state="${FINDINGS_STATE}" \
             -f context=codex-review \
             -f description="Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る" \
             -f target_url="${RUN_URL}" >/dev/null
