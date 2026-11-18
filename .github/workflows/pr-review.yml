@@ -209,31 +209,27 @@ jobs:
       # 戻す。Claude が0件を返してから codex ジョブが pending にするまでの間に、
       # 前回の codex-review で揃って見えるのを防ぐため
       - name: Mark reviews as in progress
+        # gh の無いランナー (runs_on のセルフホスト) でも動くよう、最終ステータスと同じく
+        # github-script で投稿する
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha }}
-          REVIEWER: ${{ matrix.reviewer }}
+          REVIEWER_KIND: ${{ matrix.reviewer }}
           CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          contexts=("${REVIEWER}-review")
-          if [ "${REVIEWER}" = "claude" ] && [ "${CODEX_ENABLED}" = "true" ]; then
-            contexts+=(codex-review)
-          fi
-          for context in "${contexts[@]}"; do
-            if [ "${context}" = "${REVIEWER}-review" ]; then
-              description="レビュー中"
-            else
-              description="Claude のレビュー待ち"
-            fi
-            gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
-              -f state=pending \
-              -f context="${context}" \
-              -f description="${description}" \
-              -f target_url="${RUN_URL}" >/dev/null
-          done
+        with:
+          script: |
+            const { SHA, REVIEWER_KIND, CODEX_ENABLED, RUN_URL } = process.env;
+            const statuses = [[`${REVIEWER_KIND}-review`, "レビュー中"]];
+            if (REVIEWER_KIND === "claude" && CODEX_ENABLED === "true") {
+              statuses.push(["codex-review", "Claude のレビュー待ち"]);
+            }
+            for (const [statusContext, description] of statuses) {
+              await github.rest.repos.createCommitStatus({
+                ...context.repo, sha: SHA, state: "pending", context: statusContext,
+                description, target_url: RUN_URL,
+              });
+            }
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -360,11 +356,18 @@ jobs:
         continue-on-error: true
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REVIEWER: ${{ matrix.reviewer }}
         # REVIEW_BASE_SHA は codex ジョブだけが job の env で受け取る、Claude が差分を
         # 取った merge-base。Claude の後にベースブランチが動いても、Codex は Claude と
         # 同じ差分を見る (合同の「指摘なし」が同じ差分についての判定になる)
         run: |
           set -euo pipefail
+          # Codex で現在の base に切り替えると、Claude と違う差分を見たまま合同の
+          # 「指摘なし」を出しうる。引き継げなければ止める
+          if [ "${REVIEWER:-}" = "codex" ] && [ -z "${REVIEW_BASE_SHA:-}" ]; then
+            echo "::error::Claude の merge-base を引き継げませんでした"
+            exit 1
+          fi
           if [ -n "${REVIEW_BASE_SHA:-}" ]; then
             if ! [[ "${REVIEW_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
               echo "::error::Claude の merge-base が不正です"
@@ -1371,21 +1374,21 @@ jobs:
           inputs.codex_review && inputs.codex_fallback &&
           steps.publish_review.outputs.findings != '' &&
           steps.publish_review.outputs.findings != '0'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha }}
           FINDINGS: ${{ steps.publish_review.outputs.findings }}
           # 投稿ステップが success / failure 以外を拒否してから findings を出すので、検証済み
           FINDINGS_STATE: ${{ inputs.findings_state }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
-            -f state="${FINDINGS_STATE}" \
-            -f context=codex-review \
-            -f description="Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る" \
-            -f target_url="${RUN_URL}" >/dev/null
+        with:
+          script: |
+            const { SHA, FINDINGS, FINDINGS_STATE, RUN_URL } = process.env;
+            await github.rest.repos.createCommitStatus({
+              ...context.repo, sha: SHA, state: FINDINGS_STATE, context: "codex-review",
+              description: `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`,
+              target_url: RUN_URL,
+            });
 
       - name: Remove Codex authentication
         if: ${{ always() && matrix.reviewer == 'codex' }}

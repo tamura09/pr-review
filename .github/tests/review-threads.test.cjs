@@ -411,6 +411,11 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
         GITHUB_OUTPUT: githubOutput, REVIEW_BASE_SHA: '--output=/tmp/x' },
     }));
+    // Codex は merge-base を引き継げなければ現在の base に切り替えず止まる
+    assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: '' },
+    }));
     const changedLine = diff => {
       const hunk = diff.match(/@@ .* \+(\d+),(\d+) @@/);
       return Number(hunk[1]) + Number(hunk[2]) - 1;
@@ -1254,14 +1259,16 @@ test('findings output is published only after a completed review and gates the C
   const skip = workflow.slice(workflow.indexOf('      - name: Mark Codex review as skipped')).split(/\n      - name: /)[0];
   assert.match(skip, /matrix\.reviewer == 'claude'/);
   assert.match(skip, /steps\.publish_review\.outputs\.findings != '0'/);
-  assert.match(skip, /context=codex-review/);
+  assert.match(skip, /context: "codex-review"/);
   assert.match(skip, /FINDINGS_STATE: \$\{\{ inputs\.findings_state \}\}/);
-  assert.match(skip, /state="\$\{FINDINGS_STATE\}"/);
+  assert.match(skip, /state: FINDINGS_STATE/);
+  assert.doesNotMatch(skip, /gh api/);
   const start = workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0];
   assert.ok(workflow.indexOf('      - name: Mark reviews as in progress') < workflow.indexOf('      - uses: actions/checkout@'));
-  assert.match(start, /state=pending/);
-  assert.match(start, /contexts=\("\$\{REVIEWER\}-review"\)/);
+  assert.match(start, /state: "pending"/);
+  assert.match(start, /`\$\{REVIEWER_KIND\}-review`/);
   assert.match(start, /codex-review/);
+  assert.doesNotMatch(start, /gh api/);
 });
 
 test('Codex accepts a single JSON block whose closing fence is missing', async () => {
