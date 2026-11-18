@@ -207,6 +207,38 @@ jobs:
           # ベースブランチとの差分を取るため履歴ごと取得する
           fetch-depth: 0
 
+      # 同じ head の再レビュー (reopen・再実行) では、前回の結果のチェックがその
+      # SHA に残っている。そのままだと今回のレビューが終わる前に必須チェックを
+      # 通過できるので、最初に pending に戻す。Claude のジョブでは codex-review も
+      # 戻す。Claude が0件を返してから codex ジョブが pending にするまでの間に、
+      # 前回の codex-review で揃って見えるのを防ぐため
+      - name: Mark reviews as in progress
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEWER: ${{ matrix.reviewer }}
+          CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          contexts=("${REVIEWER}-review")
+          if [ "${REVIEWER}" = "claude" ] && [ "${CODEX_ENABLED}" = "true" ]; then
+            contexts+=(codex-review)
+          fi
+          for context in "${contexts[@]}"; do
+            if [ "${context}" = "${REVIEWER}-review" ]; then
+              description="レビュー中"
+            else
+              description="Claude のレビュー待ち"
+            fi
+            gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
+              -f state=pending \
+              -f context="${context}" \
+              -f description="${description}" \
+              -f target_url="${RUN_URL}" >/dev/null
+          done
+
       # 投稿の再試行では、前回の結果と差分を復元してモデルを起動しない。
       - name: Restore review result for publication retry
         id: restore_review

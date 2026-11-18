@@ -1211,12 +1211,15 @@ test('Codex artifact excludes unparsed prose containing escaped credentials outs
 });
 
 test('findings output is published only after a completed review and gates the Codex job', async () => {
-  const clean = await run({ result: { summary: '', findings: [] } });
+  // codex ジョブの起動条件になるのは Claude 側の出力
+  const clean = await run({ isCodex: false, result: { summary: '', findings: [] } });
   assert.equal(clean.outputs.findings, '0');
-  const found = await run({ result });
+  const found = await run({ isCodex: false, result });
   assert.equal(found.outputs.findings, String(result.findings.length));
-  const broken = await run({ raw: 'not json', result });
+  const broken = await run({ isCodex: false, claudeReview: 'not json' });
   assert.equal(broken.outputs.findings, undefined);
+  const failed = await run({ isCodex: false, result: { summary: '', findings: [] }, env: { MODEL_OUTCOME: 'failure' } });
+  assert.equal(failed.outputs.findings, undefined);
 
   const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
   assert.match(codexJob, /needs: review/);
@@ -1231,4 +1234,9 @@ test('findings output is published only after a completed review and gates the C
   assert.match(skip, /context=codex-review/);
   assert.match(skip, /FINDINGS_STATE: \$\{\{ inputs\.findings_state \}\}/);
   assert.match(skip, /state="\$\{FINDINGS_STATE\}"/);
+  const start = workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0];
+  assert.ok(workflow.indexOf('      - name: Mark reviews as in progress') < workflow.indexOf('      - name: Restore review result for publication retry'));
+  assert.match(start, /state=pending/);
+  assert.match(start, /contexts=\("\$\{REVIEWER\}-review"\)/);
+  assert.match(start, /codex-review/);
 });
