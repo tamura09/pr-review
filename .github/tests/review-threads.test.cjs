@@ -401,6 +401,8 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     // Codex は Claude の merge-base を使い、その後にベースが PR の変更を取り込んでも同じ差分を見る
     git(origin, 'checkout', 'main');
     git(origin, 'merge', '--no-edit', head);
+    git(checkout, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    assert.equal(git(checkout, 'diff', `origin/main...${head}`), '');
     rmSync(join(tempDir, 'pr-review'), { recursive: true, force: true });
     execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
@@ -1301,7 +1303,7 @@ test('Claude posts no no-findings comment when Codex reviews next', async () => 
 test('Codex posts one combined no-findings comment for both reviewers', async () => {
   const claudeLabel = 'Claude · claude-test · effort low';
   const output = await run({ result: { summary: '', findings: [] },
-    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel } });
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel, MERGE_BASE: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_BASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } });
   assert.equal(output.failures.length, 0);
   assert.equal(output.server.issueComments.length, 1);
   const body = output.server.issueComments[0].body;
@@ -1310,17 +1312,24 @@ test('Codex posts one combined no-findings comment for both reviewers', async ()
   assert.equal(output.publication.claude_label, claudeLabel);
   // 再試行で新しく投稿する本文にも、保存した Claude のラベルを使う (再試行の job env は別の値でもよい)
   const failed = await run({ result: { summary: '', findings: [] }, fail: 'createComment',
-    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel } });
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel, MERGE_BASE: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_BASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' } });
   assert.equal(failed.server.issueComments.length, 0);
   const recovered = await recover({ artifactFiles: failed.artifactFiles, env: { REVIEWER_KIND: 'codex' } });
   assert.equal(recovered.outputs.restored, 'true');
   const resumed = await run({ server: failed.server, restoredRaw: recovered.raw,
     restoredMetadata: JSON.parse(failed.artifactFiles['publication.json']),
-    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · other · effort ', RESTORED: 'true',
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · other · effort ', RESTORED: 'true', REVIEW_BASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
   assert.equal(resumed.failures.length, 0);
   assert.equal(resumed.server.issueComments.length, 1);
   assert.ok(resumed.server.issueComments[0].body.includes(`${claudeLabel} / Codex`));
+  // 基点が Claude と違う・無いときは合同の「指摘なし」を出さない
+  for (const reviewBase of ['b'.repeat(40), '']) {
+    const mismatch = await run({ result: { summary: '', findings: [] },
+      env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel, MERGE_BASE: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_BASE_SHA: reviewBase } });
+    assert.match(mismatch.failures[0], /差分の基点が一致しません/);
+    assert.equal(mismatch.server.issueComments.length, 0);
+  }
   // Codex のサマリーがあれば Claude も投稿を終えている。保存結果を失った Claude を再実行しない
   const claude = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
   assert.match(claude.error.message, /保存結果がありません/);
