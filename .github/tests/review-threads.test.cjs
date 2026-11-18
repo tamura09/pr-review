@@ -1580,3 +1580,38 @@ test('the status write procedure is defined once and loaded by every step that w
     assert.match(section, /const writeOwnedStatus = new Function\("return " \+ process\.env\.PR_REVIEW_STATUS_HELPER\)\(\)\(github, context, process\.env\);/, name);
   }
 });
+
+test('a later run status overwritten between the read and the write is written back', async () => {
+  const later = { context: 'codex-review', state: 'failure', description: '指摘 1件', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
+  const ours = { context: 'codex-review', state: 'success', description: '指摘なし', target_url: runUrl, creator: bot };
+  const reads = [[], [ours, later]];
+  const created = [];
+  const github = {
+    paginate: async () => reads.shift() ?? [],
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
+  };
+  const write = new Function('return ' + statusHelper)()(github, { repo: { owner: 'example', repo: 'repo' } },
+    { SHA: 'reviewed-head', RUN_URL: runUrl });
+  assert.equal(await write('codex-review', 'success', '指摘なし'), 'written');
+  assert.deepEqual(created.map(item => [item.state, item.target_url]), [['success', runUrl], ['failure', later.target_url]]);
+});
+
+test('finalize ignores other posters and tries every context before failing', async () => {
+  const finalizeScript = workflow.match(/- name: Close out pending checks[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);
+  const created = [];
+  const statuses = [
+    { context: 'claude-review', state: 'success', target_url: runUrl, creator: { login: 'other-app[bot]' } },
+    { context: 'codex-review', state: 'pending', target_url: runUrl, creator: bot },
+  ];
+  const github = {
+    paginate: async () => statuses,
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => {
+      created.push(params);
+      if (params.context === 'claude-review') throw Object.assign(new Error('Validation Failed'), { status: 422 });
+    } } },
+  };
+  const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper };
+  await assert.rejects(finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require), /claude-review/);
+  assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
+});
