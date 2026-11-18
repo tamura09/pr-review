@@ -1651,10 +1651,11 @@ jobs:
       REVIEW_DIFF_DIGEST: ${{ needs.review.outputs.diff_digest }}
     steps: *review_steps
 
-  # この run が開始時に pending にしたチェックが、終了時にまだ pending なら error で
-  # 確定させる。キャンセル (Codex のランナー待ちの間を含む)・ジョブのタイムアウトなど、
-  # 各ジョブの中の終了処理では拾えない終わり方が対象。後続の run が上書きした
-  # チェックには触らない (最新のステータスがこの run の pending のときだけ書き換える)
+  # この run が担当したチェックに、この run の判定が出ていなければ error で確定させる。
+  # キャンセル (Codex のランナー待ちの間を含む)・ジョブのタイムアウトなど、各ジョブの
+  # 中の終了処理では拾えない終わり方が対象。最新が「この run の pending のまま」
+  # 「前回の run の結果のまま」「まだ無い」のときに書き換える。この run が確定させた
+  # もの、後続の run が一度でも書いたチェックには触らない
   finalize:
     needs: [review, codex]
     if: always() && needs.review.result != 'skipped'
