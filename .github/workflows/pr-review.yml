@@ -6,7 +6,7 @@
 # 二人目として、Claude が「指摘なし」と言ったときにだけ Codex を使う。
 # それぞれが件数サマリーと指摘ごとのレビュースレッドを投稿して PR のチェック
 # 一覧に claude-review / codex-review を出す。Codex を走らせなかったときは
-# codex-review を「省略」として success にする。
+# codex-review を pending にし、Codex が実際に見るまで完了扱いにしない。
 #
 # effort はどちらも PR の変更行数で決める (小さい PR は low、普段は medium、
 # 大きい PR は high)。
@@ -1266,8 +1266,10 @@ jobs:
             if (findingsCount !== undefined) core.setOutput("findings", String(findingsCount));
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
-      # 必須チェックに codex-review を入れた呼び出し側が待機したままにならないよう、
-      # 「省略」と明記して success にする
+      # success にすると、findings_state: success の呼び出し側では Codex が一度も
+      # 見ないまま必須チェックが揃ってマージできてしまう。Codex がまだ見ていない
+      # ことをそのまま示す pending にする。指摘を直して Claude が0件になれば、
+      # その head で Codex が走って本当の結果に置き換わる
       - name: Mark Codex review as skipped
         if: >-
           always() &&
@@ -1284,9 +1286,9 @@ jobs:
         run: |
           set -euo pipefail
           gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
-            -f state=success \
+            -f state=pending \
             -f context=codex-review \
-            -f description="Claude の指摘 ${FINDINGS}件があるため省略" \
+            -f description="Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る" \
             -f target_url="${RUN_URL}" >/dev/null
 
       - name: Remove Codex authentication
