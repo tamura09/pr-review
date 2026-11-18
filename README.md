@@ -219,6 +219,8 @@ Codex は、Claude が「指摘なし」と言った PR を見直す二人目と
 指摘を直して push すると Claude から再レビューされ、0件になった時点で Codex が走る。
 2つは同じ steps を YAML アンカーで共有し、1要素の matrix (`matrix.reviewer`) で
 どちらのモデルかを切り替える。各ジョブは自分のモデルの認証情報しか SSM から読まない。
+Codex は Claude が差分を取った merge-base を引き継いで差分と effort を作るので、
+2つのジョブの間にベースブランチが動いても、両方が同じ差分を見る。
 
 Claude は `track_progress: false` の agent モードで、checkout 済みの PR head を
 切り替えずにレビューする。過去の PR コメント・レビュースレッドはプロンプトへ自動で

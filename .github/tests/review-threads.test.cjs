@@ -178,13 +178,15 @@ async function recover(options = {}) {
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
       return method === 'listWorkflowRunArtifacts' ? (options.artifacts ?? [
         { id: 1, name: `pr-review-result-${env.REVIEWER_KIND}-1`, expired: false },
-      ]) : method === 'listIssueComments' ? (options.issueComments ?? []) : (options.reviews ?? []);
+      ]) : method === 'listIssueComments' ? (options.issueComments ?? [])
+        : method === 'listCommitStatusesForRef' ? (options.statuses ?? []) : (options.reviews ?? []);
     },
     rest: { actions: { listWorkflowRunArtifacts: 'listWorkflowRunArtifacts', downloadArtifact: async params => {
       calls.push({ method: 'downloadArtifact', params });
       if (options.fail === 'downloadArtifact') throw new Error('Simulated downloadArtifact failure');
       return { data: archive };
-    } }, pulls: { listReviews: 'listReviews' }, issues: { listComments: 'listIssueComments' } },
+    } }, pulls: { listReviews: 'listReviews' }, issues: { listComments: 'listIssueComments' },
+    repos: { listCommitStatusesForRef: 'listCommitStatusesForRef' } },
   };
   let error;
   try {
@@ -388,11 +390,27 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     assert.ok(!readFileSync(join(checkout, 'file.txt'), 'utf8').includes('future PR change'));
     const prepareScript = workflow.match(/      - name: Prepare PR diff\n[\s\S]*?        run: \|\n((?: {10}[^\n]*\n|\n)*)/)[1]
       .replace(/^ {10}/gm, '');
+    const githubOutput = join(tempDir, 'github-output');
     execFileSync('bash', ['-c', prepareScript], {
-      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir },
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir, GITHUB_OUTPUT: githubOutput },
     });
     const actual = readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim();
     assert.equal(actual, git(checkout, 'diff', `origin/main...${head}`));
+    const mergeBase = readFileSync(githubOutput, 'utf8').match(/^merge_base=([0-9a-f]{40})$/m)[1];
+    assert.equal(mergeBase, git(checkout, 'merge-base', 'origin/main', head));
+    // Codex は Claude の merge-base を使い、その後にベースが PR の変更を取り込んでも同じ差分を見る
+    git(origin, 'checkout', 'main');
+    git(origin, 'merge', '--no-edit', head);
+    rmSync(join(tempDir, 'pr-review'), { recursive: true, force: true });
+    execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEW_BASE_SHA: mergeBase },
+    });
+    assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), actual);
+    assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEW_BASE_SHA: '--output=/tmp/x' },
+    }));
     const changedLine = diff => {
       const hunk = diff.match(/@@ .* \+(\d+),(\d+) @@/);
       return Number(hunk[1]) + Number(hunk[2]) - 1;
@@ -1307,4 +1325,24 @@ test('the Codex job reads the label Claude published, not a recomputed effort', 
   const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
   assert.match(codexJob, /CLAUDE_LABEL: \$\{\{ needs\.review\.outputs\.label \}\}/);
   assert.doesNotMatch(workflow, /claude_effort/);
+});
+
+test('a finished claude-review status counts as published when Claude posted no comment', async () => {
+  const status = { context: 'claude-review', state: 'success', target_url: runUrl, creator: { login: 'github-actions[bot]' } };
+  const claude = await recover({ artifacts: [], statuses: [status], env: { REVIEWER_KIND: 'claude' } });
+  assert.match(claude.error.message, /保存結果がありません/);
+  for (const other of [{ ...status, state: 'pending' }, { ...status, target_url: 'https://example.com/other-run' },
+    { ...status, creator: { login: 'mallory' } }]) {
+    const output = await recover({ artifacts: [], statuses: [other], env: { REVIEWER_KIND: 'claude' } });
+    assert.equal(output.error, undefined);
+  }
+  const codex = await recover({ artifacts: [], statuses: [{ ...status, context: 'codex-review' }] });
+  assert.equal(codex.error, undefined);
+});
+
+test('the Codex job diffs against the merge-base Claude reviewed', () => {
+  assert.match(workflow, /merge_base: \$\{\{ steps\.review_diff\.outputs\.merge_base \|\| steps\.restore_review\.outputs\.merge_base \}\}/);
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /REVIEW_BASE_SHA: \$\{\{ needs\.review\.outputs\.merge_base \}\}/);
+  assert.match(workflow, /git diff --numstat "\$\{MERGE_BASE\}" HEAD/);
 });

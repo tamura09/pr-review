@@ -200,6 +200,8 @@ jobs:
       # 投稿まで終わったときだけ入る。エラー時は空
       findings: ${{ steps.publish_review.outputs.findings }}
       label: ${{ steps.publish_review.outputs.label }}
+      # 再試行で差分を取り直さなかったときは、保存した結果の値を使う
+      merge_base: ${{ steps.review_diff.outputs.merge_base || steps.restore_review.outputs.merge_base }}
     steps: &review_steps
       # 同じ head の再レビュー (reopen・再実行) では、前回の結果のチェックがその
       # SHA に残っている。そのままだと今回のレビューが終わる前に必須チェックを
@@ -266,14 +268,26 @@ jobs:
               .sort((a, b) => Number(b.name.slice(prefix.length)) - Number(a.name.slice(prefix.length)))[0];
             async function ensureUnpublished() {
               // 古い不正結果の artifact が残っていても、後続 attempt の投稿を確認する。
-              const [reviews, comments] = await Promise.all([
+              const [reviews, comments, statuses] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
                 }),
                 github.paginate(github.rest.issues.listComments, {
                   ...context.repo, issue_number: context.payload.pull_request.number, per_page: 100,
                 }),
+                github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                  ...context.repo, ref: SHA, per_page: 100,
+                }),
               ]);
+              // Codex が続けて見る Claude は「指摘なし」を投稿せずチェックだけ出す。
+              // この run が確定させた claude-review があれば、Claude は終わっている
+              // (pending はレビュー開始時のもの。codex-review の「未実行」は Claude の
+              // ジョブが出すので数えない)
+              if (REVIEWER_KIND === "claude" && statuses.some(item => item.context === "claude-review" &&
+                  item.target_url === RUN_URL && ["success", "failure"].includes(item.state) &&
+                  item.creator?.login === "github-actions[bot]")) {
+                throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
+              }
               if ([...reviews, ...comments].some(item => item.user?.login === "github-actions[bot]" &&
                   (item.commit_id === SHA || item.body?.includes(`<!-- pr-review:head:${SHA} -->`)) &&
                   item.body?.includes(`[Workflow run](${RUN_URL})`) &&
@@ -329,6 +343,7 @@ jobs:
               }
               fs.writeFileSync(path.join(dir, "publication.json"), JSON.stringify(metadata), { mode: 0o600 });
               core.setOutput("reviewer", metadata.model_label);
+              if (typeof metadata.merge_base === "string") core.setOutput("merge_base", metadata.merge_base);
               core.setOutput("restored", "true");
             } finally {
               fs.rmSync(zip, { force: true });
@@ -345,16 +360,30 @@ jobs:
         continue-on-error: true
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+        # REVIEW_BASE_SHA は codex ジョブだけが job の env で受け取る、Claude が差分を
+        # 取った merge-base。Claude の後にベースブランチが動いても、Codex は Claude と
+        # 同じ差分を見る (合同の「指摘なし」が同じ差分についての判定になる)
         run: |
           set -euo pipefail
-          base="origin/${BASE_REF}"
-          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-          git merge-base "${base}" HEAD >/dev/null
+          if [ -n "${REVIEW_BASE_SHA:-}" ]; then
+            if ! [[ "${REVIEW_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Claude の merge-base が不正です"
+              exit 1
+            fi
+            merge_base="${REVIEW_BASE_SHA}"
+            # fetch-depth: 0 なので、HEAD の祖先は checkout 済み
+            git merge-base --is-ancestor "${merge_base}" HEAD
+          else
+            git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            merge_base="$(git merge-base "origin/${BASE_REF}" HEAD)"
+          fi
           install -d -m 700 "${RUNNER_TEMP}/pr-review"
+          # `<merge-base> HEAD` は `origin/<base>...HEAD` と同じ差分
           git diff --no-ext-diff --no-color --unified=3 --src-prefix=a/ --dst-prefix=b/ \
-            "${base}...HEAD" > "${RUNNER_TEMP}/pr-review/pr.diff"
-          git diff --name-status -z --find-renames "${base}...HEAD" \
+            "${merge_base}" HEAD > "${RUNNER_TEMP}/pr-review/pr.diff"
+          git diff --name-status -z --find-renames "${merge_base}" HEAD \
             > "${RUNNER_TEMP}/pr-review/files.z"
+          echo "merge_base=${merge_base}" >> "${GITHUB_OUTPUT}"
 
       # 変更行数 (追加 + 削除) で effort を決める。小さい PR に high を
       # 使うと利用枠を無駄に食い、大きい PR に low を使うと見落とす。
@@ -371,14 +400,14 @@ jobs:
         # 止めないと、pr.diff が無いままモデルが起動する
         if: steps.review_diff.outcome == 'success'
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MERGE_BASE: ${{ steps.review_diff.outputs.merge_base }}
           EFFORT_OVERRIDE: >-
             ${{ matrix.reviewer == 'codex' && (inputs.codex_effort || inputs.effort) || inputs.effort }}
           SMALL_PR_MAX_LINES: ${{ inputs.small_pr_max_lines }}
           LARGE_PR_MIN_LINES: ${{ inputs.large_pr_min_lines }}
         run: |
           set -euo pipefail
-          changed_lines="$(git diff --numstat "origin/${BASE_REF}...HEAD" -- . \
+          changed_lines="$(git diff --numstat "${MERGE_BASE}" HEAD -- . \
               ':(exclude,glob)**/pnpm-lock.yaml' \
               ':(exclude,glob)**/package-lock.json' \
               ':(exclude,glob)**/yarn.lock' \
@@ -925,6 +954,7 @@ jobs:
           CODEX_AUTH_OUTCOME: ${{ steps.codex_auth.outcome }}
           CLAUDE_TOKEN: ${{ matrix.reviewer == 'claude' && (secrets.claude_code_oauth_token || steps.oauth_token.outputs.token) || '' }}
           IS_CODEX: ${{ matrix.reviewer == 'codex' }}
+          MERGE_BASE: ${{ steps.review_diff.outputs.merge_base }}
           # 指摘なしのコメントの出し方。Codex が続けて見る Claude は出さず (skip)、
           # Codex は Claude の分もまとめて1件だけ出す (combined)。Codex を使わない
           # 呼び出し側の Claude は自分の分を出す (own)
@@ -944,6 +974,7 @@ jobs:
             const issue_number = context.payload.pull_request.number;
             const cleanComment = process.env.CLEAN_COMMENT || "own";
             let claudeLabel = process.env.CLAUDE_LABEL;
+            let restoredMergeBase;
             const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
             const fs = require("node:fs");
             const path = require("node:path");
@@ -998,6 +1029,7 @@ jobs:
                 fingerprints.push(...metadata.secret_fingerprints);
                 // 再試行では effort を決めないので、Claude のラベルは前回の記録を使う
                 if (typeof metadata.claude_label === "string") claudeLabel = metadata.claude_label;
+                if (typeof metadata.merge_base === "string") restoredMergeBase = metadata.merge_base;
               } else if (isCodex) {
                 if (process.env.CODEX_AUTH_OUTCOME !== "success") throw new Error("認証情報の検査を準備できませんでした");
                 for (const name of ["auth-before.json", "auth.json"]) {
@@ -1016,6 +1048,7 @@ jobs:
               if (!fingerprints.length) throw new Error("認証情報の検査対象がありません");
               publication.secret_fingerprints = fingerprints;
               if (cleanComment === "combined") publication.claude_label = claudeLabel;
+              publication.merge_base = restoredMergeBase ?? process.env.MERGE_BASE;
               function assertNoSecrets(text) {
                 for (const { length, sha256 } of fingerprints) {
                   if (!Number.isSafeInteger(length) || length < 1 || !/^[a-f0-9]{64}$/.test(sha256)) {
@@ -1387,4 +1420,5 @@ jobs:
     # needs を読むのはこのジョブの env に限る
     env:
       CLAUDE_LABEL: ${{ needs.review.outputs.label }}
+      REVIEW_BASE_SHA: ${{ needs.review.outputs.merge_base }}
     steps: *review_steps
