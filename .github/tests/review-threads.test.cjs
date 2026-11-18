@@ -1538,3 +1538,11 @@ test('when ownership cannot be checked, only merge-blocking states are written',
   assert.notEqual(defaultFindingsState, 'success');
   assert.match(workflow, /retries: 3/);
 });
+
+test('the publish step does not auto-retry create calls, and the comment dedupe avoids SIGPIPE', () => {
+  const publishStep = workflow.slice(workflow.indexOf('      - name: Publish review threads and status')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(publishStep, /retries: 3/);
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(report, /\| grep -q/);
+  assert.match(report, /contains\(env\.MARKER\)/);
+});

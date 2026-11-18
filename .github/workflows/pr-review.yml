@@ -969,9 +969,13 @@ jobs:
         run: |
           set -euo pipefail
           # 失敗ジョブの再実行で同じ通知を重ねない。run・head・モデルの目印で照合する
-          marker="<!-- pr-review:diff-failure:${REVIEWER}:${HEAD_SHA}:${RUN_URL} -->"
-          if gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
-              --jq '.[] | select(.user.login == "github-actions[bot]") | .body' | grep -qF -- "${marker}"; then
+          # grep -q で途中終了すると、gh が SIGPIPE で落ちて pipefail で偽になるので、
+          # jq で絞り込んだ出力が空かどうかで判定する
+          export MARKER="<!-- pr-review:diff-failure:${REVIEWER}:${HEAD_SHA}:${RUN_URL} -->"
+          marker="${MARKER}"
+          existing="$(gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains(env.MARKER))) | .id')"
+          if [ -n "${existing}" ]; then
             exit 0
           fi
           if [ "${REVIEWER}" = "codex" ]; then
@@ -1028,8 +1032,8 @@ jobs:
             format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
             format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort)) }}
         with:
-          # 一時的な API エラー (5xx・レート制限) は再試行する
-          retries: 3
+          # 作成系 (createReview・createComment など) は、投稿が確定したのに 5xx が返る
+          # ことがあり、自動で再送すると重複投稿になるので再試行しない
           script: |
             const { SHA, RUN_URL, FINDINGS_STATE, REVIEWER } = process.env;
             const isCodex = process.env.IS_CODEX === "true";
@@ -1434,9 +1438,19 @@ jobs:
             // success を書くと、後続 run の失敗を古い結果で通してしまいうる
             let owned = state !== "success";
             try {
-              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                ...repo, ref: SHA, per_page: 100,
-              });
+              // 読み取りだけは、一時的な API エラーを再試行する
+              let statuses;
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                    ...repo, ref: SHA, per_page: 100,
+                  });
+                  break;
+                } catch (error) {
+                  if (attempt >= 3) throw error;
+                  await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+                }
+              }
               const latest = statuses.find(item => item.context === statusContext);
               // 自分より後に開始した run (run ID が大きい) が書いたものだけを避ける。
               // 前回の run の結果は、今回の結果で確定させる
