@@ -520,7 +520,8 @@ jobs:
           (steps.token_source.outputs.from_ssm == 'false' || steps.token_aws.outcome == 'success')
         continue-on-error: true
         env:
-          CALLER_AUTH_JSON: ${{ secrets.codex_auth_json }}
+          # env はステップの if より先に展開されうるので、Claude のジョブでは式の時点で空にする
+          CALLER_AUTH_JSON: ${{ matrix.reviewer == 'codex' && secrets.codex_auth_json || '' }}
           FROM_SSM: ${{ steps.token_source.outputs.from_ssm }}
           PARAMETER_NAME: ${{ inputs.codex_auth_parameter }}
           PARAMETER_REGION: ${{ inputs.aws_region }}
@@ -592,7 +593,9 @@ jobs:
         # 起動直後に落ちる。v1.0.232 は 2.1.280 を入れる (v1.0.231 は 2.1.278)。
         uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1.0.262
         with:
-          claude_code_oauth_token: ${{ secrets.claude_code_oauth_token || steps.oauth_token.outputs.token }}
+          # Codex のジョブでは式の時点で空にし、Claude の token を展開しない
+          claude_code_oauth_token: >-
+            ${{ matrix.reviewer == 'claude' && (secrets.claude_code_oauth_token || steps.oauth_token.outputs.token) || '' }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           track_progress: false
           claude_args: |

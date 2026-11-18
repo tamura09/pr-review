@@ -396,6 +396,13 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     });
     const actual = readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim();
     assert.equal(actual, git(checkout, 'diff', `origin/main...${head}`));
+    // 行番号の検証は、下で origin/main を進める前の base で行う
+    const changedLine = diff => {
+      const hunk = diff.match(/@@ .* \+(\d+),(\d+) @@/);
+      return Number(hunk[1]) + Number(hunk[2]) - 1;
+    };
+    assert.equal(changedLine(actual), 30);
+    assert.equal(changedLine(git(checkout, 'diff', `origin/main...${merged}`)), 31);
     const mergeBase = readFileSync(githubOutput, 'utf8').match(/^merge_base=([0-9a-f]{40})$/m)[1];
     assert.equal(mergeBase, git(checkout, 'merge-base', 'origin/main', head));
     // Codex は Claude の merge-base を使い、その後にベースが PR の変更を取り込んでも同じ差分を見る
@@ -425,12 +432,6 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
         GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: '' },
     }));
-    const changedLine = diff => {
-      const hunk = diff.match(/@@ .* \+(\d+),(\d+) @@/);
-      return Number(hunk[1]) + Number(hunk[2]) - 1;
-    };
-    assert.equal(changedLine(actual), 30);
-    assert.equal(changedLine(git(checkout, 'diff', `origin/main...${merged}`)), 31);
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -1398,4 +1399,11 @@ test('token source receives only a boolean, never the caller secrets', () => {
   assert.doesNotMatch(section, /: \$\{\{ secrets\./);
   assert.match(section, /secrets\.codex_auth_json != ''/);
   assert.match(section, /secrets\.claude_code_oauth_token != ''/);
+});
+
+test('each job expands only its own model credentials, even in step env and with inputs', () => {
+  const codexAuth = workflow.slice(workflow.indexOf('      - name: Prepare Codex authentication')).split(/\n      - name: /)[0];
+  assert.match(codexAuth, /CALLER_AUTH_JSON: \$\{\{ matrix\.reviewer == 'codex' && secrets\.codex_auth_json \|\| '' \}\}/);
+  const claude = workflow.slice(workflow.indexOf('      - name: Review with Claude')).split(/\n      - name: /)[0];
+  assert.match(claude, /matrix\.reviewer == 'claude' && \(secrets\.claude_code_oauth_token/);
 });
