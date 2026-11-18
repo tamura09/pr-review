@@ -1308,14 +1308,19 @@ test('Codex posts one combined no-findings comment for both reviewers', async ()
   assert.match(body, /✅ 指摘なし\*\* \(Claude・Codex\)/);
   assert.ok(body.includes(`${claudeLabel} / Codex · test-model · effort medium`));
   assert.equal(output.publication.claude_label, claudeLabel);
-  // 再試行では effort が無いので、保存した Claude のラベルを使う
-  const recovered = await recover({ artifactFiles: output.artifactFiles, env: { REVIEWER_KIND: 'codex' } });
-  const resumed = await run({ server: output.server, restoredRaw: recovered.raw,
-    restoredMetadata: JSON.parse(output.artifactFiles['publication.json']),
-    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · claude-test · effort ', RESTORED: 'true',
+  // 再試行で新しく投稿する本文にも、保存した Claude のラベルを使う (再試行の job env は別の値でもよい)
+  const failed = await run({ result: { summary: '', findings: [] }, fail: 'createComment',
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel } });
+  assert.equal(failed.server.issueComments.length, 0);
+  const recovered = await recover({ artifactFiles: failed.artifactFiles, env: { REVIEWER_KIND: 'codex' } });
+  assert.equal(recovered.outputs.restored, 'true');
+  const resumed = await run({ server: failed.server, restoredRaw: recovered.raw,
+    restoredMetadata: JSON.parse(failed.artifactFiles['publication.json']),
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · other · effort ', RESTORED: 'true',
       REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
   assert.equal(resumed.failures.length, 0);
   assert.equal(resumed.server.issueComments.length, 1);
+  assert.ok(resumed.server.issueComments[0].body.includes(`${claudeLabel} / Codex`));
   // Codex のサマリーがあれば Claude も投稿を終えている。保存結果を失った Claude を再実行しない
   const claude = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
   assert.match(claude.error.message, /保存結果がありません/);
@@ -1352,6 +1357,10 @@ test('a finished claude-review status counts as published when Claude posted no 
   }
   const codex = await recover({ artifacts: [], statuses: [{ ...status, context: 'codex-review' }] });
   assert.equal(codex.error, undefined);
+  // Codex はステータス履歴を取得しない
+  const codexFailing = await recover({ artifacts: [], fail: 'listCommitStatusesForRef' });
+  assert.equal(codexFailing.error, undefined);
+  assert.ok(!codexFailing.calls.some(call => call.method === 'listCommitStatusesForRef'));
 });
 
 test('the Codex job diffs against the merge-base Claude reviewed', () => {
@@ -1364,6 +1373,7 @@ test('the Codex job diffs against the merge-base Claude reviewed', () => {
 test('Codex still runs when Claude finished but its job failed afterwards, and is closed out when Claude did not finish', () => {
   const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
   assert.match(codexJob, /!cancelled\(\) &&/);
+  assert.match(codexJob, /needs\.review\.outputs\.findings &&\n\s+needs\.review\.outputs\.findings == '0'/);
   const notRun = workflow.slice(workflow.indexOf('      - name: Mark Codex review as not run')).split(/\n      - name: /)[0];
   assert.match(notRun, /steps\.publish_review\.outputs\.findings == ''/);
   assert.match(notRun, /state: "error", context: "codex-review"/);

@@ -264,22 +264,22 @@ jobs:
               .sort((a, b) => Number(b.name.slice(prefix.length)) - Number(a.name.slice(prefix.length)))[0];
             async function ensureUnpublished() {
               // 古い不正結果の artifact が残っていても、後続 attempt の投稿を確認する。
-              const [reviews, comments, statuses] = await Promise.all([
+              const [reviews, comments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, {
                   ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
                 }),
                 github.paginate(github.rest.issues.listComments, {
                   ...context.repo, issue_number: context.payload.pull_request.number, per_page: 100,
                 }),
-                github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                  ...context.repo, ref: SHA, per_page: 100,
-                }),
               ]);
               // Codex が続けて見る Claude は「指摘なし」を投稿せずチェックだけ出す。
               // この run が確定させた claude-review があれば、Claude は終わっている
               // (pending はレビュー開始時のもの。codex-review の「未実行」は Claude の
               // ジョブが出すので数えない)
-              if (REVIEWER_KIND === "claude" && statuses.some(item => item.context === "claude-review" &&
+              // 結果を使わない Codex では取得しない (この API の失敗で再試行できなくなるため)
+              const statuses = REVIEWER_KIND === "claude" ? await github.paginate(
+                github.rest.repos.listCommitStatusesForRef, { ...context.repo, ref: SHA, per_page: 100 }) : [];
+              if (statuses.some(item => item.context === "claude-review" &&
                   item.target_url === RUN_URL && ["success", "failure"].includes(item.state) &&
                   item.creator?.login === "github-actions[bot]")) {
                 throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
@@ -1428,10 +1428,13 @@ jobs:
   codex:
     needs: review
     # findings は Claude が投稿まで終えたときだけ出る。その後の artifact 保存などで
-    # review ジョブが失敗しても Codex は走らせる (暗黙の success() にしない)
+    # review ジョブが失敗しても Codex は走らせる (暗黙の success() にしない)。
+    # 出ていないときの値は null で、式の `null == '0'` は数値比較で真になるので、
+    # 先に有無を確かめる (文字列 '0' は真)
     if: >-
       !cancelled() &&
       inputs.codex_review && inputs.codex_fallback &&
+      needs.review.outputs.findings &&
       needs.review.outputs.findings == '0'
     strategy:
       matrix:
