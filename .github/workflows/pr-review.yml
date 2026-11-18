@@ -223,6 +223,8 @@ jobs:
           CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
+          # 一時的な API エラー (5xx・レート制限) は再試行する
+          retries: 3
           script: |
             const { SHA, REVIEWER_KIND, CODEX_ENABLED, RUN_URL } = process.env;
             const statuses = [[`${REVIEWER_KIND}-review`, "レビュー中"]];
@@ -230,7 +232,7 @@ jobs:
               statuses.push(["codex-review", "Claude のレビュー待ち"]);
             }
             // ランナー待ちで遅れて始まった古い run が、新しい run の判定を pending に戻さない
-            // 一覧を取れなかったときは書く (投稿ステップと同じ方針)
+            // 一覧を取れなかったときは書く (pending はマージを止める向きなので)
             let current = [];
             try {
               current = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
@@ -267,6 +269,8 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
+          # 一時的な API エラー (5xx・レート制限) は再試行する
+          retries: 3
           script: |
             core.setOutput("restored", "false");
             const attempt = Number(process.env.RUN_ATTEMPT);
@@ -960,9 +964,16 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REVIEWER: ${{ matrix.reviewer }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CODEX_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
         run: |
           set -euo pipefail
+          # 失敗ジョブの再実行で同じ通知を重ねない。run・head・モデルの目印で照合する
+          marker="<!-- pr-review:diff-failure:${REVIEWER}:${HEAD_SHA}:${RUN_URL} -->"
+          if gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+              --jq '.[] | select(.user.login == "github-actions[bot]") | .body' | grep -qF -- "${marker}"; then
+            exit 0
+          fi
           if [ "${REVIEWER}" = "codex" ]; then
             reason="${CODEX_FAILURE:-PR 差分を取得できませんでした。}"
             body="**❌ Codex のレビュー不能** — ${reason}
@@ -980,7 +991,8 @@ jobs:
           _[Workflow run](${RUN_URL})_"
           fi
           gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
-            -f body="${body}" >/dev/null
+            -f body="${body}
+          ${marker}" >/dev/null
 
       # モデルの結果を検証し、1指摘1スレッドで投稿してから件数をチェックに表示する。
       # 通常コメントへの返信には解決ボタンがないため、pull request review を使う。
@@ -1016,6 +1028,8 @@ jobs:
             format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
             format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort)) }}
         with:
+          # 一時的な API エラー (5xx・レート制限) は再試行する
+          retries: 3
           script: |
             const { SHA, RUN_URL, FINDINGS_STATE, REVIEWER } = process.env;
             const isCodex = process.env.IS_CODEX === "true";
@@ -1416,8 +1430,9 @@ jobs:
             }
 
             // 同じ head の後続 run がこのチェックを上書きしていたら、古い結果で戻さない。
-            // 一覧を取れなかったときは書く (チェックを出さないよりよい)
-            let owned = true;
+            // 確かめられなかったときは、マージを止める向きの状態 (failure・error) だけ書く。
+            // success を書くと、後続 run の失敗を古い結果で通してしまいうる
+            let owned = state !== "success";
             try {
               const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
                 ...repo, ref: SHA, per_page: 100,
@@ -1430,6 +1445,7 @@ jobs:
             } catch (error) {
               core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
             }
+            // 通常は書けなかった分を finalize が error で確定させる
             if (owned) {
               await github.rest.repos.createCommitStatus({
                 ...repo, sha: SHA, state, context: statusContext,
@@ -1468,10 +1484,12 @@ jobs:
           FINDINGS_STATE: ${{ inputs.findings_state }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
+          # 一時的な API エラー (5xx・レート制限) は再試行する
+          retries: 3
           script: |
             const { SHA, FINDINGS, FINDINGS_STATE, RUN_URL } = process.env;
             // 自分より後に開始した run が codex-review を更新していたら触らない。
-            // 一覧を取れなかったときは書く (投稿ステップと同じ方針)
+            // 一覧を取れなかったときは、マージを止める向きの状態だけ書く (投稿ステップと同じ)
             let statuses = [];
             try {
               statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
@@ -1479,6 +1497,7 @@ jobs:
               });
             } catch (error) {
               core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
+              if (FINDINGS_STATE === "success") return;
             }
             const latest = statuses.find(item => item.context === "codex-review");
             const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
@@ -1502,9 +1521,11 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
+          # 一時的な API エラー (5xx・レート制限) は再試行する
+          retries: 3
           script: |
             // 自分より後に開始した run が codex-review を更新していたら触らない。
-            // 一覧を取れなかったときは書く (投稿ステップと同じ方針)
+            // 一覧を取れなかったときは書く (error はマージを止める向きなので)
             let statuses = [];
             try {
               statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
@@ -1583,16 +1604,26 @@ jobs:
         env:
           SHA: ${{ github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
         with:
+          # 一時的な API エラー (5xx・レート制限) は再試行する
+          retries: 3
           script: |
-            const { SHA, RUN_URL } = process.env;
-            for (const statusContext of ["claude-review", "codex-review"]) {
+            const { SHA, RUN_URL, CODEX_ENABLED } = process.env;
+            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            const contexts = CODEX_ENABLED === "true" ? ["claude-review", "codex-review"] : ["claude-review"];
+            for (const statusContext of contexts) {
               // 書き込みの直前に取り直す。新しい順に返るので、文脈ごとに最初のものが最新
               const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
                 ...context.repo, ref: SHA, per_page: 100,
               });
               const latest = statuses.find(item => item.context === statusContext);
-              if (!latest || latest.state !== "pending" || latest.target_url !== RUN_URL) continue;
+              // この run が確定させたもの、自分より後に始まった run のものは触らない。
+              // この run の pending のまま・前回の run の結果のまま・まだ無い (開始時の
+              // pending を書けなかった) ときは、この run の判定が出ていないので error にする
+              const latestRun = runId(latest?.target_url);
+              if (latestRun > runId(RUN_URL)) continue;
+              if (latest?.target_url === RUN_URL && latest.state !== "pending") continue;
               await github.rest.repos.createCommitStatus({
                 ...context.repo, sha: SHA, state: "error", context: statusContext,
                 description: "レビューが完了しませんでした (キャンセル・タイムアウトなど)",

@@ -1446,13 +1446,23 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
     paginate: async () => statuses,
     rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
   };
-  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env: { SHA: 'reviewed-head', RUN_URL: runUrl } }, require);
+  const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true' };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
   assert.deepEqual(created.map(item => [item.context, item.state]), [['codex-review', 'error']]);
-  // 後続の run の pending には触らない
+  // 後続の run (run ID が大きい) のチェックには触らない
   created.length = 0;
-  statuses[0] = { context: 'codex-review', state: 'pending', target_url: 'https://example.com/newer-run' };
-  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env: { SHA: 'reviewed-head', RUN_URL: runUrl } }, require);
+  statuses[0] = { context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/124' };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
   assert.equal(created.length, 0);
+  // 前回の run の結果のまま・まだ無いチェックは、この run の判定が出ていないので error にする
+  created.length = 0;
+  statuses.splice(0, statuses.length, { context: 'claude-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122' });
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
+  assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
+  // Codex を使わない呼び出し側では codex-review を作らない
+  created.length = 0;
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env: { ...env, CODEX_ENABLED: 'false' } }, require);
+  assert.deepEqual(created.map(item => item.context), ['claude-review']);
   const job = workflow.slice(workflow.indexOf('\n  finalize:\n'));
   assert.match(job, /needs: \[review, codex\]/);
   assert.match(job, /if: always\(\) && needs\.review\.result != 'skipped'/);
@@ -1518,4 +1528,13 @@ test('a Codex diff preparation failure is reported with its reason', async () =>
   const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
   assert.doesNotMatch(report, /matrix\.reviewer == 'claude'/);
   assert.match(report, /CODEX_FAILURE: \$\{\{ steps\.review_diff\.outputs\.codex_failure \}\}/);
+});
+
+test('when ownership cannot be checked, only merge-blocking states are written', async () => {
+  const success = await run({ result: { summary: '', findings: [] }, fail: 'listCommitStatusesForRef' });
+  assert.equal(success.status, undefined);
+  const failure = await run({ fail: 'listCommitStatusesForRef' });
+  assert.equal(failure.status.state, defaultFindingsState);
+  assert.notEqual(defaultFindingsState, 'success');
+  assert.match(workflow, /retries: 3/);
 });
