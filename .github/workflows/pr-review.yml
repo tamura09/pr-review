@@ -243,8 +243,9 @@ jobs:
             }
             const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
             for (const [statusContext, description] of statuses) {
-              const latest = current.find(item => item.context === statusContext);
-              if (runId(latest?.target_url) > runId(RUN_URL)) continue;
+              // 最新の1件だけでなく履歴全体を見る。新しい run のものが1件でもあれば触らない
+              if (current.some(item => item.context === statusContext &&
+                  runId(item.target_url) > runId(RUN_URL))) continue;
               await github.rest.repos.createCommitStatus({
                 ...context.repo, sha: SHA, state: "pending", context: statusContext,
                 description, target_url: RUN_URL,
@@ -1451,30 +1452,55 @@ jobs:
               core.setFailed(description);
             }
 
-            // 同じ head の後続 run がこのチェックを上書きしていたら、古い結果で戻さない。
-            // 確かめられなかったときは、マージを止める向きの状態 (failure・error) だけ書く。
-            // success を書くと、後続 run の失敗を古い結果で通してしまいうる
-            let owned = state !== "success";
-            try {
-              const statuses = await withRetry(() => github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                ...repo, ref: SHA, per_page: 100,
-              }));
-              const latest = statuses.find(item => item.context === statusContext);
-              // 自分より後に開始した run (run ID が大きい) が書いたものだけを避ける。
-              // 前回の run の結果は、今回の結果で確定させる
-              const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
-              owned = !(runId(latest?.target_url) > runId(RUN_URL));
-            } catch (error) {
-              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
+            // 同じ head の後続 run (run ID が大きい) がこのチェックを一度でも書いていたら、
+            // 古い結果で戻さない。前回の run の結果は、今回の結果で確定させる。
+            // 再試行のたびに履歴を取り直し、待つ間に後続 run が書いたら打ち切る
+            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+            let written = false;
+            let superseded = false;
+            let ownershipUnknown = false;
+            for (let attempt = 1; attempt <= 3 && !written && !superseded; attempt++) {
+              let statuses;
+              try {
+                statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                  ...repo, ref: SHA, per_page: 100,
+                });
+              } catch (error) {
+                core.warning(`チェックの履歴を取得できませんでした: ${error.message}`);
+                if (attempt < 3) { await sleep(2000 * attempt); continue; }
+                ownershipUnknown = true;
+                break;
+              }
+              if (statuses.some(item => item.context === statusContext &&
+                  runId(item.target_url) > runId(RUN_URL))) {
+                superseded = true;
+                break;
+              }
+              try {
+                await github.rest.repos.createCommitStatus({
+                  ...repo, sha: SHA, state, context: statusContext,
+                  description, target_url: RUN_URL,
+                });
+                written = true;
+              } catch (error) {
+                if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+                await sleep(2000 * attempt);
+              }
             }
-            // 通常は書けなかった分を finalize が error で確定させる
-            if (owned) {
-              await withRetry(() => github.rest.repos.createCommitStatus({
-                ...repo, sha: SHA, state, context: statusContext,
-                description, target_url: RUN_URL,
-              }));
-            } else {
+            if (superseded) {
               core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
+            } else if (ownershipUnknown) {
+              // 確かめられなかったときは、マージを止める向きの状態 (failure・error) だけ書く。
+              // success は書かず、ジョブを失敗させて再実行できるようにする
+              if (state === "success") {
+                core.setFailed("チェックの履歴を取得できず、success を書けませんでした。失敗したジョブを再実行してください");
+              } else {
+                await withRetry(() => github.rest.repos.createCommitStatus({
+                  ...repo, sha: SHA, state, context: statusContext,
+                  description, target_url: RUN_URL,
+                }));
+              }
             }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
@@ -1512,11 +1538,13 @@ jobs:
               });
             } catch (error) {
               core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
-              if (FINDINGS_STATE === "success") return;
+              // success は書かず、ステップを失敗させて再実行できるようにする
+              if (FINDINGS_STATE === "success") throw new Error("チェックの履歴を取得できず、codex-review を書けませんでした");
             }
-            const latest = statuses.find(item => item.context === "codex-review");
             const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
-            if (runId(latest?.target_url) > runId(RUN_URL)) return;
+            // 履歴全体で、新しい run の codex-review が1件でもあれば触らない
+            if (statuses.some(item => item.context === "codex-review" &&
+                runId(item.target_url) > runId(RUN_URL))) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: SHA, state: FINDINGS_STATE, context: "codex-review",
               description: `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`,
@@ -1549,9 +1577,10 @@ jobs:
             } catch (error) {
               core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
             }
-            const latest = statuses.find(item => item.context === "codex-review");
             const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
-            if (runId(latest?.target_url) > runId(process.env.RUN_URL)) return;
+            // 履歴全体で、新しい run の codex-review が1件でもあれば触らない
+            if (statuses.some(item => item.context === "codex-review" &&
+                runId(item.target_url) > runId(process.env.RUN_URL))) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: process.env.SHA, state: "error", context: "codex-review",
               description: "Claude のレビューが完了しなかったため未実行",
@@ -1636,8 +1665,8 @@ jobs:
               // この run が確定させたもの、自分より後に始まった run のものは触らない。
               // この run の pending のまま・前回の run の結果のまま・まだ無い (開始時の
               // pending を書けなかった) ときは、この run の判定が出ていないので error にする
-              const latestRun = runId(latest?.target_url);
-              if (latestRun > runId(RUN_URL)) continue;
+              if (statuses.some(item => item.context === statusContext &&
+                  runId(item.target_url) > runId(RUN_URL))) continue;
               if (latest?.target_url === RUN_URL && latest.state !== "pending") continue;
               await github.rest.repos.createCommitStatus({
                 ...context.repo, sha: SHA, state: "error", context: statusContext,

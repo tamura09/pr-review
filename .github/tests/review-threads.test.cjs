@@ -1477,13 +1477,17 @@ test('a status already updated by a later run is not overwritten', async () => {
   const earlier = { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122' };
   const overwritten = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [earlier] } });
   assert.equal(overwritten.status.context, 'codex-review');
+  // 最新が古い run の pending でも、履歴に新しい run のものがあれば書かない
+  const buried = await run({ server: { reviews: [], comments: [], nextId: 88,
+    statuses: [{ context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/122' }, later] } });
+  assert.equal(buried.status, undefined);
   // 自分の run の pending が最新なら書く
   const own = await run({ server: { reviews: [], comments: [], nextId: 88,
     statuses: [{ context: 'codex-review', state: 'pending', target_url: runUrl }] } });
   assert.equal(own.status.context, 'codex-review');
   for (const name of ['Mark Codex review as skipped', 'Mark Codex review as not run']) {
     const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
-    assert.match(section, /if \(runId\(latest\?\.target_url\) > runId\((?:RUN_URL|process\.env\.RUN_URL)\)\) return;/);
+    assert.match(section, /statuses\.some\(item => item\.context === "codex-review" &&\n\s+runId\(item\.target_url\) > runId\((?:RUN_URL|process\.env\.RUN_URL)\)\)\) return;/);
   }
 });
 
@@ -1533,6 +1537,8 @@ test('a Codex diff preparation failure is reported with its reason', async () =>
 test('when ownership cannot be checked, only merge-blocking states are written', async () => {
   const success = await run({ result: { summary: '', findings: [] }, fail: 'listCommitStatusesForRef' });
   assert.equal(success.status, undefined);
+  // success を書けなかったときはジョブを失敗させ、再実行で復旧できるようにする
+  assert.match(success.failures.at(-1), /success を書けませんでした/);
   const failure = await run({ fail: 'listCommitStatusesForRef' });
   assert.equal(failure.status.state, defaultFindingsState);
   assert.notEqual(defaultFindingsState, 'success');
