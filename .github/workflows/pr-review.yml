@@ -65,7 +65,7 @@ on:
       claude_timeout_minutes:
         description: >-
           Claude のステップのタイムアウト (分)。超えたら claude-review を error にする。
-          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが出ない
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが開始時の pending のまま残る
         type: number
         required: false
         default: 20
@@ -135,7 +135,7 @@ on:
       codex_timeout_minutes:
         description: >-
           Codex のステップのタイムアウト (分)。超えたら codex-review を error にする。
-          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが出ない
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが開始時の pending のまま残る
         type: number
         required: false
         default: 20
@@ -575,7 +575,7 @@ jobs:
       - name: Review with Claude
         id: claude
         # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
-        # 先に切る。ジョブごと打ち切られると判定のステップが走らない
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、チェックが pending のまま残る
         timeout-minutes: ${{ inputs.claude_timeout_minutes }}
         if: >-
           always() &&
@@ -717,7 +717,7 @@ jobs:
       - name: Review with Codex
         id: codex
         # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
-        # 先に切る。ジョブごと打ち切られると判定のステップが走らない
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、チェックが pending のまま残る
         timeout-minutes: ${{ inputs.codex_timeout_minutes }}
         if: >-
           always() &&
