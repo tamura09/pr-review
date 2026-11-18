@@ -274,6 +274,15 @@ effort、workflow run URL を付ける。Codex のサマリーには目印の HT
 
 Codex を止めて Claude だけにしたい場合は `codex_review: false` にする。
 
+## 並列版からの更新後は古い run を再実行しない
+
+Claude と Codex を並列に走らせていた版の run と、この版の run では保存結果
+(artifact) の中身と前提が違う。呼び出し側が `@<sha>` で固定していれば再実行も元の版で
+走るので問題ない。`@v1` や `@main` のようにタグ・ブランチで参照している場合、
+**Re-run all jobs** は参照先の最新版で走るため、更新前の run を再実行すると新しい版が
+古い保存結果を読む。更新前の run を再レビューしたいときは再実行せず、push か
+PR の close / reopen で新しい run を起こす。
+
 ## `v1` タグは main に自動で追従する
 
 タグの付け替えは [`.github/workflows/move-v1.yml`](./.github/workflows/move-v1.yml) が
