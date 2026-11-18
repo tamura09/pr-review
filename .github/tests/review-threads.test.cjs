@@ -30,6 +30,8 @@ const defaultDiff = `diff --git a/src/example.ts b/src/example.ts
 `;
 const runUrl = 'https://github.com/example/repo/actions/runs/123';
 const bot = { login: 'github-actions[bot]' };
+// 全ステップが読み込むチェックの書き込み手順 (ワークフロー冒頭の env)
+const statusHelper = workflow.match(/^  PR_REVIEW_STATUS_HELPER: \|\n((?: {4}[^\n]*\n|\n)*)/m)[1].replace(/^ {4}/gm, '');
 const finding = {
   path: 'src/example.ts', line: 42, side: 'RIGHT',
   body: '**境界値で失敗する**\n入力が 0 の場合に例外になるため、境界条件を修正してください。',
@@ -56,7 +58,7 @@ async function run(options = {}) {
   writeFileSync(join(tempDir, 'pr-review/pr.diff'), options.diff ?? defaultDiff);
   writeFileSync(join(tempDir, 'pr-review/files.z'), options.files ?? 'M\0src/example.ts\0');
   const env = {
-    RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken,
+    RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken, PR_REVIEW_STATUS_HELPER: statusHelper,
     SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
     REVIEWER: isCodex ? 'Codex · test-model · effort medium' : 'Claude · test-model · effort medium',
     IS_CODEX: String(isCodex), REVIEW_DIFF_OUTCOME: 'success',
@@ -1446,7 +1448,7 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
     paginate: async () => statuses,
     rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
   };
-  const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true' };
+  const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper };
   await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
   assert.deepEqual(created.map(item => [item.context, item.state]), [['codex-review', 'error']]);
   // 後続の run (run ID が大きい) のチェックには触らない
@@ -1488,8 +1490,7 @@ test('a status already updated by a later run is not overwritten', async () => {
   for (const name of ['Mark Codex review as skipped', 'Mark Codex review as not run']) {
     const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
     // 書き込みは共通の手順 (再試行のたびに履歴を読み直し、後続 run のものがあれば書かない)
-    assert.match(section, /async function writeOwnedStatus/);
-    assert.match(section, /runId\(item\.target_url, item\) > runId\(process\.env\.RUN_URL\)\)\) return "superseded";/);
+    assert.match(section, /new Function\("return " \+ process\.env\.PR_REVIEW_STATUS_HELPER\)\(\)\(github, context, process\.env\)/);
     assert.doesNotMatch(section, /retries: 3/);
   }
 });
@@ -1511,17 +1512,17 @@ test('the start step does not reset a check that a later run already owns', asyn
     rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
   };
   await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
-    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'codex', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'codex', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.equal(created.length, 0);
   await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
-    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review']);
   // 履歴を取れないときは pending にしない (後続 run の確定結果を戻さないため)。ステップは止めない
   created.length = 0;
   const failing = { ...github, paginate: async () => { throw new Error('Simulated list failure'); } };
   const warnings = [];
   await start(failing, { repo: { owner: 'example', repo: 'repo' } }, { warning: message => warnings.push(message) },
-    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.deepEqual(created, []);
   assert.equal(warnings.length, 2);
   // 別の連携が同名のチェックに付けた大きい run ID は、後続 run とみなさない
@@ -1530,7 +1531,7 @@ test('the start step does not reset a check that a later run already owns', asyn
     { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/999', creator: { login: 'other-app[bot]' } },
   ] };
   await start(foreign, { repo: { owner: 'example', repo: 'repo' } }, {},
-    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review', 'codex-review']);
   assert.match(workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0],
     /continue-on-error: true/);
@@ -1568,4 +1569,14 @@ test('Codex gating outputs are set before the status write, which is retried', a
   const output = await run({ isCodex: false, result: { summary: '', findings: [] }, fail: 'createCommitStatus' });
   assert.equal(output.outputs.findings, '0');
   assert.equal(output.calls.filter(call => call.method === 'createCommitStatus').length, 3);
+});
+
+test('the status write procedure is defined once and loaded by every step that writes statuses', () => {
+  assert.equal(workflow.match(/async function writeOwnedStatus/g).length, 1);
+  assert.match(statusHelper, /runId\(item\.target_url, item\) > runId\(env\.RUN_URL\)\)\) return "superseded";/);
+  for (const name of ['Mark reviews as in progress', 'Publish review threads and status', 'Mark Codex review as skipped',
+    'Mark Codex review as not run', 'Close out pending checks']) {
+    const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
+    assert.match(section, /const writeOwnedStatus = new Function\("return " \+ process\.env\.PR_REVIEW_STATUS_HELPER\)\(\)\(github, context, process\.env\);/, name);
+  }
 });
