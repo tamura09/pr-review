@@ -4,10 +4,13 @@
 # Claude が何か挙げた PR は直してから再レビューになるので、その時点で別の
 # モデルに見せても同じ指摘を重ねるだけになる。Claude が見落としたものを拾う
 # 二人目として、Claude が「指摘なし」と言ったときにだけ Codex を使う。
-# それぞれが件数サマリーと指摘ごとのレビュースレッドを投稿して PR のチェック
-# 一覧に claude-review / codex-review を出す。Codex を走らせなかったときは
-# codex-review を「未実行」として、指摘ありの claude-review と同じ状態
-# (findings_state) で出す。
+# PR のチェック一覧にはモデルごとに claude-review / codex-review を出す。
+# 指摘を出したモデルは件数サマリーと指摘ごとのレビュースレッドを投稿する。
+# 0件の Claude はコメントを出さず (チェックだけ)、Codex も0件なら Codex のジョブが
+# 両方の分の「指摘なし」を1件だけ投稿する。
+# Codex を走らせなかったときの codex-review は、Claude に指摘があったときは
+# 「未実行」として claude-review と同じ状態 (findings_state)、Claude が投稿まで
+# 終えなかったときは error で出す。
 #
 # effort はどちらも PR の変更行数で決める (小さい PR は low、普段は medium、
 # 大きい PR は high)。
