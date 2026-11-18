@@ -232,20 +232,27 @@ jobs:
               statuses.push(["codex-review", "Claude のレビュー待ち"]);
             }
             // ランナー待ちで遅れて始まった古い run が、新しい run の判定を pending に戻さない
-            // 一覧を取れなかったときは書く (pending はマージを止める向きなので)
-            let current = [];
+            // 履歴を取れなかったときは書かない。後続 run が確定させたチェックを pending に
+            // 戻すと、後続 run も finalize もそれを書き直さないので残り続ける。
+            // この run の判定は投稿ステップと finalize が書く
+            let current;
             try {
               current = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
                 ...context.repo, ref: SHA, per_page: 100,
               });
             } catch (error) {
-              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
+              core.warning(`チェックの履歴を取得できなかったため、pending にしません: ${error.message}`);
+              return;
             }
-            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
+            // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
+            const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
+            const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
+              !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
             for (const [statusContext, description] of statuses) {
               // 最新の1件だけでなく履歴全体を見る。新しい run のものが1件でもあれば触らない
               if (current.some(item => item.context === statusContext &&
-                  runId(item.target_url) > runId(RUN_URL))) continue;
+                  runId(item.target_url, item) > runId(RUN_URL))) continue;
               await github.rest.repos.createCommitStatus({
                 ...context.repo, sha: SHA, state: "pending", context: statusContext,
                 description, target_url: RUN_URL,
@@ -413,7 +420,9 @@ jobs:
           fi
           install -d -m 700 "${RUNNER_TEMP}/pr-review"
           # `<merge-base> HEAD` は `origin/<base>...HEAD` と同じ差分
-          git diff --no-ext-diff --no-color --unified=3 --src-prefix=a/ --dst-prefix=b/ \
+          # --full-index: 短縮オブジェクト ID の桁数はリポジトリのオブジェクト数で変わり、
+          # Claude と Codex の差分のダイジェストを食い違わせるので、完全な ID にする
+          git diff --no-ext-diff --no-color --unified=3 --full-index --src-prefix=a/ --dst-prefix=b/ \
             "${merge_base}" HEAD > "${RUNNER_TEMP}/pr-review/pr.diff"
           git diff --name-status -z --find-renames "${merge_base}" HEAD \
             > "${RUNNER_TEMP}/pr-review/files.z"
@@ -1455,7 +1464,11 @@ jobs:
             // 同じ head の後続 run (run ID が大きい) がこのチェックを一度でも書いていたら、
             // 古い結果で戻さない。前回の run の結果は、今回の結果で確定させる。
             // 再試行のたびに履歴を取り直し、待つ間に後続 run が書いたら打ち切る
-            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
+            // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
+            const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
+            const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
+              !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
             const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
             let written = false;
             let superseded = false;
@@ -1473,7 +1486,7 @@ jobs:
                 break;
               }
               if (statuses.some(item => item.context === statusContext &&
-                  runId(item.target_url) > runId(RUN_URL))) {
+                  runId(item.target_url, item) > runId(RUN_URL))) {
                 superseded = true;
                 break;
               }
@@ -1541,10 +1554,14 @@ jobs:
               // success は書かず、ステップを失敗させて再実行できるようにする
               if (FINDINGS_STATE === "success") throw new Error("チェックの履歴を取得できず、codex-review を書けませんでした");
             }
-            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
+            // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
+            const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
+            const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
+              !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
             // 履歴全体で、新しい run の codex-review が1件でもあれば触らない
             if (statuses.some(item => item.context === "codex-review" &&
-                runId(item.target_url) > runId(RUN_URL))) return;
+                runId(item.target_url, item) > runId(RUN_URL))) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: SHA, state: FINDINGS_STATE, context: "codex-review",
               description: `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`,
@@ -1577,10 +1594,14 @@ jobs:
             } catch (error) {
               core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
             }
-            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
+            // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
+            const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
+            const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
+              !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
             // 履歴全体で、新しい run の codex-review が1件でもあれば触らない
             if (statuses.some(item => item.context === "codex-review" &&
-                runId(item.target_url) > runId(process.env.RUN_URL))) return;
+                runId(item.target_url, item) > runId(process.env.RUN_URL))) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: process.env.SHA, state: "error", context: "codex-review",
               description: "Claude のレビューが完了しなかったため未実行",
@@ -1654,7 +1675,11 @@ jobs:
           retries: 3
           script: |
             const { SHA, RUN_URL, CODEX_ENABLED } = process.env;
-            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
+            // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
+            const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
+            const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
+              !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
             const contexts = CODEX_ENABLED === "true" ? ["claude-review", "codex-review"] : ["claude-review"];
             for (const statusContext of contexts) {
               // 書き込みの直前に取り直す。新しい順に返るので、文脈ごとに最初のものが最新
@@ -1666,7 +1691,7 @@ jobs:
               // この run の pending のまま・前回の run の結果のまま・まだ無い (開始時の
               // pending を書けなかった) ときは、この run の判定が出ていないので error にする
               if (statuses.some(item => item.context === statusContext &&
-                  runId(item.target_url) > runId(RUN_URL))) continue;
+                  runId(item.target_url, item) > runId(RUN_URL))) continue;
               if (latest?.target_url === RUN_URL && latest.state !== "pending") continue;
               await github.rest.repos.createCommitStatus({
                 ...context.repo, sha: SHA, state: "error", context: statusContext,

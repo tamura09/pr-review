@@ -29,6 +29,7 @@ const defaultDiff = `diff --git a/src/example.ts b/src/example.ts
 +new
 `;
 const runUrl = 'https://github.com/example/repo/actions/runs/123';
+const bot = { login: 'github-actions[bot]' };
 const finding = {
   path: 'src/example.ts', line: 42, side: 'RIGHT',
   body: '**境界値で失敗する**\n入力が 0 の場合に例外になるため、境界条件を修正してください。',
@@ -399,14 +400,14 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir, GITHUB_OUTPUT: githubOutput },
     });
     const actual = readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim();
-    assert.equal(actual, git(checkout, 'diff', `origin/main...${head}`));
+    assert.equal(actual, git(checkout, 'diff', '--full-index', `origin/main...${head}`));
     // 行番号の検証は、下で origin/main を進める前の base で行う
     const changedLine = diff => {
       const hunk = diff.match(/@@ .* \+(\d+),(\d+) @@/);
       return Number(hunk[1]) + Number(hunk[2]) - 1;
     };
     assert.equal(changedLine(actual), 30);
-    assert.equal(changedLine(git(checkout, 'diff', `origin/main...${merged}`)), 31);
+    assert.equal(changedLine(git(checkout, 'diff', '--full-index', `origin/main...${merged}`)), 31);
     const mergeBase = readFileSync(githubOutput, 'utf8').match(/^merge_base=([0-9a-f]{40})$/m)[1];
     // Claude の投稿ステップと同じ計算 (pr.diff・NUL・files.z)
     const claudeDigest = require('node:crypto').createHash('sha256')
@@ -417,7 +418,7 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     git(origin, 'checkout', 'main');
     git(origin, 'merge', '--no-edit', head);
     git(checkout, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main');
-    assert.equal(git(checkout, 'diff', `origin/main...${head}`), '');
+    assert.equal(git(checkout, 'diff', '--full-index', `origin/main...${head}`), '');
     rmSync(join(tempDir, 'pr-review'), { recursive: true, force: true });
     execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
@@ -436,8 +437,8 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
         GITHUB_OUTPUT: githubOutput, REVIEWER: 'claude', REVIEW_BASE_SHA: mergeBase },
     });
-    assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), git(checkout, 'diff', `origin/main...${head}`));
-    assert.notEqual(git(checkout, 'diff', `origin/main...${head}`), actual);
+    assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), git(checkout, 'diff', '--full-index', `origin/main...${head}`));
+    assert.notEqual(git(checkout, 'diff', '--full-index', `origin/main...${head}`), actual);
     assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
         GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: '--output=/tmp/x' },
@@ -1438,9 +1439,9 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
   const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);
   const created = [];
   const statuses = [
-    { context: 'codex-review', state: 'pending', target_url: runUrl },
-    { context: 'claude-review', state: 'success', target_url: runUrl },
-    { context: 'claude-review', state: 'pending', target_url: runUrl },
+    { context: 'codex-review', state: 'pending', target_url: runUrl, creator: bot },
+    { context: 'claude-review', state: 'success', target_url: runUrl, creator: bot },
+    { context: 'claude-review', state: 'pending', target_url: runUrl, creator: bot },
   ];
   const github = {
     paginate: async () => statuses,
@@ -1451,12 +1452,12 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
   assert.deepEqual(created.map(item => [item.context, item.state]), [['codex-review', 'error']]);
   // 後続の run (run ID が大きい) のチェックには触らない
   created.length = 0;
-  statuses[0] = { context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/124' };
+  statuses[0] = { context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
   await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
   assert.equal(created.length, 0);
   // 前回の run の結果のまま・まだ無いチェックは、この run の判定が出ていないので error にする
   created.length = 0;
-  statuses.splice(0, statuses.length, { context: 'claude-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122' });
+  statuses.splice(0, statuses.length, { context: 'claude-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122', creator: bot });
   await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
   assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
   // Codex を使わない呼び出し側では codex-review を作らない
@@ -1470,24 +1471,24 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
 });
 
 test('a status already updated by a later run is not overwritten', async () => {
-  const later = { context: 'codex-review', state: 'error', target_url: 'https://github.com/example/repo/actions/runs/124' };
+  const later = { context: 'codex-review', state: 'error', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
   const output = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
   assert.equal(output.status, undefined);
   // 前回の run (run ID が小さい) の結果は、今回の結果で確定させる
-  const earlier = { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122' };
+  const earlier = { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122', creator: bot };
   const overwritten = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [earlier] } });
   assert.equal(overwritten.status.context, 'codex-review');
   // 最新が古い run の pending でも、履歴に新しい run のものがあれば書かない
   const buried = await run({ server: { reviews: [], comments: [], nextId: 88,
-    statuses: [{ context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/122' }, later] } });
+    statuses: [{ context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/122', creator: bot }, later] } });
   assert.equal(buried.status, undefined);
   // 自分の run の pending が最新なら書く
   const own = await run({ server: { reviews: [], comments: [], nextId: 88,
-    statuses: [{ context: 'codex-review', state: 'pending', target_url: runUrl }] } });
+    statuses: [{ context: 'codex-review', state: 'pending', target_url: runUrl, creator: bot }] } });
   assert.equal(own.status.context, 'codex-review');
   for (const name of ['Mark Codex review as skipped', 'Mark Codex review as not run']) {
     const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
-    assert.match(section, /statuses\.some\(item => item\.context === "codex-review" &&\n\s+runId\(item\.target_url\) > runId\((?:RUN_URL|process\.env\.RUN_URL)\)\)\) return;/);
+    assert.match(section, /statuses\.some\(item => item\.context === "codex-review" &&\n\s+runId\(item\.target_url, item\) > runId\((?:RUN_URL|process\.env\.RUN_URL)\)\)\) return;/);
   }
 });
 
@@ -1504,7 +1505,7 @@ test('the start step does not reset a check that a later run already owns', asyn
   const start = new AsyncFunction('github', 'context', 'core', 'process', 'require', startScript);
   const created = [];
   const github = {
-    paginate: async () => [{ context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124' }],
+    paginate: async () => [{ context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot }],
     rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
   };
   await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
@@ -1513,14 +1514,22 @@ test('the start step does not reset a check that a later run already owns', asyn
   await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review']);
-  // 一覧の取得に失敗しても止めずに pending を書く
+  // 履歴を取れないときは pending にしない (後続 run の確定結果を戻さないため)。ステップは止めない
   created.length = 0;
   const failing = { ...github, paginate: async () => { throw new Error('Simulated list failure'); } };
   const warnings = [];
   await start(failing, { repo: { owner: 'example', repo: 'repo' } }, { warning: message => warnings.push(message) },
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
-  assert.deepEqual(created.map(item => item.context), ['claude-review', 'codex-review']);
+  assert.deepEqual(created, []);
   assert.equal(warnings.length, 1);
+  // 別の連携が同名のチェックに付けた大きい run ID は、後続 run とみなさない
+  const foreign = { ...github, paginate: async () => [
+    { context: 'claude-review', state: 'success', target_url: 'https://github.com/other/repo/actions/runs/999', creator: bot },
+    { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/999', creator: { login: 'other-app[bot]' } },
+  ] };
+  await start(foreign, { repo: { owner: 'example', repo: 'repo' } }, {},
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+  assert.deepEqual(created.map(item => item.context), ['claude-review', 'codex-review']);
   assert.match(workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0],
     /continue-on-error: true/);
 });
