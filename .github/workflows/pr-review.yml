@@ -1210,9 +1210,10 @@ jobs:
               savePublication();
               const headline = result.summary.replace(/[\r\n]+/g, " ").trim();
               const combined = !findings.length && cleanComment === "combined";
-              // 合同の「指摘なし」は、Claude と同じ差分を見たときだけ出す。保存結果からの
-              // 再試行でも、Codex の差分の基点と Claude から受け取った基点の一致を確かめる
-              if (combined && (!/^[0-9a-f]{40}$/.test(process.env.REVIEW_BASE_SHA || "") ||
+              // Codex の結果は、Claude と同じ差分を見たときだけ出す (合同の「指摘なし」に
+              // 限らない)。保存結果からの再試行でも、Codex の差分の基点と Claude から
+              // 受け取った基点の一致を確かめる
+              if (cleanComment === "combined" && (!/^[0-9a-f]{40}$/.test(process.env.REVIEW_BASE_SHA || "") ||
                   publication.merge_base !== process.env.REVIEW_BASE_SHA)) {
                 throw new Error("Claude と Codex の差分の基点が一致しません。新しい workflow run で再レビューしてください");
               }

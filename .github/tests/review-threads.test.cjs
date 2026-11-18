@@ -1330,6 +1330,11 @@ test('Codex posts one combined no-findings comment for both reviewers', async ()
     assert.match(mismatch.failures[0], /差分の基点が一致しません/);
     assert.equal(mismatch.server.issueComments.length, 0);
   }
+  // 指摘ありの Codex 結果も同じ
+  const withFindings = await run({ result, env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel,
+    MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'b'.repeat(40) } });
+  assert.match(withFindings.failures[0], /差分の基点が一致しません/);
+  assert.equal(withFindings.server.reviews.length, 0);
   // Codex のサマリーがあれば Claude も投稿を終えている。保存結果を失った Claude を再実行しない
   const claude = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
   assert.match(claude.error.message, /保存結果がありません/);
