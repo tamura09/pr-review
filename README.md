@@ -560,6 +560,12 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
   になる。Codex の認証が切れたときは `codex-review` だけが error になる。Claude は毎回、
   Codex は Claude の指摘が0件のたびに読むので、Codex 側の失効は Claude が0件を返す
   PR まで気づけない。
+- **チェックは head の SHA に付く。** commit status は SHA 単位なので、同じ head SHA の PR を
+  複数のベースに出すと、`claude-review` / `codex-review` を互いに上書きしあう。
+  ベースごとに判定を分けたい場合は、ブランチを分けて別の SHA にする。
+- **終わらなかった run のチェックは error になる。** キャンセル・ジョブのタイムアウトなどで
+  各ジョブが判定を出せなかったときは、最後の `finalize` ジョブが、この run が pending に
+  したまま残ったチェックを error にする。後続の run がすでに上書きしたチェックには触らない。
 - **AWS が単一障害点になる。** ロールの信頼ポリシーやパラメータを壊すと、
   全リポジトリのレビューが同時に止まる。secret を各リポジトリに置いていた頃は
   リポジトリごとに独立していた。

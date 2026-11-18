@@ -68,7 +68,7 @@ on:
       claude_timeout_minutes:
         description: >-
           Claude のステップのタイムアウト (分)。超えたら claude-review を error にする。
-          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが開始時の pending のまま残る
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られ、原因の分からない error になる
         type: number
         required: false
         default: 20
@@ -138,7 +138,7 @@ on:
       codex_timeout_minutes:
         description: >-
           Codex のステップのタイムアウト (分)。超えたら codex-review を error にする。
-          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが開始時の pending のまま残る
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られ、原因の分からない error になる
         type: number
         required: false
         default: 20
@@ -579,7 +579,7 @@ jobs:
       - name: Review with Claude
         id: claude
         # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
-        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、チェックが pending のまま残る
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、finalize が原因なしの error にする
         timeout-minutes: ${{ inputs.claude_timeout_minutes }}
         if: >-
           always() &&
@@ -723,7 +723,7 @@ jobs:
       - name: Review with Codex
         id: codex
         # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
-        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、チェックが pending のまま残る
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、finalize が原因なしの error にする
         timeout-minutes: ${{ inputs.codex_timeout_minutes }}
         if: >-
           always() &&
@@ -1461,3 +1461,35 @@ jobs:
       CLAUDE_LABEL: ${{ needs.review.outputs.label }}
       REVIEW_BASE_SHA: ${{ needs.review.outputs.merge_base }}
     steps: *review_steps
+
+  # この run が開始時に pending にしたチェックが、終了時にまだ pending なら error で
+  # 確定させる。キャンセル (Codex のランナー待ちの間を含む)・ジョブのタイムアウトなど、
+  # 各ジョブの中の終了処理では拾えない終わり方が対象。後続の run が上書きした
+  # チェックには触らない (最新のステータスがこの run の pending のときだけ書き換える)
+  finalize:
+    needs: [review, codex]
+    if: always() && needs.review.result != 'skipped'
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    steps:
+      - name: Close out pending checks
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const { SHA, RUN_URL } = process.env;
+            const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+              ...context.repo, ref: SHA, per_page: 100,
+            });
+            // 新しい順に返るので、文脈ごとに最初のものが最新
+            for (const statusContext of ["claude-review", "codex-review"]) {
+              const latest = statuses.find(item => item.context === statusContext);
+              if (!latest || latest.state !== "pending" || latest.target_url !== RUN_URL) continue;
+              await github.rest.repos.createCommitStatus({
+                ...context.repo, sha: SHA, state: "error", context: statusContext,
+                description: "レビューが完了しませんでした (キャンセル・タイムアウトなど)",
+                target_url: RUN_URL,
+              });
+            }

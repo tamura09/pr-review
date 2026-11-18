@@ -1407,3 +1407,28 @@ test('each job expands only its own model credentials, even in step env and with
   const claude = workflow.slice(workflow.indexOf('      - name: Review with Claude')).split(/\n      - name: /)[0];
   assert.match(claude, /matrix\.reviewer == 'claude' && \(secrets\.claude_code_oauth_token/);
 });
+
+test('finalize turns only this run\'s still-pending checks into errors', async () => {
+  const finalizeScript = workflow.match(/- name: Close out pending checks[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);
+  const created = [];
+  const statuses = [
+    { context: 'codex-review', state: 'pending', target_url: runUrl },
+    { context: 'claude-review', state: 'success', target_url: runUrl },
+    { context: 'claude-review', state: 'pending', target_url: runUrl },
+  ];
+  const github = {
+    paginate: async () => statuses,
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
+  };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env: { SHA: 'reviewed-head', RUN_URL: runUrl } }, require);
+  assert.deepEqual(created.map(item => [item.context, item.state]), [['codex-review', 'error']]);
+  // 後続の run の pending には触らない
+  created.length = 0;
+  statuses[0] = { context: 'codex-review', state: 'pending', target_url: 'https://example.com/newer-run' };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env: { SHA: 'reviewed-head', RUN_URL: runUrl } }, require);
+  assert.equal(created.length, 0);
+  const job = workflow.slice(workflow.indexOf('\n  finalize:\n'));
+  assert.match(job, /needs: \[review, codex\]/);
+  assert.match(job, /if: always\(\) && needs\.review\.result != 'skipped'/);
+});
