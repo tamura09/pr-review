@@ -640,7 +640,9 @@ jobs:
           }
           PROFILE
           sudo apparmor_parser --replace /etc/apparmor.d/bwrap
-          npm install --global @openai/codex@0.162.0
+          # gpt-6.2-astra は 0.162.0 では model_not_found (「ChatGPT アカウントの Codex では
+          # 未対応」) で起動直後に落ちる。0.166.0 で通ることを確認した
+          npm install --global @openai/codex@0.166.0
 
       # Claude と同じく、失敗しても job は止めず最後のステップで codex-review を
       # error にする。Codex は read-only のサンドボックスでシェルを使えるので、
