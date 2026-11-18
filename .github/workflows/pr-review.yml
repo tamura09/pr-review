@@ -1218,13 +1218,10 @@ jobs:
                 if (file[finding.side].has(finding.line)) lineComments.push(comment);
                 else fileComments.push(comment);
               });
-              publication.restorable = true;
-              savePublication();
-              const headline = result.summary.replace(/[\r\n]+/g, " ").trim();
-              const combined = !findings.length && cleanComment === "combined";
               // Codex の結果は、Claude と同じ差分を見たときだけ出す (合同の「指摘なし」に
               // 限らない)。保存結果からの再試行でも、Codex の差分の基点と Claude から
-              // 受け取った基点の一致を確かめる
+              // 受け取った基点の一致を確かめる。食い違いは復元可能にする前に弾き、
+              // 再実行では保存結果を使わずモデルからやり直させる
               if (cleanComment === "combined" && (!/^[0-9a-f]{40}$/.test(process.env.REVIEW_BASE_SHA || "") ||
                   publication.merge_base !== process.env.REVIEW_BASE_SHA)) {
                 throw new Error("Claude と Codex の差分の基点が一致しません。新しい workflow run で再レビューしてください");
@@ -1232,6 +1229,10 @@ jobs:
               if (cleanComment === "combined" && diffDigest !== process.env.REVIEW_DIFF_DIGEST) {
                 throw new Error("Claude と Codex に渡した差分が一致しません。新しい workflow run で再レビューしてください");
               }
+              publication.restorable = true;
+              savePublication();
+              const headline = result.summary.replace(/[\r\n]+/g, " ").trim();
+              const combined = !findings.length && cleanComment === "combined";
               const verdict = findings.length
                 ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
                 : combined ? "**✅ 指摘なし** (Claude・Codex)" : "**✅ 指摘なし**";
@@ -1371,10 +1372,26 @@ jobs:
               core.setFailed(description);
             }
 
-            await github.rest.repos.createCommitStatus({
-              ...repo, sha: SHA, state, context: statusContext,
-              description, target_url: RUN_URL,
-            });
+            // 同じ head の後続 run がこのチェックを上書きしていたら、古い結果で戻さない。
+            // 一覧を取れなかったときは書く (チェックを出さないよりよい)
+            let owned = true;
+            try {
+              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                ...repo, ref: SHA, per_page: 100,
+              });
+              const latest = statuses.find(item => item.context === statusContext);
+              owned = !latest || latest.target_url === RUN_URL;
+            } catch (error) {
+              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
+            }
+            if (owned) {
+              await github.rest.repos.createCommitStatus({
+                ...repo, sha: SHA, state, context: statusContext,
+                description, target_url: RUN_URL,
+              });
+            } else {
+              core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
+            }
             // 後続の codex ジョブを走らせるかの判定に使う。投稿まで終わったときだけ出す
             if (findingsCount !== undefined) {
               core.setOutput("findings", String(findingsCount));
@@ -1407,6 +1424,12 @@ jobs:
         with:
           script: |
             const { SHA, FINDINGS, FINDINGS_STATE, RUN_URL } = process.env;
+            // 同じ head の後続 run が codex-review を更新していたら触らない
+            const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+              ...context.repo, ref: SHA, per_page: 100,
+            });
+            const latest = statuses.find(item => item.context === "codex-review");
+            if (latest && latest.target_url !== RUN_URL) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: SHA, state: FINDINGS_STATE, context: "codex-review",
               description: `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`,
@@ -1427,6 +1450,12 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           script: |
+            // 同じ head の後続 run が codex-review を更新していたら触らない
+            const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+              ...context.repo, ref: process.env.SHA, per_page: 100,
+            });
+            const latest = statuses.find(item => item.context === "codex-review");
+            if (latest && latest.target_url !== process.env.RUN_URL) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: process.env.SHA, state: "error", context: "codex-review",
               description: "Claude のレビューが完了しなかったため未実行",
@@ -1497,11 +1526,11 @@ jobs:
         with:
           script: |
             const { SHA, RUN_URL } = process.env;
-            const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-              ...context.repo, ref: SHA, per_page: 100,
-            });
-            // 新しい順に返るので、文脈ごとに最初のものが最新
             for (const statusContext of ["claude-review", "codex-review"]) {
+              // 書き込みの直前に取り直す。新しい順に返るので、文脈ごとに最初のものが最新
+              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                ...context.repo, ref: SHA, per_page: 100,
+              });
               const latest = statuses.find(item => item.context === statusContext);
               if (!latest || latest.state !== "pending" || latest.target_url !== RUN_URL) continue;
               await github.rest.repos.createCommitStatus({

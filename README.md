@@ -565,6 +565,8 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
 - **チェックは head の SHA に付く。** commit status は SHA 単位なので、同じ head SHA の PR を
   複数のベースに出すと、`claude-review` / `codex-review` を互いに上書きしあう。
   ベースごとに判定を分けたい場合は、ブランチを分けて別の SHA にする。
+  同じ PR の run が重なった場合は、各 run がチェックを書く直前に最新の状態を読み、
+  後続の run が更新済みのチェックは古い run の結果で戻さない。
 - **終わらなかった run のチェックは error になる。** キャンセル・ジョブのタイムアウトなどで
   各ジョブが判定を出せなかったときは、最後の `finalize` ジョブが、この run が pending に
   したまま残ったチェックを error にする。後続の run がすでに上書きしたチェックには触らない。

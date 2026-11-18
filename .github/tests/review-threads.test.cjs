@@ -120,6 +120,7 @@ async function run(options = {}) {
     paginate: async (method, params) => {
       fetches.push({ method, params });
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
+      if (method === 'listCommitStatusesForRef') return structuredClone(server.statuses ?? []);
       const rows = method === 'listIssueComments' ? server.issueComments : method === 'listReviews' ? server.reviews : method === 'listCommentsForReview'
         ? server.comments.filter(comment => comment.pull_request_review_id === params.review_id) : server.comments;
       return structuredClone(rows);
@@ -129,7 +130,7 @@ async function run(options = {}) {
         updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments',
         listCommentsForReview: 'listCommentsForReview' },
       issues: { createComment: api('createComment'), listComments: 'listIssueComments' },
-      repos: { createCommitStatus: api('createCommitStatus') },
+      repos: { createCommitStatus: api('createCommitStatus'), listCommitStatusesForRef: 'listCommitStatusesForRef' },
     },
   };
   try {
@@ -137,7 +138,7 @@ async function run(options = {}) {
     const outputs = {};
     try { await publish(github, {
       repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } },
-    }, { error: message => errors.push(message), setFailed: message => failures.push(message),
+    }, { error: message => errors.push(message), setFailed: message => failures.push(message), warning: () => {},
       setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
     return {
@@ -830,7 +831,8 @@ for (const method of ['listReviews', 'listReviewComments']) {
     assert.equal(output.status.state, 'error');
     assert.equal(output.server.comments.length, 0);
     assert.equal(summaryReviews(output.server).length, 0);
-    assert.equal(output.fetches.length, 2);
+    // 最後のステータス投稿前の所有確認 (listCommitStatusesForRef) を除いた取得
+    assert.equal(output.fetches.filter(fetch => fetch.method !== 'listCommitStatusesForRef').length, 2);
     assert.ok(output.fetches.every(fetch => fetch.params.per_page === 100));
   });
 }
@@ -1444,4 +1446,26 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
   assert.match(job, /needs: \[review, codex\]/);
   assert.match(job, /if: always\(\) && needs\.review\.result != 'skipped'/);
   assert.match(job, /permissions:\n      statuses: write\n/);
+});
+
+test('a status already updated by a later run is not overwritten', async () => {
+  const later = { context: 'codex-review', state: 'error', target_url: 'https://example.com/later-run' };
+  const output = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
+  assert.equal(output.status, undefined);
+  // 自分の run の pending が最新なら書く
+  const own = await run({ server: { reviews: [], comments: [], nextId: 88,
+    statuses: [{ context: 'codex-review', state: 'pending', target_url: runUrl }] } });
+  assert.equal(own.status.context, 'codex-review');
+  for (const name of ['Mark Codex review as skipped', 'Mark Codex review as not run']) {
+    const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
+    assert.match(section, /latest && latest\.target_url !== (?:RUN_URL|process\.env\.RUN_URL)\) return;/);
+  }
+});
+
+test('a Codex result whose diff does not match Claude is not made restorable', async () => {
+  const output = await run({ result: { summary: '', findings: [] }, env: { CLEAN_COMMENT: 'combined',
+    MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: 'c'.repeat(64) } });
+  assert.match(output.failures[0], /差分が一致しません/);
+  assert.equal(output.publication.restorable, false);
+  assert.deepEqual(output.publication.posted, []);
 });
