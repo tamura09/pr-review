@@ -21,6 +21,8 @@ permissions:
   id-token: write
 
 # 連続 push のたびに走らせず、最新のコミットだけレビューする
+# 同じ PR の run を重ねないため。チェックの書き込みはこの前提で、古い run の結果が
+# 後続 run の結果を覆わないようにしている。外さない
 concurrency:
   group: pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true

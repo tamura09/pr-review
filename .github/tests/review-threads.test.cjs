@@ -1581,21 +1581,6 @@ test('the status write procedure is defined once and loaded by every step that w
   }
 });
 
-test('a later run status overwritten between the read and the write is written back', async () => {
-  const later = { context: 'codex-review', state: 'failure', description: '指摘 1件', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
-  const ours = { context: 'codex-review', state: 'success', description: '指摘なし', target_url: runUrl, creator: bot };
-  const reads = [[], [ours, later]];
-  const created = [];
-  const github = {
-    paginate: async () => reads.shift() ?? [],
-    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
-  };
-  const write = new Function('return ' + statusHelper)()(github, { repo: { owner: 'example', repo: 'repo' } },
-    { SHA: 'reviewed-head', RUN_URL: runUrl });
-  assert.equal(await write('codex-review', 'success', '指摘なし'), 'written');
-  assert.deepEqual(created.map(item => [item.state, item.target_url]), [['success', runUrl], ['failure', later.target_url]]);
-});
-
 test('finalize ignores other posters and tries every context before failing', async () => {
   const finalizeScript = workflow.match(/- name: Close out pending checks[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
   const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);

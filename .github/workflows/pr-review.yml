@@ -190,26 +190,10 @@ env:
       // 書いた context には書かない (再送の待ち時間に後続 run が書いた場合も含む)。
       // 履歴を取れないときは、どの状態も書かずに例外にする (ジョブを失敗させ、再実行で書き直す)。
       // API の自動再試行 (github-script の retries) は履歴を読み直さないので使わない
-      // 履歴を読んでから書くまでの間に後続 run が書いていた場合 (commit status には比較して
-      // 書き込む API が無い)、書いた後に履歴を読み直し、後続 run の最新の結果を書き戻す。
-      // 後続 run がその後に書けば、そちらが最新になるので問題ない
-      async function restoreLaterRun(statusContext) {
-        let history;
-        try {
-          history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-            ...context.repo, ref: env.SHA, per_page: 100,
-          });
-        } catch {
-          return;
-        }
-        const own = history.filter(item => item.context === statusContext);
-        const later = own.find(item => runId(item.target_url, item) > runId(env.RUN_URL));
-        if (!later || own[0] === later) return;
-        await github.rest.repos.createCommitStatus({
-          ...context.repo, sha: env.SHA, state: later.state, context: statusContext,
-          description: later.description ?? undefined, target_url: later.target_url,
-        });
-      }
+      // 同じ PR の run の重なりは、呼び出し側の concurrency (cancel-in-progress) で防ぐ前提。
+      // 重なるのはキャンセルされた run の終了処理だけで、それは error しか書かない。
+      // commit status には比較して書き込む API が無いので、読んでから書くまでの数百ミリ秒に
+      // 割り込まれる可能性は残るが、その場合に残るのはマージを止める向きの error になる
       async function writeOwnedStatus(statusContext, state, description, skipIf = () => false) {
         for (let attempt = 1; ; attempt++) {
           let history;
@@ -230,7 +214,6 @@ env:
               ...context.repo, sha: env.SHA, state, context: statusContext,
               description, target_url: env.RUN_URL,
             });
-            await restoreLaterRun(statusContext);
             return "written";
           } catch (error) {
             if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
