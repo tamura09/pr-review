@@ -1,9 +1,12 @@
 # Claude と Codex (OpenAI) の2つで PR をレビューする再利用可能ワークフロー。
 #
-# 2つは matrix の別の leg として並列に走り、それぞれが件数サマリーと指摘ごとの
-# レビュースレッドを投稿して
-# PR のチェック一覧に claude-review / codex-review を出す。片方が落ちても
-# もう片方のレビューは届く。
+# まず Claude がレビューし、指摘が0件だったときだけ Codex が続けてレビューする。
+# Claude が何か挙げた PR は直してから再レビューになるので、その時点で別の
+# モデルに見せても同じ指摘を重ねるだけになる。Claude が見落としたものを拾う
+# 二人目として、Claude が「指摘なし」と言ったときにだけ Codex を使う。
+# それぞれが件数サマリーと指摘ごとのレビュースレッドを投稿して PR のチェック
+# 一覧に claude-review / codex-review を出す。Codex を走らせなかったときは
+# codex-review を「省略」として success にする。
 #
 # effort はどちらも PR の変更行数で決める (小さい PR は low、普段は medium、
 # 大きい PR は high)。
@@ -54,7 +57,7 @@ on:
         required: false
         default: 40
       timeout_minutes:
-        description: "ジョブのタイムアウト (分)。Claude と Codex の leg それぞれに掛かる"
+        description: "ジョブのタイムアウト (分)。Claude と Codex のジョブそれぞれに掛かる"
         type: number
         required: false
         default: 30
@@ -106,7 +109,7 @@ on:
         required: false
         default: "/pr-review/oauth-token"
       codex_review:
-        description: "Claude と並べて Codex でもレビューするか。false なら Claude だけ"
+        description: "Claude の指摘が0件のとき、続けて Codex でもレビューするか。false なら Claude だけ"
         type: boolean
         required: false
         default: true
@@ -120,7 +123,7 @@ on:
         description: "Codex のレビューに使う OpenAI モデル"
         type: string
         required: false
-        default: "gpt-6.1-sol"
+        default: "gpt-6.2-astra"
       codex_effort:
         description: >-
           Codex の reasoning effort (low / medium / high / xhigh / max)。
@@ -181,18 +184,21 @@ jobs:
         format(',{0},', inputs.skip_authors),
         format(',{0},', github.event.pull_request.user.login)
       )
-    # Claude と Codex を別の leg で並列に走らせる。片方の失敗や遅延がもう片方の
-    # レビューを止めないよう fail-fast は切る。差分の用意・effort の決定・判定の
-    # 読み取りは両方で同じなので、job を分けずに matrix で共有する
+    #
+    # このジョブは Claude だけを走らせる。Codex は下の codex ジョブで、
+    # Claude の指摘が0件だったときにだけ走る。差分の用意・effort の決定・投稿の
+    # 処理は両方で同じなので、steps は YAML アンカーで共有し、どちらのモデルかは
+    # 1要素の matrix (matrix.reviewer) で切り替える
     strategy:
-      fail-fast: false
       matrix:
-        reviewer: >-
-          ${{ fromJSON(inputs.codex_review && inputs.codex_fallback && '["claude","codex"]' || '["claude"]') }}
+        reviewer: [claude]
     name: ${{ matrix.reviewer }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
+    outputs:
+      # 投稿まで終わったときだけ入る。エラー時は空
+      findings: ${{ steps.publish_review.outputs.findings }}
+    steps: &review_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # 差分・関連コード・レビュースレッドの投稿先を同じ PR head に揃える
@@ -370,14 +376,14 @@ jobs:
       # いた。AWS の SSM に1本ずつ置き、OIDC で読む。
       #
       # 呼び出し側がトークンを渡した場合は AWS には触らない。渡さなかった方を
-      # SSM から読む。各 leg は自分のモデルの認証情報しか読まない。
+      # SSM から読む。各ジョブは自分のモデルの認証情報しか読まない。
       #
       # secrets コンテキストは step の if では読めないので、いったん env 経由で
       # 受けてフラグに落とす。
       - name: Decide where the token comes from
         id: token_source
         if: steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true'
-        # `a && b || c` で選ぶと、Codex の leg で secret が空のとき Claude の
+        # `a && b || c` で選ぶと、Codex のジョブで secret が空のとき Claude の
         # secret に落ちるので、シェル側で選ぶ
         env:
           REVIEWER: ${{ matrix.reviewer }}
@@ -839,7 +845,7 @@ jobs:
             echo "AWS_SESSION_TOKEN="
           } >> "${GITHUB_ENV}"
 
-      # 両方の leg が同じ失敗をするので、コメントは Claude の leg だけが出す
+      # Codex は Claude が差分を取れたときにしか走らないので、コメントは Claude だけが出す
       - name: Report PR diff preparation failure
         if: ${{ always() && matrix.reviewer == 'claude' && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome != 'success' }}
         env:
@@ -896,6 +902,7 @@ jobs:
             const path = require("node:path");
             const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
             let secretsChecked = false;
+            let findingsCount;
             let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
@@ -1231,6 +1238,7 @@ jobs:
               }
               publication.complete = true;
               savePublication();
+              findingsCount = findings.length;
               state = findings.length ? FINDINGS_STATE : "success";
               description = findings.length
                 ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
@@ -1252,13 +1260,39 @@ jobs:
               ...repo, sha: SHA, state, context: statusContext,
               description, target_url: RUN_URL,
             });
+            // 後続の codex ジョブを走らせるかの判定に使う。投稿まで終わったときだけ出す
+            if (findingsCount !== undefined) core.setOutput("findings", String(findingsCount));
+
+      # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
+      # 必須チェックに codex-review を入れた呼び出し側が待機したままにならないよう、
+      # 「省略」と明記して success にする
+      - name: Mark Codex review as skipped
+        if: >-
+          always() &&
+          matrix.reviewer == 'claude' &&
+          inputs.codex_review && inputs.codex_fallback &&
+          steps.publish_review.outputs.findings != '' &&
+          steps.publish_review.outputs.findings != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          FINDINGS: ${{ steps.publish_review.outputs.findings }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GH_REPO}/statuses/${SHA}" \
+            -f state=success \
+            -f context=codex-review \
+            -f description="Claude の指摘 ${FINDINGS}件があるため省略" \
+            -f target_url="${RUN_URL}" >/dev/null
 
       - name: Remove Codex authentication
         if: ${{ always() && matrix.reviewer == 'codex' }}
         run: |
           rm -f -- "${RUNNER_TEMP}/codex-home/auth.json" "${RUNNER_TEMP}/codex-home/auth-before.json"
 
-      # 成功した leg も保存し、Re-run all jobs でも同じ結果を再利用する。
+      # 成功したジョブも保存し、Re-run all jobs でも同じ結果を再利用する。
       - name: Preserve review result and publication state
         if: ${{ always() && steps.publish_review.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1267,3 +1301,19 @@ jobs:
           path: ${{ runner.temp }}/pr-review-results/
           if-no-files-found: ignore
           retention-days: 7
+
+  # Claude の指摘が0件だったときだけ、Codex で続けてレビューする。
+  # review ジョブが失敗・スキップした場合 (fork・draft・skip_authors を含む) は
+  # 暗黙の success() で走らない
+  codex:
+    needs: review
+    if: >-
+      inputs.codex_review && inputs.codex_fallback &&
+      needs.review.outputs.findings == '0'
+    strategy:
+      matrix:
+        reviewer: [codex]
+    name: ${{ matrix.reviewer }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps: *review_steps

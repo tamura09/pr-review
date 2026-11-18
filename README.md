@@ -1,8 +1,8 @@
 # pr-review
 
-Claude (既定は Opus 5.5) と
-[Codex の GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
-の2つに、同じ PR を並列でレビューさせる再利用可能ワークフロー。それぞれが別の
+Claude (既定は Opus 5.5) で PR をレビューし、Claude の指摘が0件だったときだけ
+[Codex の GPT-6.2 Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra)
+で続けてレビューする再利用可能ワークフロー。それぞれが別の
 件数サマリーと、1指摘につき1つの解決可能なレビュースレッドを投稿し、
 別のチェック (`claude-review` / `codex-review`) を出す。
 **レビューを投稿するだけで、マージも承認もしない。** 判断は人間がする。
@@ -181,7 +181,7 @@ secret に入れる場合も、手元の `~/.codex/auth.json` ではなく
 ## effort の決め方
 
 ベースブランチとの差分の変更行数 (追加 + 削除) で effort を決める。Claude と
-GPT-6.1 Sol は effort の段階名 (`low`〜`max`) が同じなので、両方に同じ値を渡す。
+GPT-6.2 Astra は effort の段階名 (`low`〜`max`) が同じなので、両方に同じ値を渡す。
 
 | 変更行数 | effort |
 | --- | --- |
@@ -200,10 +200,20 @@ p90 で 174 行。`effort` を指定すると行数に関係なく両方にそ�
 
 ## 2つのレビューの動作
 
-Claude と Codex は matrix の別の leg (`review / claude`・`review / codex`) として
-並列に走る。`fail-fast: false` なので、片方が利用枠超過・認証切れ・タイムアウトなどで
-落ちても、もう片方のレビューはそのまま届く。各 leg は自分のモデルの認証情報しか
-SSM から読まない。
+まず Claude のジョブ (`review / claude`) が走り、投稿まで終えて指摘が0件だったときだけ
+Codex のジョブ (`review / codex`) が続けて走る。Claude が何か挙げた PR は直してから
+再レビューになるので、その時点で Codex にも見せると同じ指摘を重ねるだけになる。
+Codex は、Claude が「指摘なし」と言った PR を見直す二人目として使う。
+
+| Claude の結果 | Codex | `codex-review` |
+| --- | --- | --- |
+| 指摘なし | 走る | Codex の結果 |
+| 指摘あり | 走らない | ✅ `Claude の指摘 N件があるため省略` |
+| レビュー失敗 | 走らない | 出ない (`claude-review` が error) |
+
+指摘を直して push すると Claude から再レビューされ、0件になった時点で Codex が走る。
+2つは同じ steps を YAML アンカーで共有し、1要素の matrix (`matrix.reviewer`) で
+どちらのモデルかを切り替える。各ジョブは自分のモデルの認証情報しか SSM から読まない。
 
 Claude は `track_progress: false` の agent モードで、checkout 済みの PR head を
 切り替えずにレビューする。過去の PR コメント・レビュースレッドはプロンプトへ自動で
@@ -215,7 +225,7 @@ Claude は `track_progress: false` の agent モードで、checkout 済みの P
 結果は `--json-schema` による `structured_output` から取得し、HTML 加工されたコメントは
 取得元に使わない。
 
-Codex は GPT-6.1 Sol で差分と関連コードを読み、同じ形式の最終回答を返す。
+Codex は GPT-6.2 Astra で差分と関連コードを読み、同じ形式の最終回答を返す。
 [permission profile](https://learn.chatgpt.com/docs/permissions) で、checkout 先・差分と
 最小限の実行用ファイルだけを読み取り許可し、`CODEX_HOME` を明示的に拒否する。
 シェルにジョブの環境変数を引き継がず、書き込み・ネットワーク・承認による権限拡張も
@@ -332,7 +342,8 @@ head 側のコミットから読まれるので、push 権限を持つ人は PR 
 **Resolve conversation** が使える。指摘なしの場合は `**✅ 指摘なし**` とフッターだけを
 投稿する。件数はモデルの申告ではなく、検証した `findings` の要素数から決める。
 
-PR のチェック一覧にも `claude-review` と `codex-review` を出す。
+PR のチェック一覧にも `claude-review` と `codex-review` を出す。Claude に指摘があって
+Codex を走らせなかったときも、`codex-review` は「省略」として success で出す。
 
 | 状態 | 表示 |
 | --- | --- |
@@ -373,7 +384,7 @@ workflow run を起動する。JSON として解析でき、認証情報の検�
 
 最終結果の JSON 解析と認証情報の検査を通った attempt は成功・失敗のどちらでも、
 解析済みの最終結果・差分・変更ファイル一覧・投稿記録を `pr-review-result-<claude|codex>-<実行attempt>` という workflow artifact に
-7日間保存する。成功した leg も保存するため、Re-run all jobs でも結果とチェック状態を再利用できる。
+7日間保存する。成功したジョブも保存するため、Re-run all jobs でも結果とチェック状態を再利用できる。
 指摘なしの通常コメントも投稿者・マーカーで照合し、再投稿せず URL を記録する。復元には `actions: read` が必要なため、呼び出し側にも指定する。
 `publication.json` には投稿済みレビュー・スレッドの URL と失敗理由を保存し、投稿済み URL
 はジョブログにも出力する。ツール実行履歴や認証情報を含む Claude の `execution_file`
@@ -416,7 +427,7 @@ Claude は読み取り専用ツールと構造化出力だけを使う。`--tool
 | `small_pr_max_lines` | number | `30` | 変更行数がこれ以下なら effort を `low` にする |
 | `large_pr_min_lines` | number | `500` | 変更行数がこれ以上なら effort を `high` にする |
 | `max_turns` | number | `40` | Claude の最大ターン数 |
-| `timeout_minutes` | number | `30` | ジョブのタイムアウト。Claude と Codex の leg それぞれに掛かる |
+| `timeout_minutes` | number | `30` | ジョブのタイムアウト。Claude と Codex のジョブそれぞれに掛かる |
 | `claude_timeout_minutes` | number | `20` | Claude のステップのタイムアウト。超えたら `claude-review` を error にする |
 | `skip_authors` | string | `dependabot[bot],renovate[bot],tamura09-renovate[bot]` | レビューをスキップする作成者。カンマ区切り |
 | `skip_draft` | boolean | `true` | draft の PR をスキップするか |
@@ -425,9 +436,9 @@ Claude は読み取り専用ツールと構造化出力だけを使う。`--tool
 | `aws_role_to_assume` | string | `arn:aws:iam::222165754930:role/github-actions-pr-review` | トークンを読むために OIDC で引くロール |
 | `aws_region` | string | `ap-northeast-1` | パラメータのあるリージョン |
 | `oauth_token_parameter` | string | `/pr-review/oauth-token` | トークンを入れた SSM パラメータ名 |
-| `codex_review` | boolean | `true` | Claude と並べて Codex でもレビューするか |
+| `codex_review` | boolean | `true` | Claude の指摘が0件のとき、続けて Codex でもレビューするか |
 | `codex_fallback` | boolean | `true` | 廃止。`false` を渡すと `codex_review: false` と同じ。v1 の呼び出し側を壊さないために残してある |
-| `codex_model` | string | `gpt-6.1-sol` | Codex のレビューに使う OpenAI モデル |
+| `codex_model` | string | `gpt-6.2-astra` | Codex のレビューに使う OpenAI モデル |
 | `codex_effort` | string | `""` | Codex の reasoning effort。空文字なら `effort` と同じ決め方 |
 | `codex_timeout_minutes` | number | `20` | Codex のステップのタイムアウト。超えたら `codex-review` を error にする |
 | `codex_auth_parameter` | string | `/pr-review/codex-auth-json` | Codex `auth.json` を入れた SSM パラメータ名 |
@@ -514,12 +525,13 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
 
 ## 注意点
 
-- **認証が切れた側のチェックだけが赤くなる。** 毎回両方を読むので、どちらかが
-  切れればその PR ですぐ分かる。
+- **認証が切れた側のチェックだけが赤くなる。** Claude は毎回、Codex は Claude の
+  指摘が0件のたびに読むので、どちらかが切れれば数回の PR のうちに分かる。
 - **AWS が単一障害点になる。** ロールの信頼ポリシーやパラメータを壊すと、
   全リポジトリのレビューが同時に止まる。secret を各リポジトリに置いていた頃は
   リポジトリごとに独立していた。
-- **消費するのはサブスクリプションの利用枠で、Claude と ChatGPT の両方を毎回使う。**
+- **消費するのはサブスクリプションの利用枠。** Claude は毎回、ChatGPT は Claude の
+  指摘が0件のときだけ使う。
   push のたびに走る (同一 PR への連続 push は `concurrency` で古い実行をキャンセル
   する)。effort を行数で変えているのはこのため。`with: model:` は Claude のモデル
   だけを変える。Codex のモデルは `codex_model` で変える。
@@ -527,9 +539,8 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
   refresh 自体が拒否された場合 (ログに `refresh_token_reused` など) は、
   [1. の手順](#1-codex-oauth-認証を-ssm-に入れる) で CI 専用のセッションを作り直し、
   `/pr-review/codex-auth-json` を上書きする。それまで `codex-review` は error になる。
-- **Codex の refresh は複数リポジトリの実行が重なると競合しうる。** 全 PR で Codex が
-  走るので、同じ `auth.json` を読んだ実行が同時に refresh する機会がフォールバック
-  だった頃より増えた。`concurrency` はリポジトリをまたげないので直列化できない。
+- **Codex の refresh は複数リポジトリの実行が重なると競合しうる。** Claude の指摘が
+  0件の PR では Codex が走るので、同じ `auth.json` を読んだ実行が同時に refresh しうる。`concurrency` はリポジトリをまたげないので直列化できない。
   負けた側の `codex-review` が認証エラーになったら、再実行すれば SSM の新しい方を読む。
   それでも通らなければ 1. の手順で CI 専用のセッションを作り直す。
 - **トークンは失効する。** 失効するとワークフローが認証エラーで落ちるので、

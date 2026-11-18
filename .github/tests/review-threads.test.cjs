@@ -131,9 +131,11 @@ async function run(options = {}) {
   };
   try {
     let thrown;
+    const outputs = {};
     try { await publish(github, {
       repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } },
-    }, { error: message => errors.push(message), setFailed: message => failures.push(message) }, { env }, require); } catch (error) { thrown = error; }
+    }, { error: message => errors.push(message), setFailed: message => failures.push(message),
+      setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
     return {
       artifactFiles: Object.fromEntries(['codex.md', 'claude.json', 'publication.json', 'pr.diff', 'files.z']
@@ -142,7 +144,7 @@ async function run(options = {}) {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
       publication: existsSync(join(tempDir, 'pr-review-results/publication.json'))
         ? JSON.parse(readFileSync(join(tempDir, 'pr-review-results/publication.json'), 'utf8')) : undefined,
-      calls, failures, errors, server, fetches, thrown,
+      calls, failures, errors, server, fetches, thrown, outputs,
       review: calls.findLast(call => call.method === 'createReview')
         ? { ...calls.findLast(call => call.method === 'createReview').params,
             body: summaryReviews(server).at(-1)?.body ?? calls.findLast(call => call.method === 'createReview').params.body } : undefined,
@@ -1206,4 +1208,25 @@ test('Codex artifact excludes unparsed prose containing escaped credentials outs
   assert.equal(output.failures.length, 0);
   assert.equal(output.savedResult, jsonBlock(result));
   assert.ok(!JSON.stringify(output.artifactFiles).includes(encoded));
+});
+
+test('findings output is published only after a completed review and gates the Codex job', async () => {
+  const clean = await run({ result: { summary: '', findings: [] } });
+  assert.equal(clean.outputs.findings, '0');
+  const found = await run({ result });
+  assert.equal(found.outputs.findings, String(result.findings.length));
+  const broken = await run({ raw: 'not json', result });
+  assert.equal(broken.outputs.findings, undefined);
+
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /needs: review/);
+  assert.match(codexJob, /needs\.review\.outputs\.findings == '0'/);
+  assert.match(codexJob, /reviewer: \[codex\]/);
+  assert.match(codexJob, /steps: \*review_steps/);
+  assert.match(workflow, /reviewer: \[claude\]/);
+  assert.match(workflow, /findings: \$\{\{ steps\.publish_review\.outputs\.findings \}\}/);
+  const skip = workflow.slice(workflow.indexOf('      - name: Mark Codex review as skipped')).split(/\n      - name: /)[0];
+  assert.match(skip, /matrix\.reviewer == 'claude'/);
+  assert.match(skip, /steps\.publish_review\.outputs\.findings != '0'/);
+  assert.match(skip, /context=codex-review/);
 });
