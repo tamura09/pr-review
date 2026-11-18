@@ -1235,8 +1235,53 @@ test('findings output is published only after a completed review and gates the C
   assert.match(skip, /FINDINGS_STATE: \$\{\{ inputs\.findings_state \}\}/);
   assert.match(skip, /state="\$\{FINDINGS_STATE\}"/);
   const start = workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0];
-  assert.ok(workflow.indexOf('      - name: Mark reviews as in progress') < workflow.indexOf('      - name: Restore review result for publication retry'));
+  assert.ok(workflow.indexOf('      - name: Mark reviews as in progress') < workflow.indexOf('      - uses: actions/checkout@'));
   assert.match(start, /state=pending/);
   assert.match(start, /contexts=\("\$\{REVIEWER\}-review"\)/);
   assert.match(start, /codex-review/);
+});
+
+test('Codex accepts a single JSON block whose closing fence is missing', async () => {
+  const output = await run({ raw: '```json\n' + JSON.stringify(result, null, 2) + '\n', result });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.status.state, defaultFindingsState);
+  const twice = await run({ raw: jsonBlock(result) + '\n```json\n' + JSON.stringify(result) + '\n', result });
+  assert.match(twice.failures[0], /JSON ブロック/);
+});
+
+test('Claude posts no no-findings comment when Codex reviews next', async () => {
+  const output = await run({ isCodex: false, result: { summary: '', findings: [] }, env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.server.issueComments.length, 0);
+  assert.equal(output.server.reviews.length, 0);
+  assert.equal(output.status.state, 'success');
+  assert.equal(output.outputs.findings, '0');
+  // 指摘があるときは従来どおり投稿する
+  const found = await run({ isCodex: false, result, env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(summaryReviews(found.server).length, 1);
+});
+
+test('Codex posts one combined no-findings comment for both reviewers', async () => {
+  const claudeLabel = 'Claude · claude-test · effort low';
+  const output = await run({ result: { summary: '', findings: [] },
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel } });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.server.issueComments.length, 1);
+  const body = output.server.issueComments[0].body;
+  assert.match(body, /✅ 指摘なし\*\* \(Claude・Codex\)/);
+  assert.ok(body.includes(`${claudeLabel} / Codex · test-model · effort medium`));
+  assert.equal(output.publication.claude_label, claudeLabel);
+  // 再試行では effort が無いので、保存した Claude のラベルを使う
+  const recovered = await recover({ artifactFiles: output.artifactFiles, env: { REVIEWER_KIND: 'codex' } });
+  const resumed = await run({ server: output.server, restoredRaw: recovered.raw,
+    restoredMetadata: JSON.parse(output.artifactFiles['publication.json']),
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · claude-test · effort ', RESTORED: 'true',
+      REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.server.issueComments.length, 1);
+  // Codex の「指摘なし」に Claude のラベルがあっても、Claude の投稿済みとは数えない
+  const claude = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
+  assert.equal(claude.error, undefined);
+  const codex = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'codex' } });
+  assert.match(codex.error.message, /保存結果がありません/);
 });
