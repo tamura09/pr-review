@@ -31,7 +31,7 @@ concurrency:
 # レビュー完了も必須にする場合は claude-review / codex-review を必須チェックにする。
 # Codex は Claude の指摘が0件のときだけ走る。Claude が投稿まで終えて指摘が1件以上
 # あったときの codex-review は「未実行」で、状態は claude-review と同じ (findings_state)。
-# Claude 自体が失敗したときの codex-review は pending のまま (claude-review が error)。
+# Claude 自体が失敗したときの codex-review は error (Claude のレビューが完了しなかったため未実行)。
 # codex_review: false / codex_fallback: false なら claude-review だけを必須にする。
 # スキップ対象の PR にはチェックが出ないため、必須化すると待機し続ける点に注意。
 #

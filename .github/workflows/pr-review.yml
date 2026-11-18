@@ -364,11 +364,13 @@ jobs:
           set -euo pipefail
           # Codex で現在の base に切り替えると、Claude と違う差分を見たまま合同の
           # 「指摘なし」を出しうる。引き継げなければ止める
-          if [ "${REVIEWER:-}" = "codex" ] && [ -z "${REVIEW_BASE_SHA:-}" ]; then
-            echo "::error::Claude の merge-base を引き継げませんでした"
-            exit 1
-          fi
-          if [ -n "${REVIEW_BASE_SHA:-}" ]; then
+          # Claude は環境に REVIEW_BASE_SHA があっても (セルフホストのランナー変数など)
+          # 使わず、常に base と HEAD から計算する
+          if [ "${REVIEWER:-}" = "codex" ]; then
+            if [ -z "${REVIEW_BASE_SHA:-}" ]; then
+              echo "::error::Claude の merge-base を引き継げませんでした"
+              exit 1
+            fi
             if ! [[ "${REVIEW_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
               echo "::error::Claude の merge-base が不正です"
               exit 1
@@ -453,20 +455,15 @@ jobs:
       - name: Decide where the token comes from
         id: token_source
         if: steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true'
-        # `a && b || c` で選ぶと、Codex のジョブで secret が空のとき Claude の
-        # secret に落ちるので、シェル側で選ぶ
+        # 要るのは自分のモデルの secret の有無だけ。値をシェルに渡すと、両方の
+        # secret を渡した呼び出し側でもう一方の認証情報までこのジョブに入るので、
+        # 式で真偽値にしてから渡す (比較の結果は true / false で、空に落ちない)
         env:
-          REVIEWER: ${{ matrix.reviewer }}
-          CALLER_CLAUDE_TOKEN: ${{ secrets.claude_code_oauth_token }}
-          CALLER_CODEX_AUTH: ${{ secrets.codex_auth_json }}
+          HAS_CALLER_TOKEN: >-
+            ${{ (matrix.reviewer == 'codex' && secrets.codex_auth_json != '') ||
+            (matrix.reviewer != 'codex' && secrets.claude_code_oauth_token != '') }}
         run: |
-          if [ "${REVIEWER}" = "codex" ]; then
-            caller_token="${CALLER_CODEX_AUTH}"
-          else
-            caller_token="${CALLER_CLAUDE_TOKEN}"
-          fi
-
-          if [ -z "${caller_token}" ]; then
+          if [ "${HAS_CALLER_TOKEN}" != "true" ]; then
             echo "from_ssm=true" >> "${GITHUB_OUTPUT}"
           else
             echo "from_ssm=false" >> "${GITHUB_OUTPUT}"
@@ -1390,6 +1387,26 @@ jobs:
               target_url: RUN_URL,
             });
 
+      # Claude が投稿まで終えなかったとき (認証切れ・JSON 不正・投稿失敗など) は
+      # Codex を走らせない。開始時に pending にした codex-review を理由付きで確定させる
+      - name: Mark Codex review as not run
+        if: >-
+          !cancelled() &&
+          matrix.reviewer == 'claude' &&
+          inputs.codex_review && inputs.codex_fallback &&
+          steps.publish_review.outputs.findings == ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              ...context.repo, sha: process.env.SHA, state: "error", context: "codex-review",
+              description: "Claude のレビューが完了しなかったため未実行",
+              target_url: process.env.RUN_URL,
+            });
+
       - name: Remove Codex authentication
         if: ${{ always() && matrix.reviewer == 'codex' }}
         run: |
@@ -1406,11 +1423,14 @@ jobs:
           retention-days: 7
 
   # Claude の指摘が0件だったときだけ、Codex で続けてレビューする。
-  # review ジョブが失敗・スキップした場合 (fork・draft・skip_authors を含む) は
-  # 暗黙の success() で走らない
+  # review ジョブがスキップした場合 (fork・draft・skip_authors を含む) や Claude が
+  # 投稿まで終えなかった場合は findings が空なので走らない
   codex:
     needs: review
+    # findings は Claude が投稿まで終えたときだけ出る。その後の artifact 保存などで
+    # review ジョブが失敗しても Codex は走らせる (暗黙の success() にしない)
     if: >-
+      !cancelled() &&
       inputs.codex_review && inputs.codex_fallback &&
       needs.review.outputs.findings == '0'
     strategy:

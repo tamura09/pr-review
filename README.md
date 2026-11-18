@@ -209,12 +209,13 @@ Codex は、Claude が「指摘なし」と言った PR を見直す二人目と
 | --- | --- | --- |
 | 指摘なし | 走る | Codex の結果 |
 | 指摘あり | 走らない | `Claude の指摘 N件があるため未実行。0件になると Codex が走る` (状態は `findings_state`) |
-| レビュー失敗 (認証・JSON 不正・投稿失敗など) | 走らない | pending `Claude のレビュー待ち` のまま (`claude-review` が error) |
+| レビュー失敗 (認証・JSON 不正・投稿失敗など) | 走らない | error `Claude のレビューが完了しなかったため未実行` |
 
 各ジョブは最初に自分のチェックを pending (`レビュー中`) に戻し、Claude のジョブは
 `codex-review` も pending (`Claude のレビュー待ち`) に戻す。同じ head の再レビュー
 (reopen・再実行) で、前回の結果のチェックが今回の完了前に必須チェックを通さないため。
-「未実行」が出るのは、Claude が投稿まで終えて指摘が1件以上あった場合だけ。
+Claude が投稿まで終えて0件なら、その後の artifact 保存などで Claude のジョブが
+失敗しても Codex は走る。
 
 指摘を直して push すると Claude から再レビューされ、0件になった時点で Codex が走る。
 2つは同じ steps を YAML アンカーで共有し、1要素の matrix (`matrix.reviewer`) で

@@ -404,12 +404,19 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     rmSync(join(tempDir, 'pr-review'), { recursive: true, force: true });
     execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
-        GITHUB_OUTPUT: githubOutput, REVIEW_BASE_SHA: mergeBase },
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: mergeBase },
     });
     assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), actual);
+    // Claude は環境に REVIEW_BASE_SHA があっても使わず、現在の base から計算する
+    execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'claude', REVIEW_BASE_SHA: mergeBase },
+    });
+    assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), git(checkout, 'diff', `origin/main...${head}`));
+    assert.notEqual(git(checkout, 'diff', `origin/main...${head}`), actual);
     assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
-        GITHUB_OUTPUT: githubOutput, REVIEW_BASE_SHA: '--output=/tmp/x' },
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: '--output=/tmp/x' },
     }));
     // Codex は merge-base を引き継げなければ現在の base に切り替えず止まる
     assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
@@ -1352,4 +1359,19 @@ test('the Codex job diffs against the merge-base Claude reviewed', () => {
   const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
   assert.match(codexJob, /REVIEW_BASE_SHA: \$\{\{ needs\.review\.outputs\.merge_base \}\}/);
   assert.match(workflow, /git diff --numstat "\$\{MERGE_BASE\}" HEAD/);
+});
+
+test('Codex still runs when Claude finished but its job failed afterwards, and is closed out when Claude did not finish', () => {
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /!cancelled\(\) &&/);
+  const notRun = workflow.slice(workflow.indexOf('      - name: Mark Codex review as not run')).split(/\n      - name: /)[0];
+  assert.match(notRun, /steps\.publish_review\.outputs\.findings == ''/);
+  assert.match(notRun, /state: "error", context: "codex-review"/);
+});
+
+test('token source receives only a boolean, never the caller secrets', () => {
+  const section = workflow.slice(workflow.indexOf('      - name: Decide where the token comes from')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(section, /: \$\{\{ secrets\./);
+  assert.match(section, /secrets\.codex_auth_json != ''/);
+  assert.match(section, /secrets\.claude_code_oauth_token != ''/);
 });
