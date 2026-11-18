@@ -199,6 +199,7 @@ jobs:
     outputs:
       # 投稿まで終わったときだけ入る。エラー時は空
       findings: ${{ steps.publish_review.outputs.findings }}
+      label: ${{ steps.publish_review.outputs.label }}
     steps: &review_steps
       # 同じ head の再レビュー (reopen・再実行) では、前回の結果のチェックがその
       # SHA に残っている。そのままだと今回のレビューが終わる前に必須チェックを
@@ -277,9 +278,11 @@ jobs:
                   (item.commit_id === SHA || item.body?.includes(`<!-- pr-review:head:${SHA} -->`)) &&
                   item.body?.includes(`[Workflow run](${RUN_URL})`) &&
                   item.body?.includes(`<!-- pr-review:summary:`) &&
-                  // Codex の「指摘なし」は Claude のラベルも含むので、目印で見分ける
-                  item.body?.includes("<!-- pr-review:codex -->") === (REVIEWER_KIND === "codex") &&
-                  item.body?.includes(REVIEWER_KIND === "codex" ? "Codex ·" : "Claude ·"))) {
+                  // Codex の目印は投稿側が本文の先頭に置く。モデルの要約が引用しても先頭には来ない。
+                  // Codex は Claude が投稿を終えてからしか走らないので、Codex のサマリーが
+                  // あれば Claude も投稿済み (「指摘なし」を出さない Claude の分も含む)
+                  (item.body?.startsWith("<!-- pr-review:codex -->") ||
+                    (REVIEWER_KIND === "claude" && item.body?.includes("Claude ·"))))) {
                 throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
               }
             }
@@ -371,8 +374,6 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           EFFORT_OVERRIDE: >-
             ${{ matrix.reviewer == 'codex' && (inputs.codex_effort || inputs.effort) || inputs.effort }}
-          # Codex の「指摘なし」コメントは Claude の分もまとめて出すので、Claude の effort も要る
-          CLAUDE_EFFORT_OVERRIDE: ${{ inputs.effort }}
           SMALL_PR_MAX_LINES: ${{ inputs.small_pr_max_lines }}
           LARGE_PR_MIN_LINES: ${{ inputs.large_pr_min_lines }}
         run: |
@@ -393,23 +394,19 @@ jobs:
           else
             auto_effort=medium
           fi
-          for value in "${EFFORT_OVERRIDE}" "${CLAUDE_EFFORT_OVERRIDE}"; do
-            case "${value}" in
-              ""|low|medium|high|xhigh|max) ;;
-              *)
-                echo "::error::effort は low / medium / high / xhigh / max のどれか (指定値: ${value})"
-                exit 1
-                ;;
-            esac
-          done
-          effort="${EFFORT_OVERRIDE:-${auto_effort}}"
-          claude_effort="${CLAUDE_EFFORT_OVERRIDE:-${auto_effort}}"
+          case "${EFFORT_OVERRIDE}" in
+            "") effort="${auto_effort}" ;;
+            low|medium|high|xhigh|max) effort="${EFFORT_OVERRIDE}" ;;
+            *)
+              echo "::error::effort は low / medium / high / xhigh / max のどれか (指定値: ${EFFORT_OVERRIDE})"
+              exit 1
+              ;;
+          esac
 
           echo "変更 ${changed_lines} 行 -> effort ${effort}"
           {
             echo "changed_lines=${changed_lines}"
             echo "effort=${effort}"
-            echo "claude_effort=${claude_effort}"
           } >> "${GITHUB_OUTPUT}"
 
       # 呼び出し側は secret を持たないのが既定。reusable workflow は呼び出され側の
@@ -934,7 +931,6 @@ jobs:
           CLEAN_COMMENT: >-
             ${{ matrix.reviewer == 'codex' && 'combined' ||
             (inputs.codex_review && inputs.codex_fallback && 'skip' || 'own') }}
-          CLAUDE_LABEL: ${{ format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.claude_effort) }}
           REVIEWER: >-
             ${{ steps.restore_review.outputs.reviewer || (matrix.reviewer == 'codex' &&
             format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
@@ -1322,7 +1318,11 @@ jobs:
               description, target_url: RUN_URL,
             });
             // 後続の codex ジョブを走らせるかの判定に使う。投稿まで終わったときだけ出す
-            if (findingsCount !== undefined) core.setOutput("findings", String(findingsCount));
+            if (findingsCount !== undefined) {
+              core.setOutput("findings", String(findingsCount));
+              // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
+              core.setOutput("label", REVIEWER);
+            }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
       # 状態は指摘ありの claude-review と同じ findings_state にする。codex-review を
@@ -1383,4 +1383,8 @@ jobs:
     name: ${{ matrix.reviewer }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
+    # 「指摘なし」を Claude の分もまとめて出すときのラベル。steps は共有なので、
+    # needs を読むのはこのジョブの env に限る
+    env:
+      CLAUDE_LABEL: ${{ needs.review.outputs.label }}
     steps: *review_steps

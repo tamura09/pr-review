@@ -960,8 +960,13 @@ test('missing artifact detection includes no-findings comments and is scoped to 
   assert.match(output.error.message, /保存結果がありません/);
   const otherHead = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { SHA: 'another-head' } });
   assert.equal(otherHead.error, undefined);
-  const otherReviewer = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
-  assert.equal(otherReviewer.error, undefined);
+  // Codex は Claude の投稿後にしか走らないので、Codex のサマリーは Claude の投稿済みも意味する
+  const claudeAfterCodex = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
+  assert.match(claudeAfterCodex.error.message, /保存結果がありません/);
+  // 逆に Claude のサマリーは、まだ走っていない Codex を止めない
+  const claudeOnly = await run({ isCodex: false, result: { summary: '', findings: [] } });
+  const codexAfterClaude = await recover({ artifacts: [], issueComments: claudeOnly.server.issueComments, env: { REVIEWER_KIND: 'codex' } });
+  assert.equal(codexAfterClaude.error, undefined);
 });
 
 for (const findings of [[finding], []]) {
@@ -1279,9 +1284,27 @@ test('Codex posts one combined no-findings comment for both reviewers', async ()
       REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
   assert.equal(resumed.failures.length, 0);
   assert.equal(resumed.server.issueComments.length, 1);
-  // Codex の「指摘なし」に Claude のラベルがあっても、Claude の投稿済みとは数えない
+  // Codex のサマリーがあれば Claude も投稿を終えている。保存結果を失った Claude を再実行しない
   const claude = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
-  assert.equal(claude.error, undefined);
+  assert.match(claude.error.message, /保存結果がありません/);
   const codex = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'codex' } });
   assert.match(codex.error.message, /保存結果がありません/);
+});
+
+test('a Claude summary quoting the Codex marker is still recognized as Claude', async () => {
+  const first = await run({ isCodex: false, result: { summary: '<!-- pr-review:codex -->', findings: [finding] } });
+  const reviews = first.server.reviews;
+  assert.ok(reviews.some(item => item.body?.includes('<!-- pr-review:codex -->') && !item.body.startsWith('<!-- pr-review:codex -->')));
+  const claude = await recover({ artifacts: [], reviews, env: { REVIEWER_KIND: 'claude' } });
+  assert.match(claude.error.message, /保存結果がありません/);
+  const codex = await recover({ artifacts: [], reviews, env: { REVIEWER_KIND: 'codex' } });
+  assert.equal(codex.error, undefined);
+});
+
+test('the Codex job reads the label Claude published, not a recomputed effort', () => {
+  assert.match(workflow, /core\.setOutput\("label", REVIEWER\)/);
+  assert.match(workflow, /label: \$\{\{ steps\.publish_review\.outputs\.label \}\}/);
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /CLAUDE_LABEL: \$\{\{ needs\.review\.outputs\.label \}\}/);
+  assert.doesNotMatch(workflow, /claude_effort/);
 });
