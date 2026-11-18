@@ -541,8 +541,11 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
 
 ## 注意点
 
-- **認証が切れた側のチェックだけが赤くなる。** Claude は毎回、Codex は Claude の
-  指摘が0件のたびに読むので、どちらかが切れれば数回の PR のうちに分かる。
+- **Claude の認証が切れると両方のチェックが赤くなる。** Claude が投稿まで終えないと
+  Codex は走らず、`codex-review` も error (`Claude のレビューが完了しなかったため未実行`)
+  になる。Codex の認証が切れたときは `codex-review` だけが error になる。Claude は毎回、
+  Codex は Claude の指摘が0件のたびに読むので、Codex 側の失効は Claude が0件を返す
+  PR まで気づけない。
 - **AWS が単一障害点になる。** ロールの信頼ポリシーやパラメータを壊すと、
   全リポジトリのレビューが同時に止まる。secret を各リポジトリに置いていた頃は
   リポジトリごとに独立していた。
