@@ -429,6 +429,8 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
         GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: mergeBase, REVIEW_DIFF_DIGEST: 'c'.repeat(64) },
     }));
+    // 理由はステップ出力に残し、codex-review の説明と PR のコメントに使う
+    assert.match(readFileSync(githubOutput, 'utf8'), /^codex_failure=Claude と Codex の差分が一致しません/m);
     // Claude は環境に REVIEW_BASE_SHA があっても使わず、現在の base から計算する
     execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
@@ -1497,4 +1499,13 @@ test('the start step does not reset a check that a later run already owns', asyn
   await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review']);
+});
+
+test('a Codex diff preparation failure is reported with its reason', async () => {
+  const output = await run({ env: { REVIEW_DIFF_OUTCOME: 'failure', CODEX_DIFF_FAILURE: 'Claude と Codex の差分が一致しません。' } });
+  assert.equal(output.status.state, 'error');
+  assert.match(output.status.description, /差分が一致しません/);
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(report, /matrix\.reviewer == 'claude'/);
+  assert.match(report, /CODEX_FAILURE: \$\{\{ steps\.review_diff\.outputs\.codex_failure \}\}/);
 });

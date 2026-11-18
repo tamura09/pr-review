@@ -373,22 +373,28 @@ jobs:
         # 同じ差分を見る (合同の「指摘なし」が同じ差分についての判定になる)
         run: |
           set -euo pipefail
+          # Codex 固有の失敗は理由をステップ出力に残し、codex-review の説明と PR の
+          # コメントに出す (Claude が0件で何も投稿していないと、PR に何も残らないため)
+          fail_codex() {
+            echo "::error::$1"
+            echo "codex_failure=$1" >> "${GITHUB_OUTPUT}"
+            exit 1
+          }
           # Codex で現在の base に切り替えると、Claude と違う差分を見たまま合同の
           # 「指摘なし」を出しうる。引き継げなければ止める
           # Claude は環境に REVIEW_BASE_SHA があっても (セルフホストのランナー変数など)
           # 使わず、常に base と HEAD から計算する
           if [ "${REVIEWER:-}" = "codex" ]; then
             if [ -z "${REVIEW_BASE_SHA:-}" ]; then
-              echo "::error::Claude の merge-base を引き継げませんでした"
-              exit 1
+              fail_codex "Claude の merge-base を引き継げませんでした"
             fi
             if ! [[ "${REVIEW_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "::error::Claude の merge-base が不正です"
-              exit 1
+              fail_codex "Claude の merge-base が不正です"
             fi
             merge_base="${REVIEW_BASE_SHA}"
             # fetch-depth: 0 なので、HEAD の祖先は checkout 済み
-            git merge-base --is-ancestor "${merge_base}" HEAD
+            git merge-base --is-ancestor "${merge_base}" HEAD ||
+              fail_codex "Claude の merge-base が PR head の祖先にありません"
           else
             git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
             merge_base="$(git merge-base "origin/${BASE_REF}" HEAD)"
@@ -406,8 +412,7 @@ jobs:
             digest="$({ cat "${RUNNER_TEMP}/pr-review/pr.diff"; printf '\0'; cat "${RUNNER_TEMP}/pr-review/files.z"; } \
               | shasum -a 256 | cut -d' ' -f1)"
             if [ "${digest}" != "${REVIEW_DIFF_DIGEST:-}" ]; then
-              echo "::error::Claude と Codex の差分が一致しません。ランナーの Git 設定を確認し、新しい workflow run で再レビューしてください"
-              exit 1
+              fail_codex "Claude と Codex の差分が一致しません。ランナーの Git 設定を確認し、新しい workflow run で再レビューしてください"
             fi
           fi
 
@@ -938,22 +943,35 @@ jobs:
             echo "AWS_SESSION_TOKEN="
           } >> "${GITHUB_ENV}"
 
-      # Codex は Claude が差分を取れたときにしか走らないので、コメントは Claude だけが出す
+      # Codex は Claude と同じ差分を作れなかったとき (merge-base の引き継ぎ・差分の照合の
+      # 失敗) にも止まる。Claude が0件だと PR には何も投稿されていないので、Codex も出す
       - name: Report PR diff preparation failure
-        if: ${{ always() && matrix.reviewer == 'claude' && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome != 'success' }}
+        if: ${{ always() && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome != 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REVIEWER: ${{ matrix.reviewer }}
+          CODEX_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
         run: |
           set -euo pipefail
-          body="**❌ レビュー不能** — PR 差分を取得できませんでした。
+          if [ "${REVIEWER}" = "codex" ]; then
+            reason="${CODEX_FAILURE:-PR 差分を取得できませんでした。}"
+            body="**❌ Codex のレビュー不能** — ${reason}
+
+          Codex のレビューを実行していません。Claude のレビューは指摘なしで完了しています。
+
+          ---
+          _[Workflow run](${RUN_URL})_"
+          else
+            body="**❌ レビュー不能** — PR 差分を取得できませんでした。
 
           レビューを実行していません。Prepare PR diff の job log で base branch の取得・比較エラーを確認してください。
 
           ---
           _[Workflow run](${RUN_URL})_"
+          fi
           gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
             -f body="${body}" >/dev/null
 
@@ -969,6 +987,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
+          CODEX_DIFF_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
           RESTORE_OUTCOME: ${{ steps.restore_review.outcome }}
           RESTORED: ${{ steps.restore_review.outputs.restored }}
@@ -1016,7 +1035,7 @@ jobs:
               }
               const restored = process.env.RESTORED === "true";
               if (!restored && process.env.REVIEW_DIFF_OUTCOME !== "success") {
-                throw new Error("PR差分を取得できませんでした");
+                throw new Error(process.env.CODEX_DIFF_FAILURE || "PR差分を取得できませんでした");
               }
               if (!restored && process.env.EFFORT_OUTCOME !== "success") {
                 throw new Error("effort を決められませんでした");
