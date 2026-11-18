@@ -228,7 +228,14 @@ jobs:
             if (REVIEWER_KIND === "claude" && CODEX_ENABLED === "true") {
               statuses.push(["codex-review", "Claude のレビュー待ち"]);
             }
+            // ランナー待ちで遅れて始まった古い run が、新しい run の判定を pending に戻さない
+            const current = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+              ...context.repo, ref: SHA, per_page: 100,
+            });
+            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
             for (const [statusContext, description] of statuses) {
+              const latest = current.find(item => item.context === statusContext);
+              if (runId(latest?.target_url) > runId(RUN_URL)) continue;
               await github.rest.repos.createCommitStatus({
                 ...context.repo, sha: SHA, state: "pending", context: statusContext,
                 description, target_url: RUN_URL,
@@ -393,6 +400,16 @@ jobs:
           git diff --name-status -z --find-renames "${merge_base}" HEAD \
             > "${RUNNER_TEMP}/pr-review/files.z"
           echo "merge_base=${merge_base}" >> "${GITHUB_OUTPUT}"
+          # Codex は Claude と同じ差分でなければ起動しない (投稿前にも同じ照合をする)。
+          # 投稿ステップと同じく pr.diff・NUL・files.z を連結した SHA-256
+          if [ "${REVIEWER:-}" = "codex" ]; then
+            digest="$({ cat "${RUNNER_TEMP}/pr-review/pr.diff"; printf '\0'; cat "${RUNNER_TEMP}/pr-review/files.z"; } \
+              | shasum -a 256 | cut -d' ' -f1)"
+            if [ "${digest}" != "${REVIEW_DIFF_DIGEST:-}" ]; then
+              echo "::error::Claude と Codex の差分が一致しません。ランナーの Git 設定を確認し、新しい workflow run で再レビューしてください"
+              exit 1
+            fi
+          fi
 
       # 変更行数 (追加 + 削除) で effort を決める。小さい PR に high を
       # 使うと利用枠を無駄に食い、大きい PR に low を使うと見落とす。
@@ -1380,7 +1397,10 @@ jobs:
                 ...repo, ref: SHA, per_page: 100,
               });
               const latest = statuses.find(item => item.context === statusContext);
-              owned = !latest || latest.target_url === RUN_URL;
+              // 自分より後に開始した run (run ID が大きい) が書いたものだけを避ける。
+              // 前回の run の結果は、今回の結果で確定させる
+              const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+              owned = !(runId(latest?.target_url) > runId(RUN_URL));
             } catch (error) {
               core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
             }
@@ -1424,12 +1444,13 @@ jobs:
         with:
           script: |
             const { SHA, FINDINGS, FINDINGS_STATE, RUN_URL } = process.env;
-            // 同じ head の後続 run が codex-review を更新していたら触らない
+            // 自分より後に開始した run が codex-review を更新していたら触らない
             const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
               ...context.repo, ref: SHA, per_page: 100,
             });
             const latest = statuses.find(item => item.context === "codex-review");
-            if (latest && latest.target_url !== RUN_URL) return;
+            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            if (runId(latest?.target_url) > runId(RUN_URL)) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: SHA, state: FINDINGS_STATE, context: "codex-review",
               description: `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`,
@@ -1450,12 +1471,13 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           script: |
-            // 同じ head の後続 run が codex-review を更新していたら触らない
+            // 自分より後に開始した run が codex-review を更新していたら触らない
             const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
               ...context.repo, ref: process.env.SHA, per_page: 100,
             });
             const latest = statuses.find(item => item.context === "codex-review");
-            if (latest && latest.target_url !== process.env.RUN_URL) return;
+            const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
+            if (runId(latest?.target_url) > runId(process.env.RUN_URL)) return;
             await github.rest.repos.createCommitStatus({
               ...context.repo, sha: process.env.SHA, state: "error", context: "codex-review",
               description: "Claude のレビューが完了しなかったため未実行",

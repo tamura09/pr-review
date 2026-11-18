@@ -408,6 +408,10 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     assert.equal(changedLine(actual), 30);
     assert.equal(changedLine(git(checkout, 'diff', `origin/main...${merged}`)), 31);
     const mergeBase = readFileSync(githubOutput, 'utf8').match(/^merge_base=([0-9a-f]{40})$/m)[1];
+    // Claude の投稿ステップと同じ計算 (pr.diff・NUL・files.z)
+    const claudeDigest = require('node:crypto').createHash('sha256')
+      .update(readFileSync(join(tempDir, 'pr-review/pr.diff'))).update('\0')
+      .update(readFileSync(join(tempDir, 'pr-review/files.z'))).digest('hex');
     assert.equal(mergeBase, git(checkout, 'merge-base', 'origin/main', head));
     // Codex は Claude の merge-base を使い、その後にベースが PR の変更を取り込んでも同じ差分を見る
     git(origin, 'checkout', 'main');
@@ -417,9 +421,14 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     rmSync(join(tempDir, 'pr-review'), { recursive: true, force: true });
     execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
-        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: mergeBase },
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: mergeBase, REVIEW_DIFF_DIGEST: claudeDigest },
     });
     assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), actual);
+    // Claude と差分が違えば、Codex を起動する前に止まる
+    assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: mergeBase, REVIEW_DIFF_DIGEST: 'c'.repeat(64) },
+    }));
     // Claude は環境に REVIEW_BASE_SHA があっても使わず、現在の base から計算する
     execFileSync('bash', ['-c', prepareScript], {
       cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
@@ -1449,16 +1458,20 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
 });
 
 test('a status already updated by a later run is not overwritten', async () => {
-  const later = { context: 'codex-review', state: 'error', target_url: 'https://example.com/later-run' };
+  const later = { context: 'codex-review', state: 'error', target_url: 'https://github.com/example/repo/actions/runs/124' };
   const output = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
   assert.equal(output.status, undefined);
+  // 前回の run (run ID が小さい) の結果は、今回の結果で確定させる
+  const earlier = { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122' };
+  const overwritten = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [earlier] } });
+  assert.equal(overwritten.status.context, 'codex-review');
   // 自分の run の pending が最新なら書く
   const own = await run({ server: { reviews: [], comments: [], nextId: 88,
     statuses: [{ context: 'codex-review', state: 'pending', target_url: runUrl }] } });
   assert.equal(own.status.context, 'codex-review');
   for (const name of ['Mark Codex review as skipped', 'Mark Codex review as not run']) {
     const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
-    assert.match(section, /latest && latest\.target_url !== (?:RUN_URL|process\.env\.RUN_URL)\) return;/);
+    assert.match(section, /if \(runId\(latest\?\.target_url\) > runId\((?:RUN_URL|process\.env\.RUN_URL)\)\) return;/);
   }
 });
 
@@ -1468,4 +1481,20 @@ test('a Codex result whose diff does not match Claude is not made restorable', a
   assert.match(output.failures[0], /差分が一致しません/);
   assert.equal(output.publication.restorable, false);
   assert.deepEqual(output.publication.posted, []);
+});
+
+test('the start step does not reset a check that a later run already owns', async () => {
+  const startScript = workflow.match(/- name: Mark reviews as in progress[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const start = new AsyncFunction('github', 'context', 'core', 'process', 'require', startScript);
+  const created = [];
+  const github = {
+    paginate: async () => [{ context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124' }],
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
+  };
+  await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'codex', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+  assert.equal(created.length, 0);
+  await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+  assert.deepEqual(created.map(item => item.context), ['claude-review']);
 });
