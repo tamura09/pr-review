@@ -1286,13 +1286,12 @@ test('findings output is published only after a completed review and gates the C
   const skip = workflow.slice(workflow.indexOf('      - name: Mark Codex review as skipped')).split(/\n      - name: /)[0];
   assert.match(skip, /matrix\.reviewer == 'claude'/);
   assert.match(skip, /steps\.publish_review\.outputs\.findings != '0'/);
-  assert.match(skip, /context: "codex-review"/);
+  assert.match(skip, /writeOwnedStatus\("codex-review", FINDINGS_STATE,/);
   assert.match(skip, /FINDINGS_STATE: \$\{\{ inputs\.findings_state \}\}/);
-  assert.match(skip, /state: FINDINGS_STATE/);
   assert.doesNotMatch(skip, /gh api/);
   const start = workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0];
   assert.ok(workflow.indexOf('      - name: Mark reviews as in progress') < workflow.indexOf('      - uses: actions/checkout@'));
-  assert.match(start, /state: "pending"/);
+  assert.match(start, /writeOwnedStatus\(statusContext, "pending", description\)/);
   assert.match(start, /`\$\{REVIEWER_KIND\}-review`/);
   assert.match(start, /codex-review/);
   assert.doesNotMatch(start, /gh api/);
@@ -1417,7 +1416,7 @@ test('Codex still runs when Claude finished but its job failed afterwards, and i
   assert.match(codexJob, /needs\.review\.outputs\.findings &&\n\s+needs\.review\.outputs\.findings == '0'/);
   const notRun = workflow.slice(workflow.indexOf('      - name: Mark Codex review as not run')).split(/\n      - name: /)[0];
   assert.match(notRun, /steps\.publish_review\.outputs\.findings == ''/);
-  assert.match(notRun, /state: "error", context: "codex-review"/);
+  assert.match(notRun, /writeOwnedStatus\("codex-review", "error"/);
 });
 
 test('token source receives only a boolean, never the caller secrets', () => {
@@ -1488,7 +1487,10 @@ test('a status already updated by a later run is not overwritten', async () => {
   assert.equal(own.status.context, 'codex-review');
   for (const name of ['Mark Codex review as skipped', 'Mark Codex review as not run']) {
     const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
-    assert.match(section, /statuses\.some\(item => item\.context === "codex-review" &&\n\s+runId\(item\.target_url, item\) > runId\((?:RUN_URL|process\.env\.RUN_URL)\)\)\) return;/);
+    // 書き込みは共通の手順 (再試行のたびに履歴を読み直し、後続 run のものがあれば書かない)
+    assert.match(section, /async function writeOwnedStatus/);
+    assert.match(section, /runId\(item\.target_url, item\) > runId\(process\.env\.RUN_URL\)\)\) return "superseded";/);
+    assert.doesNotMatch(section, /retries: 3/);
   }
 });
 
@@ -1521,7 +1523,7 @@ test('the start step does not reset a check that a later run already owns', asyn
   await start(failing, { repo: { owner: 'example', repo: 'repo' } }, { warning: message => warnings.push(message) },
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
   assert.deepEqual(created, []);
-  assert.equal(warnings.length, 1);
+  assert.equal(warnings.length, 2);
   // 別の連携が同名のチェックに付けた大きい run ID は、後続 run とみなさない
   const foreign = { ...github, paginate: async () => [
     { context: 'claude-review', state: 'success', target_url: 'https://github.com/other/repo/actions/runs/999', creator: bot },
@@ -1543,15 +1545,15 @@ test('a Codex diff preparation failure is reported with its reason', async () =>
   assert.match(report, /CODEX_FAILURE: \$\{\{ steps\.review_diff\.outputs\.codex_failure \}\}/);
 });
 
-test('when ownership cannot be checked, only merge-blocking states are written', async () => {
-  const success = await run({ result: { summary: '', findings: [] }, fail: 'listCommitStatusesForRef' });
-  assert.equal(success.status, undefined);
-  // success を書けなかったときはジョブを失敗させ、再実行で復旧できるようにする
-  assert.match(success.failures.at(-1), /success を書けませんでした/);
-  const failure = await run({ fail: 'listCommitStatusesForRef' });
-  assert.equal(failure.status.state, defaultFindingsState);
-  assert.notEqual(defaultFindingsState, 'success');
-  assert.match(workflow, /retries: 3/);
+test('when ownership cannot be checked, no status is written and the step fails', async () => {
+  // 履歴を確かめられないときは、どの状態も書かずにステップを失敗させる (再実行で書き直す)
+  for (const result of [{ summary: '', findings: [] }, undefined]) {
+    const output = await run({ ...(result ? { result } : {}), fail: 'listCommitStatusesForRef' });
+    assert.equal(output.status, undefined);
+    assert.match(output.thrown.message, /履歴を取得できず/);
+  }
+  const publishStep = workflow.slice(workflow.indexOf('      - name: Publish review threads and status')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(publishStep, /retries: 3/);
 });
 
 test('the publish step does not auto-retry create calls, and the comment dedupe avoids SIGPIPE', () => {

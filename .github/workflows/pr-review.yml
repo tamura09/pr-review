@@ -223,42 +223,60 @@ jobs:
           CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
-          # 一時的な API エラー (5xx・レート制限) は再試行する
-          retries: 3
           script: |
-            const { SHA, REVIEWER_KIND, CODEX_ENABLED, RUN_URL } = process.env;
-            const statuses = [[`${REVIEWER_KIND}-review`, "レビュー中"]];
-            if (REVIEWER_KIND === "claude" && CODEX_ENABLED === "true") {
-              statuses.push(["codex-review", "Claude のレビュー待ち"]);
-            }
-            // ランナー待ちで遅れて始まった古い run が、新しい run の判定を pending に戻さない
-            // 履歴を取れなかったときは書かない。後続 run が確定させたチェックを pending に
-            // 戻すと、後続 run も finalize もそれを書き直さないので残り続ける。
-            // この run の判定は投稿ステップと finalize が書く
-            let current;
-            try {
-              current = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                ...context.repo, ref: SHA, per_page: 100,
-              });
-            } catch (error) {
-              core.warning(`チェックの履歴を取得できなかったため、pending にしません: ${error.message}`);
-              return;
-            }
+            const { REVIEWER_KIND, CODEX_ENABLED } = process.env;
+            // --- チェックの書き込み (開始・投稿・省略・未実行・finalize で同じ手順) ---
             // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
             // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
             const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
             const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
               !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
-            for (const [statusContext, description] of statuses) {
-              // 最新の1件だけでなく履歴全体を見る。新しい run のものが1件でもあれば触らない
-              if (current.some(item => item.context === statusContext &&
-                  runId(item.target_url, item) > runId(RUN_URL))) continue;
-              await github.rest.repos.createCommitStatus({
-                ...context.repo, sha: SHA, state: "pending", context: statusContext,
-                description, target_url: RUN_URL,
-              });
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+            // 書き込むたびに履歴を読み直し、自分より後に始まった run (run ID が大きい) が一度でも
+            // 書いた context には書かない (再送の待ち時間に後続 run が書いた場合も含む)。
+            // 履歴を取れないときは、どの状態も書かずに例外にする (ジョブを失敗させ、再実行で書き直す)。
+            // API の自動再試行 (github-script の retries) は履歴を読み直さないので使わない
+            async function writeOwnedStatus(statusContext, state, description, skipIf = () => false) {
+              for (let attempt = 1; ; attempt++) {
+                let history;
+                try {
+                  history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                    ...context.repo, ref: process.env.SHA, per_page: 100,
+                  });
+                } catch (error) {
+                  if (attempt < 3) { await sleep(2000 * attempt); continue; }
+                  throw new Error(`チェックの履歴を取得できず、${statusContext} を書けませんでした。` +
+                    `失敗したジョブを再実行してください (${error.message})`);
+                }
+                if (history.some(item => item.context === statusContext &&
+                    runId(item.target_url, item) > runId(process.env.RUN_URL))) return "superseded";
+                if (skipIf(history)) return "skipped";
+                try {
+                  await github.rest.repos.createCommitStatus({
+                    ...context.repo, sha: process.env.SHA, state, context: statusContext,
+                    description, target_url: process.env.RUN_URL,
+                  });
+                  return "written";
+                } catch (error) {
+                  if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+                  await sleep(2000 * attempt);
+                }
+              }
             }
-
+            const statuses = [[`${REVIEWER_KIND}-review`, "レビュー中"]];
+            if (REVIEWER_KIND === "claude" && CODEX_ENABLED === "true") {
+              statuses.push(["codex-review", "Claude のレビュー待ち"]);
+            }
+            // ランナー待ちで遅れて始まった古い run が、新しい run の判定を pending に戻さない。
+            // 履歴を取れなかったときは書かずにレビューを続ける。この run の判定は投稿ステップと
+            // finalize が書く (それまでは前回の run の結果が残る)
+            for (const [statusContext, description] of statuses) {
+              try {
+                await writeOwnedStatus(statusContext, "pending", description);
+              } catch (error) {
+                core.warning(`${statusContext} を pending にできませんでした: ${error.message}`);
+              }
+            }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # 差分・関連コード・レビュースレッドの投稿先を同じ PR head に揃える
@@ -1051,18 +1069,6 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
             const cleanComment = process.env.CLEAN_COMMENT || "own";
-            // 読み取りとチェックの書き込み (どちらも繰り返して害がない) だけを再試行する。
-            // 作成系の投稿は重複するので再試行しない
-            async function withRetry(call) {
-              for (let attempt = 1; ; attempt++) {
-                try {
-                  return await call();
-                } catch (error) {
-                  if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
-                  await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
-                }
-              }
-            }
             let claudeLabel = process.env.CLAUDE_LABEL;
             let restoredMergeBase;
             const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
@@ -1461,59 +1467,48 @@ jobs:
               core.setFailed(description);
             }
 
-            // 同じ head の後続 run (run ID が大きい) がこのチェックを一度でも書いていたら、
-            // 古い結果で戻さない。前回の run の結果は、今回の結果で確定させる。
-            // 再試行のたびに履歴を取り直し、待つ間に後続 run が書いたら打ち切る
+            // --- チェックの書き込み (開始・投稿・省略・未実行・finalize で同じ手順) ---
             // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
             // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
             const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
             const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
               !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
             const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-            let written = false;
-            let superseded = false;
-            let ownershipUnknown = false;
-            for (let attempt = 1; attempt <= 3 && !written && !superseded; attempt++) {
-              let statuses;
-              try {
-                statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                  ...repo, ref: SHA, per_page: 100,
-                });
-              } catch (error) {
-                core.warning(`チェックの履歴を取得できませんでした: ${error.message}`);
-                if (attempt < 3) { await sleep(2000 * attempt); continue; }
-                ownershipUnknown = true;
-                break;
-              }
-              if (statuses.some(item => item.context === statusContext &&
-                  runId(item.target_url, item) > runId(RUN_URL))) {
-                superseded = true;
-                break;
-              }
-              try {
-                await github.rest.repos.createCommitStatus({
-                  ...repo, sha: SHA, state, context: statusContext,
-                  description, target_url: RUN_URL,
-                });
-                written = true;
-              } catch (error) {
-                if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
-                await sleep(2000 * attempt);
+            // 書き込むたびに履歴を読み直し、自分より後に始まった run (run ID が大きい) が一度でも
+            // 書いた context には書かない (再送の待ち時間に後続 run が書いた場合も含む)。
+            // 履歴を取れないときは、どの状態も書かずに例外にする (ジョブを失敗させ、再実行で書き直す)。
+            // API の自動再試行 (github-script の retries) は履歴を読み直さないので使わない
+            async function writeOwnedStatus(statusContext, state, description, skipIf = () => false) {
+              for (let attempt = 1; ; attempt++) {
+                let history;
+                try {
+                  history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                    ...context.repo, ref: process.env.SHA, per_page: 100,
+                  });
+                } catch (error) {
+                  if (attempt < 3) { await sleep(2000 * attempt); continue; }
+                  throw new Error(`チェックの履歴を取得できず、${statusContext} を書けませんでした。` +
+                    `失敗したジョブを再実行してください (${error.message})`);
+                }
+                if (history.some(item => item.context === statusContext &&
+                    runId(item.target_url, item) > runId(process.env.RUN_URL))) return "superseded";
+                if (skipIf(history)) return "skipped";
+                try {
+                  await github.rest.repos.createCommitStatus({
+                    ...context.repo, sha: process.env.SHA, state, context: statusContext,
+                    description, target_url: process.env.RUN_URL,
+                  });
+                  return "written";
+                } catch (error) {
+                  if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+                  await sleep(2000 * attempt);
+                }
               }
             }
-            if (superseded) {
+            // 同じ head の後続 run がこのチェックを一度でも書いていたら、古い結果で戻さない。
+            // 前回の run の結果は、今回の結果で確定させる
+            if (await writeOwnedStatus(statusContext, state, description) === "superseded") {
               core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
-            } else if (ownershipUnknown) {
-              // 確かめられなかったときは、マージを止める向きの状態 (failure・error) だけ書く。
-              // success は書かず、ジョブを失敗させて再実行できるようにする
-              if (state === "success") {
-                core.setFailed("チェックの履歴を取得できず、success を書けませんでした。失敗したジョブを再実行してください");
-              } else {
-                await withRetry(() => github.rest.repos.createCommitStatus({
-                  ...repo, sha: SHA, state, context: statusContext,
-                  description, target_url: RUN_URL,
-                }));
-              }
             }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
@@ -1538,35 +1533,48 @@ jobs:
           FINDINGS_STATE: ${{ inputs.findings_state }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
-          # 一時的な API エラー (5xx・レート制限) は再試行する
-          retries: 3
           script: |
-            const { SHA, FINDINGS, FINDINGS_STATE, RUN_URL } = process.env;
-            // 自分より後に開始した run が codex-review を更新していたら触らない。
-            // 一覧を取れなかったときは、マージを止める向きの状態だけ書く (投稿ステップと同じ)
-            let statuses = [];
-            try {
-              statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                ...context.repo, ref: SHA, per_page: 100,
-              });
-            } catch (error) {
-              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
-              // success は書かず、ステップを失敗させて再実行できるようにする
-              if (FINDINGS_STATE === "success") throw new Error("チェックの履歴を取得できず、codex-review を書けませんでした");
-            }
+            const { FINDINGS, FINDINGS_STATE } = process.env;
+            // --- チェックの書き込み (開始・投稿・省略・未実行・finalize で同じ手順) ---
             // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
             // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
             const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
             const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
               !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
-            // 履歴全体で、新しい run の codex-review が1件でもあれば触らない
-            if (statuses.some(item => item.context === "codex-review" &&
-                runId(item.target_url, item) > runId(RUN_URL))) return;
-            await github.rest.repos.createCommitStatus({
-              ...context.repo, sha: SHA, state: FINDINGS_STATE, context: "codex-review",
-              description: `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`,
-              target_url: RUN_URL,
-            });
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+            // 書き込むたびに履歴を読み直し、自分より後に始まった run (run ID が大きい) が一度でも
+            // 書いた context には書かない (再送の待ち時間に後続 run が書いた場合も含む)。
+            // 履歴を取れないときは、どの状態も書かずに例外にする (ジョブを失敗させ、再実行で書き直す)。
+            // API の自動再試行 (github-script の retries) は履歴を読み直さないので使わない
+            async function writeOwnedStatus(statusContext, state, description, skipIf = () => false) {
+              for (let attempt = 1; ; attempt++) {
+                let history;
+                try {
+                  history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                    ...context.repo, ref: process.env.SHA, per_page: 100,
+                  });
+                } catch (error) {
+                  if (attempt < 3) { await sleep(2000 * attempt); continue; }
+                  throw new Error(`チェックの履歴を取得できず、${statusContext} を書けませんでした。` +
+                    `失敗したジョブを再実行してください (${error.message})`);
+                }
+                if (history.some(item => item.context === statusContext &&
+                    runId(item.target_url, item) > runId(process.env.RUN_URL))) return "superseded";
+                if (skipIf(history)) return "skipped";
+                try {
+                  await github.rest.repos.createCommitStatus({
+                    ...context.repo, sha: process.env.SHA, state, context: statusContext,
+                    description, target_url: process.env.RUN_URL,
+                  });
+                  return "written";
+                } catch (error) {
+                  if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+                  await sleep(2000 * attempt);
+                }
+              }
+            }
+            await writeOwnedStatus("codex-review", FINDINGS_STATE,
+              `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`);
 
       # Claude が投稿まで終えなかったとき (認証切れ・JSON 不正・投稿失敗など) は
       # Codex を走らせない。開始時に pending にした codex-review を理由付きで確定させる
@@ -1581,32 +1589,46 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
-          # 一時的な API エラー (5xx・レート制限) は再試行する
-          retries: 3
           script: |
-            // 自分より後に開始した run が codex-review を更新していたら触らない。
-            // 一覧を取れなかったときは書く (error はマージを止める向きなので)
-            let statuses = [];
-            try {
-              statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                ...context.repo, ref: process.env.SHA, per_page: 100,
-              });
-            } catch (error) {
-              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
-            }
+            // --- チェックの書き込み (開始・投稿・省略・未実行・finalize で同じ手順) ---
             // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
             // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
             const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
             const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
               !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
-            // 履歴全体で、新しい run の codex-review が1件でもあれば触らない
-            if (statuses.some(item => item.context === "codex-review" &&
-                runId(item.target_url, item) > runId(process.env.RUN_URL))) return;
-            await github.rest.repos.createCommitStatus({
-              ...context.repo, sha: process.env.SHA, state: "error", context: "codex-review",
-              description: "Claude のレビューが完了しなかったため未実行",
-              target_url: process.env.RUN_URL,
-            });
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+            // 書き込むたびに履歴を読み直し、自分より後に始まった run (run ID が大きい) が一度でも
+            // 書いた context には書かない (再送の待ち時間に後続 run が書いた場合も含む)。
+            // 履歴を取れないときは、どの状態も書かずに例外にする (ジョブを失敗させ、再実行で書き直す)。
+            // API の自動再試行 (github-script の retries) は履歴を読み直さないので使わない
+            async function writeOwnedStatus(statusContext, state, description, skipIf = () => false) {
+              for (let attempt = 1; ; attempt++) {
+                let history;
+                try {
+                  history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                    ...context.repo, ref: process.env.SHA, per_page: 100,
+                  });
+                } catch (error) {
+                  if (attempt < 3) { await sleep(2000 * attempt); continue; }
+                  throw new Error(`チェックの履歴を取得できず、${statusContext} を書けませんでした。` +
+                    `失敗したジョブを再実行してください (${error.message})`);
+                }
+                if (history.some(item => item.context === statusContext &&
+                    runId(item.target_url, item) > runId(process.env.RUN_URL))) return "superseded";
+                if (skipIf(history)) return "skipped";
+                try {
+                  await github.rest.repos.createCommitStatus({
+                    ...context.repo, sha: process.env.SHA, state, context: statusContext,
+                    description, target_url: process.env.RUN_URL,
+                  });
+                  return "written";
+                } catch (error) {
+                  if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+                  await sleep(2000 * attempt);
+                }
+              }
+            }
+            await writeOwnedStatus("codex-review", "error", "Claude のレビューが完了しなかったため未実行");
 
       - name: Remove Codex authentication
         if: ${{ always() && matrix.reviewer == 'codex' }}
@@ -1672,31 +1694,57 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
         with:
-          # 一時的な API エラー (5xx・レート制限) は再試行する
-          retries: 3
           script: |
-            const { SHA, RUN_URL, CODEX_ENABLED } = process.env;
+            const { RUN_URL, CODEX_ENABLED } = process.env;
+            // --- チェックの書き込み (開始・投稿・省略・未実行・finalize で同じ手順) ---
             // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
             // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
             const runsPrefix = process.env.RUN_URL.replace(/\d+$/, "");
             const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
               !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+            // 書き込むたびに履歴を読み直し、自分より後に始まった run (run ID が大きい) が一度でも
+            // 書いた context には書かない (再送の待ち時間に後続 run が書いた場合も含む)。
+            // 履歴を取れないときは、どの状態も書かずに例外にする (ジョブを失敗させ、再実行で書き直す)。
+            // API の自動再試行 (github-script の retries) は履歴を読み直さないので使わない
+            async function writeOwnedStatus(statusContext, state, description, skipIf = () => false) {
+              for (let attempt = 1; ; attempt++) {
+                let history;
+                try {
+                  history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                    ...context.repo, ref: process.env.SHA, per_page: 100,
+                  });
+                } catch (error) {
+                  if (attempt < 3) { await sleep(2000 * attempt); continue; }
+                  throw new Error(`チェックの履歴を取得できず、${statusContext} を書けませんでした。` +
+                    `失敗したジョブを再実行してください (${error.message})`);
+                }
+                if (history.some(item => item.context === statusContext &&
+                    runId(item.target_url, item) > runId(process.env.RUN_URL))) return "superseded";
+                if (skipIf(history)) return "skipped";
+                try {
+                  await github.rest.repos.createCommitStatus({
+                    ...context.repo, sha: process.env.SHA, state, context: statusContext,
+                    description, target_url: process.env.RUN_URL,
+                  });
+                  return "written";
+                } catch (error) {
+                  if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+                  await sleep(2000 * attempt);
+                }
+              }
+            }
             const contexts = CODEX_ENABLED === "true" ? ["claude-review", "codex-review"] : ["claude-review"];
             for (const statusContext of contexts) {
-              // 書き込みの直前に取り直す。新しい順に返るので、文脈ごとに最初のものが最新
-              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-                ...context.repo, ref: SHA, per_page: 100,
-              });
-              const latest = statuses.find(item => item.context === statusContext);
-              // この run が確定させたもの、自分より後に始まった run のものは触らない。
-              // この run の pending のまま・前回の run の結果のまま・まだ無い (開始時の
-              // pending を書けなかった) ときは、この run の判定が出ていないので error にする
-              if (statuses.some(item => item.context === statusContext &&
-                  runId(item.target_url, item) > runId(RUN_URL))) continue;
-              if (latest?.target_url === RUN_URL && latest.state !== "pending") continue;
-              await github.rest.repos.createCommitStatus({
-                ...context.repo, sha: SHA, state: "error", context: statusContext,
-                description: "レビューが完了しませんでした (キャンセル・タイムアウトなど)",
-                target_url: RUN_URL,
-              });
+              // この run が確定させたもの (pending 以外) は触らない。この run の pending のまま・
+              // 前回の run の結果のまま・まだ無いときは、この run の判定が出ていないので error にする。
+              // 既知の制限: 判定は run 単位で attempt を区別しない。Re-run failed jobs では成功した
+              // ジョブの結果が前の attempt から引き継がれ、attempt 単位で見ると再実行していない
+              // ジョブの正しい結果まで error になるため。再実行の開始時に pending を書けず、さらに
+              // 判定前に止まった場合は、同じ run・同じ head で前の attempt が出した結果が残る
+              await writeOwnedStatus(statusContext, "error", "レビューが完了しませんでした (キャンセル・タイムアウトなど)",
+                history => {
+                  const latest = history.find(item => item.context === statusContext);
+                  return latest?.target_url === RUN_URL && latest.state !== "pending";
+                });
             }
