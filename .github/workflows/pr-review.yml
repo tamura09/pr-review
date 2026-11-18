@@ -214,7 +214,8 @@ jobs:
       # 前回の codex-review で揃って見えるのを防ぐため
       - name: Mark reviews as in progress
         # gh の無いランナー (runs_on のセルフホスト) でも動くよう、最終ステータスと同じく
-        # github-script で投稿する
+        # github-script で投稿する。pending にできなくてもレビューは止めない
+        continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           SHA: ${{ github.event.pull_request.head.sha }}
@@ -229,9 +230,15 @@ jobs:
               statuses.push(["codex-review", "Claude のレビュー待ち"]);
             }
             // ランナー待ちで遅れて始まった古い run が、新しい run の判定を pending に戻さない
-            const current = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-              ...context.repo, ref: SHA, per_page: 100,
-            });
+            // 一覧を取れなかったときは書く (投稿ステップと同じ方針)
+            let current = [];
+            try {
+              current = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                ...context.repo, ref: SHA, per_page: 100,
+              });
+            } catch (error) {
+              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
+            }
             const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
             for (const [statusContext, description] of statuses) {
               const latest = current.find(item => item.context === statusContext);
@@ -1463,10 +1470,16 @@ jobs:
         with:
           script: |
             const { SHA, FINDINGS, FINDINGS_STATE, RUN_URL } = process.env;
-            // 自分より後に開始した run が codex-review を更新していたら触らない
-            const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-              ...context.repo, ref: SHA, per_page: 100,
-            });
+            // 自分より後に開始した run が codex-review を更新していたら触らない。
+            // 一覧を取れなかったときは書く (投稿ステップと同じ方針)
+            let statuses = [];
+            try {
+              statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                ...context.repo, ref: SHA, per_page: 100,
+              });
+            } catch (error) {
+              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
+            }
             const latest = statuses.find(item => item.context === "codex-review");
             const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
             if (runId(latest?.target_url) > runId(RUN_URL)) return;
@@ -1490,10 +1503,16 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
           script: |
-            // 自分より後に開始した run が codex-review を更新していたら触らない
-            const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-              ...context.repo, ref: process.env.SHA, per_page: 100,
-            });
+            // 自分より後に開始した run が codex-review を更新していたら触らない。
+            // 一覧を取れなかったときは書く (投稿ステップと同じ方針)
+            let statuses = [];
+            try {
+              statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                ...context.repo, ref: process.env.SHA, per_page: 100,
+              });
+            } catch (error) {
+              core.warning(`チェックの最新状態を取得できませんでした: ${error.message}`);
+            }
             const latest = statuses.find(item => item.context === "codex-review");
             const runId = url => Number(/\/actions\/runs\/(\d+)/.exec(url || "")?.[1] ?? NaN);
             if (runId(latest?.target_url) > runId(process.env.RUN_URL)) return;

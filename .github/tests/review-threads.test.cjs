@@ -1499,6 +1499,16 @@ test('the start step does not reset a check that a later run already owns', asyn
   await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review']);
+  // 一覧の取得に失敗しても止めずに pending を書く
+  created.length = 0;
+  const failing = { ...github, paginate: async () => { throw new Error('Simulated list failure'); } };
+  const warnings = [];
+  await start(failing, { repo: { owner: 'example', repo: 'repo' } }, { warning: message => warnings.push(message) },
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl } }, require);
+  assert.deepEqual(created.map(item => item.context), ['claude-review', 'codex-review']);
+  assert.equal(warnings.length, 1);
+  assert.match(workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0],
+    /continue-on-error: true/);
 });
 
 test('a Codex diff preparation failure is reported with its reason', async () => {
