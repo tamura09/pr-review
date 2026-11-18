@@ -372,7 +372,8 @@ PR のチェック一覧にも `claude-review` と `codex-review` を出す。Cl
 Codex を走らせなかったときは、`codex-review` を「未実行」として、指摘ありの
 `claude-review` と同じ状態 (`findings_state`、既定は `failure`) で出す。`codex-review` を
 `claude-review` より緩くも厳しくもしないため。`findings_state: success` にすると、
-Claude の指摘を残したまま、Codex のレビューを経ずにマージできる。
+Codex を実行しないまま両方のチェックが成功になる。Claude の指摘スレッドが未解決のまま
+マージできるかは、ブランチ保護の **Require conversation resolution before merging** に従う。
 
 | 状態 | 表示 |
 | --- | --- |
