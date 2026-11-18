@@ -203,6 +203,7 @@ jobs:
       # 投稿まで終わったときだけ入る。エラー時は空
       findings: ${{ steps.publish_review.outputs.findings }}
       label: ${{ steps.publish_review.outputs.label }}
+      diff_digest: ${{ steps.publish_review.outputs.diff_digest }}
       # 再試行で差分を取り直さなかったときは、保存した結果の値を使う
       merge_base: ${{ steps.review_diff.outputs.merge_base || steps.restore_review.outputs.merge_base }}
     steps: &review_steps
@@ -987,6 +988,7 @@ jobs:
             const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
             let secretsChecked = false;
             let findingsCount;
+            let diffDigest;
             let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
@@ -1055,6 +1057,13 @@ jobs:
               publication.secret_fingerprints = fingerprints;
               if (cleanComment === "combined") publication.claude_label = claudeLabel;
               publication.merge_base = restoredMergeBase ?? process.env.MERGE_BASE;
+              // モデルに渡した差分そのもののダイジェスト。merge-base が同じでも、ランナーの
+              // Git 設定 (diff 属性・bigFileThreshold など) で差分の中身は変わりうる
+              diffDigest = createHash("sha256")
+                .update(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/pr.diff")))
+                .update("\0")
+                .update(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/files.z")))
+                .digest("hex");
               function assertNoSecrets(text) {
                 for (const { length, sha256 } of fingerprints) {
                   if (!Number.isSafeInteger(length) || length < 1 || !/^[a-f0-9]{64}$/.test(sha256)) {
@@ -1220,6 +1229,9 @@ jobs:
                   publication.merge_base !== process.env.REVIEW_BASE_SHA)) {
                 throw new Error("Claude と Codex の差分の基点が一致しません。新しい workflow run で再レビューしてください");
               }
+              if (cleanComment === "combined" && diffDigest !== process.env.REVIEW_DIFF_DIGEST) {
+                throw new Error("Claude と Codex に渡した差分が一致しません。新しい workflow run で再レビューしてください");
+              }
               const verdict = findings.length
                 ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
                 : combined ? "**✅ 指摘なし** (Claude・Codex)" : "**✅ 指摘なし**";
@@ -1368,6 +1380,7 @@ jobs:
               core.setOutput("findings", String(findingsCount));
               // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
               core.setOutput("label", REVIEWER);
+              core.setOutput("diff_digest", diffDigest);
             }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
@@ -1460,6 +1473,7 @@ jobs:
     env:
       CLAUDE_LABEL: ${{ needs.review.outputs.label }}
       REVIEW_BASE_SHA: ${{ needs.review.outputs.merge_base }}
+      REVIEW_DIFF_DIGEST: ${{ needs.review.outputs.diff_digest }}
     steps: *review_steps
 
   # この run が開始時に pending にしたチェックが、終了時にまだ pending なら error で
@@ -1469,6 +1483,9 @@ jobs:
   finalize:
     needs: [review, codex]
     if: always() && needs.review.result != 'skipped'
+    # commit status の一覧取得と作成しか呼ばない
+    permissions:
+      statuses: write
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
     steps:
