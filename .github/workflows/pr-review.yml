@@ -1071,6 +1071,7 @@ jobs:
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
           CODEX_DIFF_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
           RESTORE_OUTCOME: ${{ steps.restore_review.outcome }}
@@ -1113,6 +1114,8 @@ jobs:
             let secretsChecked = false;
             let findingsCount;
             let supersededRetry = false;
+            // 見送った理由。head が動いたとき (古い SHA) は null で、チェックも書かない
+            let supersedeReason = null;
             let diffDigest;
             let savePublication = () => {};
             let state = "error";
@@ -1406,15 +1409,21 @@ jobs:
               const laterRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
                 ...repo, workflow_id: thisRun.workflow_id, head_sha: SHA, per_page: 100,
               });
-              const superseded = currentPr.head?.sha !== SHA ||
-                // ベースブランチを変えた PR では差分が変わる
-                currentPr.base?.ref !== process.env.BASE_REF ||
-                laterRuns.some(item => item.id > context.runId &&
+              const headMoved = currentPr.head?.sha !== SHA;
+              // ベースブランチを変えた PR では差分が変わる
+              const baseChanged = currentPr.base?.ref !== process.env.BASE_REF;
+              const laterRun = laterRuns.some(item => item.id > context.runId &&
                   (item.pull_requests || []).some(pr => pr.number === issue_number)) ||
                 [...prReviews, ...prComments].some(item => isPublisher(item) &&
                   item.body?.includes(`<!-- pr-review:head:${SHA} -->`) &&
                   item.body.includes("<!-- pr-review:summary:") &&
                   runIdOf(item.body) > ownRunId);
+              const superseded = headMoved || baseChanged || laterRun;
+              if (!headMoved) {
+                supersedeReason = baseChanged
+                  ? "ベースブランチが変わったため未投稿。push か close / reopen で再レビューしてください"
+                  : "同じ head への新しい run があるため、この run の結果は投稿しません";
+              }
               if (superseded) {
                 supersededRetry = true;
                 core.warning("PR の head・ベースが動いたか、同じ head への新しい run があるため、この run の結果を投稿しません");
@@ -1533,8 +1542,18 @@ jobs:
 
             // 同じ head の後続 run がこのチェックを一度でも書いていたら、古い結果で戻さない。
             // 前回の run の結果は、今回の結果で確定させる
-            // 古い run の再実行で投稿を見送ったときは、チェックも書かない
-            if (supersededRetry) core.setOutput("superseded", "true");
+            // 古い run の再実行で投稿を見送ったときは、判定のチェックは書かない。head が同じまま
+            // (ベースの変更・新しい run) なら、理由付きの error で確定させる (finalize の
+            // 「キャンセル・タイムアウト」と取り違えないため)。Claude は Codex の分も確定させる。
+            // 新しい run がすでに書いていれば writeOwnedStatus が書かない
+            if (supersededRetry) {
+              core.setOutput("superseded", "true");
+              if (supersedeReason) {
+                const contexts = !isCodex && process.env.CODEX_ENABLED === "true"
+                  ? [statusContext, "codex-review"] : [statusContext];
+                for (const item of contexts) await writeOwnedStatus(item, "error", supersedeReason);
+              }
+            }
             const written = supersededRetry ? "superseded" : await writeOwnedStatus(statusContext, state, description);
             if (written === "superseded") {
               core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);

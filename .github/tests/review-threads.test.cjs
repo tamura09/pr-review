@@ -1597,7 +1597,7 @@ test('an old run does not post after the PR head moved or a newer run reviewed t
   const newer = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [newerSummary] } });
   assert.equal(newer.server.issueComments.length, 1);
   assert.equal(newer.outputs.findings, undefined);
-  assert.equal(newer.status, undefined);
+  assert.equal(newer.status.state, 'error');
   // モデルの要約に含まれる run URL では判定しない (フッターの run URL だけを使う)
   const quoted = { ...newerSummary, body: newerSummary.body
     .replace('**✅ 指摘なし**', '**⚠️ 指摘 1件** — [参考](https://github.com/example/repo/actions/runs/999)')
@@ -1675,12 +1675,19 @@ test('finalize leaves an old head alone once the PR head has moved', async () =>
 test('an old run also stops for a base change or a later run without a summary, and lists are fetched once', async () => {
   const based = await run({ result, prBase: 'release' });
   assert.equal(based.server.reviews.length, 0);
-  assert.equal(based.status, undefined);
+  // head は同じなので、理由付きの error で確定させる
+  assert.equal(based.status.state, 'error');
+  assert.match(based.status.description, /ベースブランチが変わった/);
+  // Claude は Codex の分も同じ理由で確定させる
+  const basedClaude = await run({ isCodex: false, result, prBase: 'release', env: { CODEX_ENABLED: 'true' } });
+  assert.deepEqual(basedClaude.calls.filter(call => call.method === 'createCommitStatus').map(call => [call.params.context, call.params.state]),
+    [['claude-review', 'error'], ['codex-review', 'error']]);
   // サマリーを投稿できなかった新しい run も、この PR の run なら検出する
   const laterRun = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88,
     workflowRuns: [{ id: 124, pull_requests: [{ number: 7 }] }] } });
   assert.equal(laterRun.server.issueComments.length, 0);
-  assert.equal(laterRun.status, undefined);
+  assert.equal(laterRun.status.state, 'error');
+  assert.match(laterRun.status.description, /新しい run/);
   // 別の PR の新しい run では止めない
   const otherPrRun = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88,
     workflowRuns: [{ id: 124, pull_requests: [{ number: 8 }] }] } });
