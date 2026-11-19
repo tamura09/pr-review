@@ -1028,7 +1028,9 @@ jobs:
         run: |
           set -euo pipefail
           # 古い run の再実行で、PR の head かベースがもう動いていれば通知しない
-          if [ "$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.head.sha + " " + .base.ref')" != "${HEAD_SHA} ${BASE_REF}" ]; then
+          # 取得の失敗は if の条件の中だと set -e が効かず空文字で比べてしまうので、先に変数へ入れる
+          current="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.head.sha + " " + .base.ref')"
+          if [ "${current}" != "${HEAD_SHA} ${BASE_REF}" ]; then
             echo "PR の head かベースが動いているため、差分取得失敗を通知しません"
             exit 0
           fi

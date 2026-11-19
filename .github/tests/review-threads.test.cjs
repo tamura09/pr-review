@@ -1725,5 +1725,5 @@ test('a rewritten base history, or a moved head on a failure path, stops the old
   assert.equal(failed.status, undefined);
   assert.equal(failed.outputs.superseded, 'true');
   const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
-  assert.match(report, /\.head\.sha \+ " " \+ \.base\.ref/);
+  assert.match(report, /current="\$\(gh api [^\n]*\.head\.sha \+ " " \+ \.base\.ref'\)"\n\s+if \[ "\$\{current\}" != /);
 });
