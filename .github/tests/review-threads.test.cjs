@@ -1574,10 +1574,12 @@ test('Codex gating outputs are set only after claude-review is written, which is
   assert.equal(written.outputs.findings, '0');
 });
 
-test('a run superseded by a later run posts no review, comment, or status, and cancelled runs do not publish', async () => {
+test('a retry superseded by a later run posts nothing, a fresh run still posts, and cancelled runs do not publish', async () => {
   const later = { context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
-  for (const result of [{ summary: '', findings: [] }, undefined]) {
-    const output = await run({ ...(result ? { result } : {}), env: { CLEAN_COMMENT: 'own' },
+  for (const value of [{ summary: '', findings: [] }, result]) {
+    // 保存結果からの再試行
+    const output = await run({ result: value, restoredRaw: jsonBlock(value),
+      env: { CLEAN_COMMENT: 'own', RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' },
       server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
     assert.equal(output.server.reviews.length, 0);
     assert.equal(output.server.comments.length, 0);
@@ -1585,6 +1587,12 @@ test('a run superseded by a later run posts no review, comment, or status, and c
     assert.equal(output.status, undefined);
     assert.equal(output.outputs.findings, undefined);
   }
+  // 新規の実行では、履歴にある後続 run (同じ head の別の PR) で投稿を止めない
+  const fresh = await run({ isCodex: false, result, server: { reviews: [], comments: [], nextId: 88, statuses: [
+    { ...later, context: 'claude-review' }] } });
+  assert.equal(summaryReviews(fresh.server).length, 1);
+  assert.equal(fresh.status, undefined);
+  assert.equal(fresh.outputs.findings, String(result.findings.length));
   for (const name of ['Publish review threads and status', 'Mark Codex review as skipped']) {
     const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
     assert.match(section, /!cancelled\(\)/, name);
@@ -1620,4 +1628,10 @@ test('finalize ignores other posters and tries every context before failing', as
   const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper };
   await assert.rejects(finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require), /claude-review/);
   assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
+});
+
+test('the diff failure notice is only for a real failure, not a cancellation', () => {
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.match(report, /!cancelled\(\) &&/);
+  assert.match(report, /steps\.review_diff\.outcome == 'failure'/);
 });

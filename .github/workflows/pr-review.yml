@@ -1016,7 +1016,7 @@ jobs:
       # Codex は Claude と同じ差分を作れなかったとき (merge-base の引き継ぎ・差分の照合の
       # 失敗) にも止まる。Claude が0件だと PR には何も投稿されていないので、Codex も出す
       - name: Report PR diff preparation failure
-        if: ${{ always() && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome != 'success' }}
+        if: ${{ !cancelled() && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome == 'failure' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -1112,6 +1112,7 @@ jobs:
             const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
             let secretsChecked = false;
             let findingsCount;
+            let supersededRetry = false;
             let diffDigest;
             let savePublication = () => {};
             let state = "error";
@@ -1381,10 +1382,13 @@ jobs:
               }
               // マーカーだけでなく投稿者も確認する。通常コメントにも同じ判定を使う。
               const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
-              // 同じ head の後続 run がすでに判定を書いていたら、古い結果のレビューやコメントを
-              // 投稿しない (保存結果からの再試行で、新しいレビューの後に古い結果が付くのを防ぐ)
-              const superseded = await writeOwnedStatus.supersededFor(statusContext);
+              // 保存結果からの再試行で、同じ head の後続 run がすでに判定を書いていたら、古い結果の
+              // レビューやコメントを投稿しない (新しいレビューの後に古い結果が付くのを防ぐ)。
+              // 新規の実行では確かめない。同じ PR の run は呼び出し側の concurrency で重ならず、
+              // 履歴にある後続 run は同じ head の別の PR のもので、この PR の投稿を止める理由にならない
+              const superseded = restored && await writeOwnedStatus.supersededFor(statusContext);
               if (superseded) {
+                supersededRetry = true;
                 core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果を投稿しません`);
               } else if (findings.length) {
                 const params = { ...repo, pull_number: issue_number, per_page: 100 };
@@ -1506,9 +1510,11 @@ jobs:
             const written = await writeOwnedStatus(statusContext, state, description);
             if (written === "superseded") {
               core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
-            } else if (findingsCount !== undefined) {
+            }
+            if (findingsCount !== undefined && !supersededRetry) {
               // 後続の codex ジョブを走らせるかの判定に使う。0件の Claude はコメントを出さず
-              // claude-review が唯一の公開結果なので、それを書けたときだけ出す。
+              // claude-review が唯一の公開結果なので、それを書けたとき (後続 run が書いていて
+              // 書かなかったときを含む) だけ出す。書き込みが失敗すれば例外でここに来ない。
               // この後の artifact 保存などが失敗しても Codex は走る
               core.setOutput("findings", String(findingsCount));
               // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
