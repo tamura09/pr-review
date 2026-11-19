@@ -1447,24 +1447,25 @@ test('finalize turns only this run\'s still-pending checks into errors', async (
   ];
   const github = {
     paginate: async () => statuses,
-    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: 'reviewed-head' } } }) } },
   };
   const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper };
-  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require);
   assert.deepEqual(created.map(item => [item.context, item.state]), [['codex-review', 'error']]);
   // 後続の run (run ID が大きい) のチェックには触らない
   created.length = 0;
   statuses[0] = { context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
-  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require);
   assert.equal(created.length, 0);
   // 前回の run の結果のまま・まだ無いチェックは、この run の判定が出ていないので error にする
   created.length = 0;
   statuses.splice(0, statuses.length, { context: 'claude-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122', creator: bot });
-  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require);
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require);
   assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
   // Codex を使わない呼び出し側では codex-review を作らない
   created.length = 0;
-  await finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env: { ...env, CODEX_ENABLED: 'false' } }, require);
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env: { ...env, CODEX_ENABLED: 'false' } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review']);
   const job = workflow.slice(workflow.indexOf('\n  finalize:\n'));
   assert.match(job, /needs: \[review, codex\]/);
@@ -1581,12 +1582,18 @@ test('an old run does not post after the PR head moved or a newer run reviewed t
   assert.equal(moved.server.reviews.length, 0);
   assert.equal(moved.server.comments.length, 0);
   assert.equal(moved.outputs.findings, undefined);
+  // チェックも書かず、Codex の未実行も出さない
+  assert.equal(moved.status, undefined);
+  assert.equal(moved.outputs.superseded, 'true');
+  const notRun = workflow.slice(workflow.indexOf('      - name: Mark Codex review as not run')).split(/\n      - name: /)[0];
+  assert.match(notRun, /steps\.publish_review\.outputs\.superseded != 'true'/);
   // 同じ head に、この PR で自分より新しい run のサマリーがあれば投稿しない (保存結果の有無を問わない)
   const newerSummary = { id: 5, user: { login: 'github-actions[bot]', type: 'Bot' },
     body: '**✅ 指摘なし**\n\n---\n_Claude · x [Workflow run](https://github.com/example/repo/actions/runs/124)_\n<!-- pr-review:summary:abc -->\n<!-- pr-review:head:reviewed-head -->' };
   const newer = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [newerSummary] } });
   assert.equal(newer.server.issueComments.length, 1);
   assert.equal(newer.outputs.findings, undefined);
+  assert.equal(newer.status, undefined);
   // 古い run のサマリーや別の head のサマリーでは止めない
   for (const body of [newerSummary.body.replace('/runs/124', '/runs/122'), newerSummary.body.replace('head:reviewed-head', 'head:other-head')]) {
     const output = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [{ ...newerSummary, body }] } });
@@ -1627,10 +1634,10 @@ test('finalize ignores other posters and tries every context before failing', as
     rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => {
       created.push(params);
       if (params.context === 'claude-review') throw Object.assign(new Error('Validation Failed'), { status: 422 });
-    } } },
+    } }, pulls: { get: async () => ({ data: { head: { sha: 'reviewed-head' } } }) } },
   };
   const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper };
-  await assert.rejects(finalize(github, { repo: { owner: 'example', repo: 'repo' } }, {}, { env }, require), /claude-review/);
+  await assert.rejects(finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require), /claude-review/);
   assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
 });
 
@@ -1638,4 +1645,19 @@ test('the diff failure notice is only for a real failure, not a cancellation', (
   const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
   assert.match(report, /!cancelled\(\) &&/);
   assert.match(report, /steps\.review_diff\.outcome == 'failure'/);
+});
+
+test('finalize leaves an old head alone once the PR head has moved', async () => {
+  const finalizeScript = workflow.match(/- name: Close out pending checks[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);
+  const created = [];
+  const github = {
+    paginate: async () => [],
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: 'newer-head' } } }) } },
+  };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
+    { env: { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.equal(created.length, 0);
+  assert.match(workflow.slice(workflow.indexOf('\n  finalize:\n')), /pull-requests: read/);
 });

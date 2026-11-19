@@ -1502,7 +1502,9 @@ jobs:
 
             // 同じ head の後続 run がこのチェックを一度でも書いていたら、古い結果で戻さない。
             // 前回の run の結果は、今回の結果で確定させる
-            const written = await writeOwnedStatus(statusContext, state, description);
+            // 古い run の再実行で投稿を見送ったときは、チェックも書かない
+            if (supersededRetry) core.setOutput("superseded", "true");
+            const written = supersededRetry ? "superseded" : await writeOwnedStatus(statusContext, state, description);
             if (written === "superseded") {
               core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
             }
@@ -1553,7 +1555,8 @@ jobs:
           !cancelled() &&
           matrix.reviewer == 'claude' &&
           inputs.codex_review && inputs.codex_fallback &&
-          steps.publish_review.outputs.findings == ''
+          steps.publish_review.outputs.findings == '' &&
+          steps.publish_review.outputs.superseded != 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           SHA: ${{ github.event.pull_request.head.sha }}
@@ -1615,9 +1618,10 @@ jobs:
   finalize:
     needs: [review, codex]
     if: always() && needs.review.result != 'skipped'
-    # commit status の一覧取得と作成しか呼ばない
+    # commit status の一覧取得と作成、PR の head の確認しか呼ばない
     permissions:
       statuses: write
+      pull-requests: read
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
     steps:
@@ -1629,7 +1633,15 @@ jobs:
           CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
         with:
           script: |
-            const { RUN_URL, CODEX_ENABLED } = process.env;
+            const { RUN_URL, CODEX_ENABLED, SHA } = process.env;
+            // 古い run の再実行で PR の head がもう動いていれば、古い SHA のチェックには触らない
+            const { data: currentPr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: context.payload.pull_request.number,
+            });
+            if (currentPr.head?.sha !== SHA) {
+              core.info("PR の head が動いているため、古い head のチェックは確定させません");
+              return;
+            }
             // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
             const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
             const contexts = CODEX_ENABLED === "true" ? ["claude-review", "codex-review"] : ["claude-review"];
