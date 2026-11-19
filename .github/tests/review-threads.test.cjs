@@ -58,7 +58,7 @@ async function run(options = {}) {
   writeFileSync(join(tempDir, 'pr-review/pr.diff'), options.diff ?? defaultDiff);
   writeFileSync(join(tempDir, 'pr-review/files.z'), options.files ?? 'M\0src/example.ts\0');
   const env = {
-    RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken, PR_REVIEW_STATUS_HELPER: statusHelper,
+    RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken, PR_REVIEW_STATUS_HELPER: statusHelper, BASE_REF: 'main',
     SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
     REVIEWER: isCodex ? 'Codex · test-model · effort medium' : 'Claude · test-model · effort medium',
     IS_CODEX: String(isCodex), REVIEW_DIFF_OUTCOME: 'success',
@@ -124,24 +124,26 @@ async function run(options = {}) {
       fetches.push({ method, params });
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
       if (method === 'listCommitStatusesForRef') return structuredClone(server.statuses ?? []);
+      if (method === 'listWorkflowRuns') return structuredClone(server.workflowRuns ?? []);
       const rows = method === 'listIssueComments' ? server.issueComments : method === 'listReviews' ? server.reviews : method === 'listCommentsForReview'
         ? server.comments.filter(comment => comment.pull_request_review_id === params.review_id) : server.comments;
       return structuredClone(rows);
     },
     rest: {
-      pulls: { get: async () => ({ data: { head: { sha: options.prHead ?? 'reviewed-head' } } }),
+      pulls: { get: async () => ({ data: { head: { sha: options.prHead ?? 'reviewed-head' }, base: { ref: options.prBase ?? 'main' } } }),
         createReview: api('createReview'), createReviewComment: api('createReviewComment'),
         updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments',
         listCommentsForReview: 'listCommentsForReview' },
       issues: { createComment: api('createComment'), listComments: 'listIssueComments' },
       repos: { createCommitStatus: api('createCommitStatus'), listCommitStatusesForRef: 'listCommitStatusesForRef' },
+      actions: { getWorkflowRun: async () => ({ data: { workflow_id: 1 } }), listWorkflowRuns: 'listWorkflowRuns' },
     },
   };
   try {
     let thrown;
     const outputs = {};
     try { await publish(github, {
-      repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } },
+      repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } }, runId: 123,
     }, { error: message => errors.push(message), setFailed: message => failures.push(message), warning: () => {},
       setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
@@ -1509,21 +1511,23 @@ test('the start step does not reset a check that a later run already owns', asyn
   const startScript = workflow.match(/- name: Mark reviews as in progress[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
   const start = new AsyncFunction('github', 'context', 'core', 'process', 'require', startScript);
   const created = [];
+  let prHead = 'reviewed-head';
   const github = {
     paginate: async () => [{ context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot }],
-    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } } },
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: prHead } } }) } },
   };
-  await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
+  await start(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'codex', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.equal(created.length, 0);
-  await start(github, { repo: { owner: 'example', repo: 'repo' } }, {},
+  await start(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review']);
   // 履歴を取れないときは pending にしない (後続 run の確定結果を戻さないため)。ステップは止めない
   created.length = 0;
   const failing = { ...github, paginate: async () => { throw new Error('Simulated list failure'); } };
   const warnings = [];
-  await start(failing, { repo: { owner: 'example', repo: 'repo' } }, { warning: message => warnings.push(message) },
+  await start(failing, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { warning: message => warnings.push(message) },
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.deepEqual(created, []);
   assert.equal(warnings.length, 2);
@@ -1532,7 +1536,7 @@ test('the start step does not reset a check that a later run already owns', asyn
     { context: 'claude-review', state: 'success', target_url: 'https://github.com/other/repo/actions/runs/999', creator: bot },
     { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/999', creator: { login: 'other-app[bot]' } },
   ] };
-  await start(foreign, { repo: { owner: 'example', repo: 'repo' } }, {},
+  await start(foreign, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.deepEqual(created.map(item => item.context), ['claude-review', 'codex-review']);
   assert.match(workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0],
@@ -1666,4 +1670,38 @@ test('finalize leaves an old head alone once the PR head has moved', async () =>
     { env: { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.equal(created.length, 0);
   assert.match(workflow.slice(workflow.indexOf('\n  finalize:\n')), /pull-requests: read/);
+});
+
+test('an old run also stops for a base change or a later run without a summary, and lists are fetched once', async () => {
+  const based = await run({ result, prBase: 'release' });
+  assert.equal(based.server.reviews.length, 0);
+  assert.equal(based.status, undefined);
+  // サマリーを投稿できなかった新しい run も、この PR の run なら検出する
+  const laterRun = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88,
+    workflowRuns: [{ id: 124, pull_requests: [{ number: 7 }] }] } });
+  assert.equal(laterRun.server.issueComments.length, 0);
+  assert.equal(laterRun.status, undefined);
+  // 別の PR の新しい run では止めない
+  const otherPrRun = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88,
+    workflowRuns: [{ id: 124, pull_requests: [{ number: 8 }] }] } });
+  assert.equal(otherPrRun.server.issueComments.length, 1);
+  // 投稿前の確認で取ったレビュー・コメント一覧を使い回す
+  const once = await run({ result });
+  assert.equal(once.fetches.filter(fetch => fetch.method === 'listReviews').length, 1);
+  const onceClean = await run({ result: { summary: '', findings: [] } });
+  assert.equal(onceClean.fetches.filter(fetch => fetch.method === 'listIssueComments').length, 1);
+});
+
+test('the start step leaves an old head alone once the PR head has moved', async () => {
+  const startScript = workflow.match(/- name: Mark reviews as in progress[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const start = new AsyncFunction('github', 'context', 'core', 'process', 'require', startScript);
+  const created = [];
+  const github = {
+    paginate: async () => [],
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: 'newer-head' } } }) } },
+  };
+  await start(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.equal(created.length, 0);
 });

@@ -279,6 +279,20 @@ jobs:
             const { REVIEWER_KIND, CODEX_ENABLED } = process.env;
             // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
             const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
+            // 古い head の run を再実行したときは、そのチェックを pending に戻さない (投稿ステップも
+            // finalize も古い head には書かないので、戻すと pending のまま残る)
+            try {
+              const { data: currentPr } = await github.rest.pulls.get({
+                ...context.repo, pull_number: context.payload.pull_request.number,
+              });
+              if (currentPr.head?.sha !== process.env.SHA) {
+                core.info("PR の head が動いているため、古い head のチェックを pending にしません");
+                return;
+              }
+            } catch (error) {
+              core.warning(`PR を取得できなかったため、pending にしません: ${error.message}`);
+              return;
+            }
             const statuses = [[`${REVIEWER_KIND}-review`, "レビュー中"]];
             if (REVIEWER_KIND === "claude" && CODEX_ENABLED === "true") {
               statuses.push(["codex-review", "Claude のレビュー待ち"]);
@@ -1056,6 +1070,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           CODEX_DIFF_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
           RESTORE_OUTCOME: ${{ steps.restore_review.outcome }}
@@ -1385,21 +1400,30 @@ jobs:
                 github.paginate(github.rest.pulls.listReviews, { ...repo, pull_number: issue_number, per_page: 100 }),
                 github.paginate(github.rest.issues.listComments, { ...repo, issue_number, per_page: 100 }),
               ]);
+              // 同じワークフロー・同じ head で、この PR に対する自分より新しい run があれば止める。
+              // サマリーを投稿できなかった新しい run (認証エラーなど) も検出できる
+              const { data: thisRun } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: context.runId });
+              const laterRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                ...repo, workflow_id: thisRun.workflow_id, head_sha: SHA, per_page: 100,
+              });
               const superseded = currentPr.head?.sha !== SHA ||
+                // ベースブランチを変えた PR では差分が変わる
+                currentPr.base?.ref !== process.env.BASE_REF ||
+                laterRuns.some(item => item.id > context.runId &&
+                  (item.pull_requests || []).some(pr => pr.number === issue_number)) ||
                 [...prReviews, ...prComments].some(item => isPublisher(item) &&
                   item.body?.includes(`<!-- pr-review:head:${SHA} -->`) &&
                   item.body.includes("<!-- pr-review:summary:") &&
                   runIdOf(item.body) > ownRunId);
               if (superseded) {
                 supersededRetry = true;
-                core.warning("PR の head が動いたか、同じ head への新しいレビューがあるため、この run の結果を投稿しません");
+                core.warning("PR の head・ベースが動いたか、同じ head への新しい run があるため、この run の結果を投稿しません");
               } else if (findings.length) {
                 const params = { ...repo, pull_number: issue_number, per_page: 100 };
                 // 再実行時は公開済みの同一指摘を再利用する。履歴はモデルには渡さない。
-                const [reviews, comments] = await Promise.all([
-                  github.paginate(github.rest.pulls.listReviews, params),
-                  github.paginate(github.rest.pulls.listReviewComments, params),
-                ]);
+                // レビュー一覧は投稿前の確認で取得済みのものを使う
+                const reviews = prReviews;
+                const comments = await github.paginate(github.rest.pulls.listReviewComments, params);
                 let review = reviews.find(item => isPublisher(item) &&
                   item.body?.includes(summaryMarker) && item.state !== "PENDING");
                 const remaining = [];
@@ -1479,9 +1503,8 @@ jobs:
                 // 続けて Codex が見る。指摘なしのコメントは Codex のジョブが両方の分を
                 // まとめて1件だけ出すので、ここでは何も投稿しない (チェックだけ出す)
               } else {
-                const comments = await github.paginate(github.rest.issues.listComments, {
-                  ...repo, issue_number, per_page: 100,
-                });
+                // コメント一覧は投稿前の確認で取得済みのものを使う
+                const comments = prComments;
                 let posted = comments.find(item => isPublisher(item) && item.body?.includes(summaryMarker));
                 if (!posted) {
                   ({ data: posted } = await github.rest.issues.createComment({ ...repo, issue_number, body: summary() }));

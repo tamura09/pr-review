@@ -582,9 +582,12 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
   run の重なり自体は、呼び出し側の `concurrency` (`cancel-in-progress: true`、
   examples/pr-review.yml の設定) で防ぐ前提。キャンセルされた run は判定もレビューも投稿せず、
   重なるのはその終了処理 (finalize) だけで、それは error しか書かない。古い run を再実行した
-  場合は、投稿の直前に PR を確かめ、head が動いていたり、同じ head への新しい run のサマリーが
-  あったりすれば、レビュー・コメント・チェックのどれも投稿しない (Codex の「未実行」も出さず、
-  PR の head が動いていれば `finalize` も古い head のチェックに触らない)。commit status には比較して書き込む API が無いので、読んでから
+  場合は、投稿の直前に PR を確かめ、head かベースブランチが動いていたり、同じ head でこの PR に
+  対する新しい run (サマリーを投稿できなかったものを含む) があったりすれば、レビュー・コメント・
+  チェックのどれも投稿しない (Codex の「未実行」も出さず、
+  PR の head が動いていれば、開始時の pending も `finalize` も古い head のチェックに触らない)。
+  ベースブランチの変更 (`edited`) では再レビューは起きないので、変えた後は push か
+  close / reopen で新しい run を起こす。commit status には比較して書き込む API が無いので、読んでから
   書くまでの間に割り込まれる可能性は残るが、その場合に残るのはマージを止める向きの error。
   `concurrency` を外した呼び出し側では、古い run の success が後続 run の結果を覆いうる。
   履歴を取れないとき (再試行後も) は、判定の書き込みではどの状態も書かずにジョブを失敗させる
