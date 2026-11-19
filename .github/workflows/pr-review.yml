@@ -1023,9 +1023,15 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REVIEWER: ${{ matrix.reviewer }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
           CODEX_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
         run: |
           set -euo pipefail
+          # 古い run の再実行で、PR の head かベースがもう動いていれば通知しない
+          if [ "$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.head.sha + " " + .base.ref')" != "${HEAD_SHA} ${BASE_REF}" ]; then
+            echo "PR の head かベースが動いているため、差分取得失敗を通知しません"
+            exit 0
+          fi
           # 失敗ジョブの再実行で同じ通知を重ねない。run・head・モデルの目印で照合する
           # grep -q で途中終了すると、gh が SIGPIPE で落ちて pipefail で偽になるので、
           # jq で絞り込んだ出力が空かどうかで判定する
@@ -1116,6 +1122,15 @@ jobs:
             let supersededRetry = false;
             // 見送った理由。head が動いたとき (古い SHA) は null で、チェックも書かない
             let supersedeReason = null;
+            // 古い head の run を再実行したときは、成功・失敗どちらの経路でも古い SHA に書かない。
+            // 復元やモデルの失敗で下の確認まで届かない場合があるので、最初に確かめる
+            let headMovedEarly = false;
+            try {
+              const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: issue_number });
+              headMovedEarly = pr.head?.sha !== SHA;
+            } catch (error) {
+              core.warning(`PR を取得できませんでした: ${error.message}`);
+            }
             let diffDigest;
             let savePublication = () => {};
             let state = "error";
@@ -1418,9 +1433,18 @@ jobs:
                   item.body?.includes(`<!-- pr-review:head:${SHA} -->`) &&
                   item.body.includes("<!-- pr-review:summary:") &&
                   runIdOf(item.body) > ownRunId);
-              const superseded = headMoved || baseChanged || laterRun;
+              // ベースの履歴が書き換わる (巻き戻しなど) と、名前が同じでも差分が変わる。
+              // 現在のベースと head の merge-base を、モデルに渡した差分の基点と比べる
+              let mergeBaseChanged = false;
+              if (!headMoved && !baseChanged) {
+                const { data: compared } = await github.rest.repos.compareCommitsWithBasehead({
+                  ...repo, basehead: `${currentPr.base.sha}...${SHA}`,
+                });
+                mergeBaseChanged = compared.merge_base_commit?.sha !== publication.merge_base;
+              }
+              const superseded = headMoved || baseChanged || mergeBaseChanged || laterRun;
               if (!headMoved) {
-                supersedeReason = baseChanged
+                supersedeReason = baseChanged || mergeBaseChanged
                   ? "ベースブランチが変わったため未投稿。push か close / reopen で再レビューしてください"
                   : "同じ head への新しい run があるため、この run の結果は投稿しません";
               }
@@ -1542,6 +1566,10 @@ jobs:
 
             // 同じ head の後続 run がこのチェックを一度でも書いていたら、古い結果で戻さない。
             // 前回の run の結果は、今回の結果で確定させる
+            if (headMovedEarly) {
+              supersededRetry = true;
+              supersedeReason = null;
+            }
             // 古い run の再実行で投稿を見送ったときは、判定のチェックは書かない。head が同じまま
             // (ベースの変更・新しい run) なら、理由付きの error で確定させる (finalize の
             // 「キャンセル・タイムアウト」と取り違えないため)。Claude は Codex の分も確定させる。

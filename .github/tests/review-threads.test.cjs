@@ -130,12 +130,13 @@ async function run(options = {}) {
       return structuredClone(rows);
     },
     rest: {
-      pulls: { get: async () => ({ data: { head: { sha: options.prHead ?? 'reviewed-head' }, base: { ref: options.prBase ?? 'main' } } }),
+      pulls: { get: async () => ({ data: { head: { sha: options.prHead ?? 'reviewed-head' }, base: { ref: options.prBase ?? 'main', sha: 'base-sha' } } }),
         createReview: api('createReview'), createReviewComment: api('createReviewComment'),
         updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments',
         listCommentsForReview: 'listCommentsForReview' },
       issues: { createComment: api('createComment'), listComments: 'listIssueComments' },
-      repos: { createCommitStatus: api('createCommitStatus'), listCommitStatusesForRef: 'listCommitStatusesForRef' },
+      repos: { createCommitStatus: api('createCommitStatus'), listCommitStatusesForRef: 'listCommitStatusesForRef',
+        compareCommitsWithBasehead: async () => ({ data: { merge_base_commit: { sha: 'prMergeBase' in options ? options.prMergeBase : env.MERGE_BASE } } }) },
       actions: { getWorkflowRun: async () => ({ data: { workflow_id: 1 } }), listWorkflowRuns: 'listWorkflowRuns' },
     },
   };
@@ -1339,7 +1340,7 @@ test('Codex posts one combined no-findings comment for both reviewers', async ()
   const recovered = await recover({ artifactFiles: failed.artifactFiles, env: { REVIEWER_KIND: 'codex' } });
   assert.equal(recovered.outputs.restored, 'true');
   const resumed = await run({ server: failed.server, restoredRaw: recovered.raw,
-    restoredMetadata: JSON.parse(failed.artifactFiles['publication.json']),
+    restoredMetadata: JSON.parse(failed.artifactFiles['publication.json']), prMergeBase: 'a'.repeat(40),
     env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · other · effort ', RESTORED: 'true', REVIEW_BASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_DIFF_DIGEST: defaultDiffDigest,
       REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
   assert.equal(resumed.failures.length, 0);
@@ -1711,4 +1712,18 @@ test('the start step leaves an old head alone once the PR head has moved', async
   await start(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
     { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
   assert.equal(created.length, 0);
+});
+
+test('a rewritten base history, or a moved head on a failure path, stops the old run', async () => {
+  // ベースの履歴が変わって merge-base が違えば、理由付きの error にして投稿しない
+  const rewound = await run({ result: { summary: '', findings: [] }, prMergeBase: 'b'.repeat(40), env: { MERGE_BASE: 'a'.repeat(40) } });
+  assert.equal(rewound.server.issueComments.length, 0);
+  assert.equal(rewound.status.state, 'error');
+  assert.match(rewound.status.description, /ベースブランチが変わった/);
+  // 復元やモデルの失敗の経路でも、head が動いていれば古い SHA に書かない
+  const failed = await run({ prHead: 'newer-head', env: { MODEL_OUTCOME: 'failure' } });
+  assert.equal(failed.status, undefined);
+  assert.equal(failed.outputs.superseded, 'true');
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.match(report, /\.head\.sha \+ " " \+ \.base\.ref/);
 });
