@@ -291,6 +291,10 @@ Claude と Codex を並列に走らせていた版の run と、この版の run
 古い保存結果を読む。更新前の run を再レビューしたいときは再実行せず、push か
 PR の close / reopen で新しい run を起こす。
 
+参照方法にかかわらず、同じ head にこの版の判定が付いた後は、並列版の run を再実行しない。
+並列版は後続 run の履歴を確かめずに、保存済みの結果で `claude-review` / `codex-review` を
+書き戻すので、新しい判定を古い結果で覆いうる。
+
 ## `v1` タグは main に自動で追従する
 
 タグの付け替えは [`.github/workflows/move-v1.yml`](./.github/workflows/move-v1.yml) が
@@ -577,8 +581,9 @@ Dependabot の PR もレビューしたい場合は、`schedule` で main 上か
   結果で戻さない。前回の run の結果は今回の結果で上書きする。再試行のたびに履歴を読み直す。
   run の重なり自体は、呼び出し側の `concurrency` (`cancel-in-progress: true`、
   examples/pr-review.yml の設定) で防ぐ前提。キャンセルされた run は判定もレビューも投稿せず、
-  重なるのはその終了処理 (finalize) だけで、それは error しか書かない。保存結果からの再試行でも、
-  後続 run がすでに判定を書いていれば、古い結果のレビュー・コメント・チェックは投稿しない。commit status には比較して書き込む API が無いので、読んでから
+  重なるのはその終了処理 (finalize) だけで、それは error しか書かない。古い run を再実行した
+  場合は、投稿の直前に PR を確かめ、head が動いていたり、同じ head への新しい run のサマリーが
+  あったりすれば、レビュー・コメント・チェックのどれも投稿しない。commit status には比較して書き込む API が無いので、読んでから
   書くまでの間に割り込まれる可能性は残るが、その場合に残るのはマージを止める向きの error。
   `concurrency` を外した呼び出し側では、古い run の success が後続 run の結果を覆いうる。
   履歴を取れないとき (再試行後も) は、判定の書き込みではどの状態も書かずにジョブを失敗させる

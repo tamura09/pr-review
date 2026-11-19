@@ -129,7 +129,8 @@ async function run(options = {}) {
       return structuredClone(rows);
     },
     rest: {
-      pulls: { createReview: api('createReview'), createReviewComment: api('createReviewComment'),
+      pulls: { get: async () => ({ data: { head: { sha: options.prHead ?? 'reviewed-head' } } }),
+        createReview: api('createReview'), createReviewComment: api('createReviewComment'),
         updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments',
         listCommentsForReview: 'listCommentsForReview' },
       issues: { createComment: api('createComment'), listComments: 'listIssueComments' },
@@ -830,7 +831,7 @@ test('failure to fetch batch thread URLs stops additional publication and recove
 });
 
 test('publication identities do not collide across reviewers, heads, or workflow runs', async () => {
-  for (const options of [{ isCodex: false }, { env: { SHA: 'another-head' } }, { env: { RUN_URL: runUrl + '4' } }]) {
+  for (const options of [{ isCodex: false }, { env: { SHA: 'another-head' }, prHead: 'another-head' }, { env: { RUN_URL: runUrl + '4' } }]) {
     const first = await run();
     const second = await run({ ...options, server: first.server });
     assert.equal(second.failures.length, 0);
@@ -845,8 +846,8 @@ for (const method of ['listReviews', 'listReviewComments']) {
     assert.equal(output.status.state, 'error');
     assert.equal(output.server.comments.length, 0);
     assert.equal(summaryReviews(output.server).length, 0);
-    // 最後のステータス投稿前の所有確認 (listCommitStatusesForRef) を除いた取得
-    assert.equal(output.fetches.filter(fetch => fetch.method !== 'listCommitStatusesForRef').length, 2);
+    // 投稿前の PR の確認 (listReviews・listIssueComments) の後で、失敗した取得で止まる
+    assert.ok(output.fetches.some(fetch => fetch.method === method));
     assert.ok(output.fetches.every(fetch => fetch.params.per_page === 100));
   });
 }
@@ -1574,25 +1575,28 @@ test('Codex gating outputs are set only after claude-review is written, which is
   assert.equal(written.outputs.findings, '0');
 });
 
-test('a retry superseded by a later run posts nothing, a fresh run still posts, and cancelled runs do not publish', async () => {
-  const later = { context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
-  for (const value of [{ summary: '', findings: [] }, result]) {
-    // 保存結果からの再試行
-    const output = await run({ result: value, restoredRaw: jsonBlock(value),
-      env: { CLEAN_COMMENT: 'own', RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' },
-      server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
-    assert.equal(output.server.reviews.length, 0);
-    assert.equal(output.server.comments.length, 0);
-    assert.equal(output.server.issueComments.length, 0);
-    assert.equal(output.status, undefined);
-    assert.equal(output.outputs.findings, undefined);
+test('an old run does not post after the PR head moved or a newer run reviewed the same head', async () => {
+  // PR の head が動いていれば投稿しない
+  const moved = await run({ result, prHead: 'newer-head' });
+  assert.equal(moved.server.reviews.length, 0);
+  assert.equal(moved.server.comments.length, 0);
+  assert.equal(moved.outputs.findings, undefined);
+  // 同じ head に、この PR で自分より新しい run のサマリーがあれば投稿しない (保存結果の有無を問わない)
+  const newerSummary = { id: 5, user: { login: 'github-actions[bot]', type: 'Bot' },
+    body: '**✅ 指摘なし**\n\n---\n_Claude · x [Workflow run](https://github.com/example/repo/actions/runs/124)_\n<!-- pr-review:summary:abc -->\n<!-- pr-review:head:reviewed-head -->' };
+  const newer = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [newerSummary] } });
+  assert.equal(newer.server.issueComments.length, 1);
+  assert.equal(newer.outputs.findings, undefined);
+  // 古い run のサマリーや別の head のサマリーでは止めない
+  for (const body of [newerSummary.body.replace('/runs/124', '/runs/122'), newerSummary.body.replace('head:reviewed-head', 'head:other-head')]) {
+    const output = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [{ ...newerSummary, body }] } });
+    assert.equal(output.server.issueComments.length, 2);
   }
-  // 新規の実行では、履歴にある後続 run (同じ head の別の PR) で投稿を止めない
-  const fresh = await run({ isCodex: false, result, server: { reviews: [], comments: [], nextId: 88, statuses: [
-    { ...later, context: 'claude-review' }] } });
-  assert.equal(summaryReviews(fresh.server).length, 1);
-  assert.equal(fresh.status, undefined);
-  assert.equal(fresh.outputs.findings, String(result.findings.length));
+  // 別の PR の run がチェックを書いていても (commit status は SHA 単位)、この PR の投稿は止めない
+  const later = { context: 'claude-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
+  const otherPr = await run({ isCodex: false, result, server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
+  assert.equal(summaryReviews(otherPr.server).length, 1);
+  assert.equal(otherPr.outputs.findings, String(result.findings.length));
   for (const name of ['Publish review threads and status', 'Mark Codex review as skipped']) {
     const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
     assert.match(section, /!cancelled\(\)/, name);

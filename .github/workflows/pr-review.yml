@@ -221,21 +221,6 @@ env:
           }
         }
       }
-      // 後続 run がこの context を一度でも書いていたら真。レビューやコメントを作る前の確認に使う
-      writeOwnedStatus.supersededFor = async statusContext => {
-        for (let attempt = 1; ; attempt++) {
-          try {
-            const history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
-              ...context.repo, ref: env.SHA, per_page: 100,
-            });
-            return history.some(item => item.context === statusContext &&
-              runId(item.target_url, item) > runId(env.RUN_URL));
-          } catch (error) {
-            if (attempt >= 3) throw new Error(`チェックの履歴を取得できませんでした (${error.message})`);
-            await sleep(2000 * attempt);
-          }
-        }
-      };
       return writeOwnedStatus;
     })
 
@@ -1382,14 +1367,24 @@ jobs:
               }
               // マーカーだけでなく投稿者も確認する。通常コメントにも同じ判定を使う。
               const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
-              // 保存結果からの再試行で、同じ head の後続 run がすでに判定を書いていたら、古い結果の
-              // レビューやコメントを投稿しない (新しいレビューの後に古い結果が付くのを防ぐ)。
-              // 新規の実行では確かめない。同じ PR の run は呼び出し側の concurrency で重ならず、
-              // 履歴にある後続 run は同じ head の別の PR のもので、この PR の投稿を止める理由にならない
-              const superseded = restored && await writeOwnedStatus.supersededFor(statusContext);
+              // 古い run の再実行が、新しいレビューの後に古い結果を付けないよう、投稿の直前に
+              // この PR 自体を確かめる (commit status は SHA 単位で、別の PR と区別できないので使わない)。
+              // - PR の head がレビューした SHA から動いていれば投稿しない
+              // - この PR に、同じ head への自分より新しい run のサマリーがあれば投稿しない
+              const runIdOf = text => Number(/\/actions\/runs\/(\d+)\)/.exec(text || "")?.[1] ?? NaN);
+              const { data: currentPr } = await github.rest.pulls.get({ ...repo, pull_number: issue_number });
+              const [prReviews, prComments] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, { ...repo, pull_number: issue_number, per_page: 100 }),
+                github.paginate(github.rest.issues.listComments, { ...repo, issue_number, per_page: 100 }),
+              ]);
+              const superseded = currentPr.head?.sha !== SHA ||
+                [...prReviews, ...prComments].some(item => isPublisher(item) &&
+                  item.body?.includes(`<!-- pr-review:head:${SHA} -->`) &&
+                  item.body.includes("<!-- pr-review:summary:") &&
+                  runIdOf(item.body) > runIdOf(`(${RUN_URL})`));
               if (superseded) {
                 supersededRetry = true;
-                core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果を投稿しません`);
+                core.warning("PR の head が動いたか、同じ head への新しいレビューがあるため、この run の結果を投稿しません");
               } else if (findings.length) {
                 const params = { ...repo, pull_number: issue_number, per_page: 100 };
                 // 再実行時は公開済みの同一指摘を再利用する。履歴はモデルには渡さない。
