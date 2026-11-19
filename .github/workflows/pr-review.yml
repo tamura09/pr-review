@@ -1,9 +1,16 @@
 # Claude と Codex (OpenAI) の2つで PR をレビューする再利用可能ワークフロー。
 #
-# 2つは matrix の別の leg として並列に走り、それぞれが件数サマリーと指摘ごとの
-# レビュースレッドを投稿して
-# PR のチェック一覧に claude-review / codex-review を出す。片方が落ちても
-# もう片方のレビューは届く。
+# まず Claude がレビューし、指摘が0件だったときだけ Codex が続けてレビューする。
+# Claude が何か挙げた PR は直してから再レビューになるので、その時点で別の
+# モデルに見せても同じ指摘を重ねるだけになる。Claude が見落としたものを拾う
+# 二人目として、Claude が「指摘なし」と言ったときにだけ Codex を使う。
+# PR のチェック一覧にはモデルごとに claude-review / codex-review を出す。
+# 指摘を出したモデルは件数サマリーと指摘ごとのレビュースレッドを投稿する。
+# 0件の Claude はコメントを出さず (チェックだけ)、Codex も0件なら Codex のジョブが
+# 両方の分の「指摘なし」を1件だけ投稿する。
+# Codex を走らせなかったときの codex-review は、Claude に指摘があったときは
+# 「未実行」として claude-review と同じ状態 (findings_state)、Claude が投稿まで
+# 終えなかったときは error で出す。
 #
 # effort はどちらも PR の変更行数で決める (小さい PR は low、普段は medium、
 # 大きい PR は high)。
@@ -54,14 +61,14 @@ on:
         required: false
         default: 40
       timeout_minutes:
-        description: "ジョブのタイムアウト (分)。Claude と Codex の leg それぞれに掛かる"
+        description: "ジョブのタイムアウト (分)。Claude と Codex のジョブそれぞれに掛かる"
         type: number
         required: false
         default: 30
       claude_timeout_minutes:
         description: >-
           Claude のステップのタイムアウト (分)。超えたら claude-review を error にする。
-          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが出ない
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られ、原因の分からない error になる
         type: number
         required: false
         default: 20
@@ -106,7 +113,7 @@ on:
         required: false
         default: "/pr-review/oauth-token"
       codex_review:
-        description: "Claude と並べて Codex でもレビューするか。false なら Claude だけ"
+        description: "Claude の指摘が0件のとき、続けて Codex でもレビューするか。false なら Claude だけ"
         type: boolean
         required: false
         default: true
@@ -120,7 +127,7 @@ on:
         description: "Codex のレビューに使う OpenAI モデル"
         type: string
         required: false
-        default: "gpt-6.1-sol"
+        default: "gpt-6.2-astra"
       codex_effort:
         description: >-
           Codex の reasoning effort (low / medium / high / xhigh / max)。
@@ -131,7 +138,7 @@ on:
       codex_timeout_minutes:
         description: >-
           Codex のステップのタイムアウト (分)。超えたら codex-review を error にする。
-          timeout_minutes より短くしておかないと、ジョブごと打ち切られてチェックが出ない
+          timeout_minutes より短くしておかないと、ジョブごと打ち切られ、原因の分からない error になる
         type: number
         required: false
         default: 20
@@ -165,6 +172,58 @@ permissions:
   # Claude/Codex の認証情報を SSM から読むための OIDC トークン発行
   id-token: write
 
+# チェック (commit status) の書き込み手順。開始・投稿・省略・未実行・finalize の
+# github-script が同じものを使うよう、ここに1か所だけ置き、各スクリプトで
+# `new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env)` として読み込む。
+# 値はこのワークフローの定数で、外部の入力は入らない
+env:
+  PR_REVIEW_STATUS_HELPER: |
+    ((github, context, env) => {
+      // --- チェックの書き込み (開始・投稿・省略・未実行・finalize で同じ手順) ---
+      // このワークフロー (github-actions[bot]) がこのリポジトリの run として書いたものだけを
+      // 比べる。別の連携が同名のチェックに付けた URL の run ID は無視する
+      const runsPrefix = env.RUN_URL.replace(/\d+$/, "");
+      const runId = (url, item) => (item && item.creator?.login !== "github-actions[bot]") ||
+        !(url || "").startsWith(runsPrefix) ? NaN : Number(/^(\d+)/.exec(url.slice(runsPrefix.length))?.[1] ?? NaN);
+      const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+      // 書き込むたびに履歴を読み直し、自分より後に始まった run (run ID が大きい) が一度でも
+      // 書いた context には書かない (再送の待ち時間に後続 run が書いた場合も含む)。
+      // 履歴を取れないときは、どの状態も書かずに例外にする (ジョブを失敗させ、再実行で書き直す)。
+      // API の自動再試行 (github-script の retries) は履歴を読み直さないので使わない
+      // 同じ PR の run の重なりは、呼び出し側の concurrency (cancel-in-progress) で防ぐ前提。
+      // 重なるのはキャンセルされた run の終了処理だけで、それは error しか書かない。
+      // commit status には比較して書き込む API が無いので、読んでから書くまでの数百ミリ秒に
+      // 割り込まれる可能性は残るが、その場合に残るのはマージを止める向きの error になる
+      async function writeOwnedStatus(statusContext, state, description, skipIf = () => false) {
+        for (let attempt = 1; ; attempt++) {
+          let history;
+          try {
+            history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+              ...context.repo, ref: env.SHA, per_page: 100,
+            });
+          } catch (error) {
+            if (attempt < 3) { await sleep(2000 * attempt); continue; }
+            throw new Error(`チェックの履歴を取得できず、${statusContext} を書けませんでした。` +
+              `失敗したジョブを再実行してください (${error.message})`);
+          }
+          if (history.some(item => item.context === statusContext &&
+              runId(item.target_url, item) > runId(env.RUN_URL))) return "superseded";
+          if (skipIf(history)) return "skipped";
+          try {
+            await github.rest.repos.createCommitStatus({
+              ...context.repo, sha: env.SHA, state, context: statusContext,
+              description, target_url: env.RUN_URL,
+            });
+            return "written";
+          } catch (error) {
+            if (attempt >= 3 || [400, 401, 403, 404, 422].includes(error.status)) throw error;
+            await sleep(2000 * attempt);
+          }
+        }
+      }
+      return writeOwnedStatus;
+    })
+
 jobs:
   review:
     # fork からの PR は Secrets を読めないためスキップする。
@@ -181,18 +240,73 @@ jobs:
         format(',{0},', inputs.skip_authors),
         format(',{0},', github.event.pull_request.user.login)
       )
-    # Claude と Codex を別の leg で並列に走らせる。片方の失敗や遅延がもう片方の
-    # レビューを止めないよう fail-fast は切る。差分の用意・effort の決定・判定の
-    # 読み取りは両方で同じなので、job を分けずに matrix で共有する
+    #
+    # このジョブは Claude だけを走らせる。Codex は下の codex ジョブで、
+    # Claude の指摘が0件だったときにだけ走る。差分の用意・effort の決定・投稿の
+    # 処理は両方で同じなので、steps は YAML アンカーで共有し、どちらのモデルかは
+    # 1要素の matrix (matrix.reviewer) で切り替える
     strategy:
-      fail-fast: false
       matrix:
-        reviewer: >-
-          ${{ fromJSON(inputs.codex_review && inputs.codex_fallback && '["claude","codex"]' || '["claude"]') }}
+        reviewer: [claude]
     name: ${{ matrix.reviewer }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    steps:
+    outputs:
+      # 投稿まで終わったときだけ入る。エラー時は空
+      findings: ${{ steps.publish_review.outputs.findings }}
+      label: ${{ steps.publish_review.outputs.label }}
+      diff_digest: ${{ steps.publish_review.outputs.diff_digest }}
+      # 再試行で差分を取り直さなかったときは、保存した結果の値を使う
+      merge_base: ${{ steps.review_diff.outputs.merge_base || steps.restore_review.outputs.merge_base }}
+    steps: &review_steps
+      # 同じ head の再レビュー (reopen・再実行) では、前回の結果のチェックがその
+      # SHA に残っている。そのままだと今回のレビューが終わる前に必須チェックを
+      # 通過できるので、最初に pending に戻す。checkout (fetch-depth: 0) も待たない。Claude のジョブでは codex-review も
+      # 戻す。Claude が0件を返してから codex ジョブが pending にするまでの間に、
+      # 前回の codex-review で揃って見えるのを防ぐため
+      - name: Mark reviews as in progress
+        # gh の無いランナー (runs_on のセルフホスト) でも動くよう、最終ステータスと同じく
+        # github-script で投稿する。pending にできなくてもレビューは止めない
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REVIEWER_KIND: ${{ matrix.reviewer }}
+          CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const { REVIEWER_KIND, CODEX_ENABLED } = process.env;
+            // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
+            const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
+            // 古い head の run を再実行したときは、そのチェックを pending に戻さない (投稿ステップも
+            // finalize も古い head には書かないので、戻すと pending のまま残る)
+            try {
+              const { data: currentPr } = await github.rest.pulls.get({
+                ...context.repo, pull_number: context.payload.pull_request.number,
+              });
+              if (currentPr.head?.sha !== process.env.SHA) {
+                core.info("PR の head が動いているため、古い head のチェックを pending にしません");
+                return;
+              }
+            } catch (error) {
+              core.warning(`PR を取得できなかったため、pending にしません: ${error.message}`);
+              return;
+            }
+            const statuses = [[`${REVIEWER_KIND}-review`, "レビュー中"]];
+            if (REVIEWER_KIND === "claude" && CODEX_ENABLED === "true") {
+              statuses.push(["codex-review", "Claude のレビュー待ち"]);
+            }
+            // ランナー待ちで遅れて始まった古い run が、新しい run の判定を pending に戻さない。
+            // 履歴を取れなかったときは書かずにレビューを続ける。この run の判定は投稿ステップと
+            // finalize が書く (それまでは前回の run の結果が残る)
+            for (const [statusContext, description] of statuses) {
+              try {
+                await writeOwnedStatus(statusContext, "pending", description);
+              } catch (error) {
+                core.warning(`${statusContext} を pending にできませんでした: ${error.message}`);
+              }
+            }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # 差分・関連コード・レビュースレッドの投稿先を同じ PR head に揃える
@@ -211,6 +325,8 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         with:
+          # 一時的な API エラー (5xx・レート制限) は再試行する
+          retries: 3
           script: |
             core.setOutput("restored", "false");
             const attempt = Number(process.env.RUN_ATTEMPT);
@@ -234,11 +350,27 @@ jobs:
                   ...context.repo, issue_number: context.payload.pull_request.number, per_page: 100,
                 }),
               ]);
+              // Codex が続けて見る Claude は「指摘なし」を投稿せずチェックだけ出す。
+              // この run が確定させた claude-review があれば、Claude は終わっている
+              // (pending はレビュー開始時のもの。codex-review の「未実行」は Claude の
+              // ジョブが出すので数えない)
+              // 結果を使わない Codex では取得しない (この API の失敗で再試行できなくなるため)
+              const statuses = REVIEWER_KIND === "claude" ? await github.paginate(
+                github.rest.repos.listCommitStatusesForRef, { ...context.repo, ref: SHA, per_page: 100 }) : [];
+              if (statuses.some(item => item.context === "claude-review" &&
+                  item.target_url === RUN_URL && ["success", "failure"].includes(item.state) &&
+                  item.creator?.login === "github-actions[bot]")) {
+                throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
+              }
               if ([...reviews, ...comments].some(item => item.user?.login === "github-actions[bot]" &&
                   (item.commit_id === SHA || item.body?.includes(`<!-- pr-review:head:${SHA} -->`)) &&
                   item.body?.includes(`[Workflow run](${RUN_URL})`) &&
                   item.body?.includes(`<!-- pr-review:summary:`) &&
-                  item.body?.includes(REVIEWER_KIND === "codex" ? "Codex ·" : "Claude ·"))) {
+                  // Codex の目印は投稿側が本文の先頭に置く。モデルの要約が引用しても先頭には来ない。
+                  // Codex は Claude が投稿を終えてからしか走らないので、Codex のサマリーが
+                  // あれば Claude も投稿済み (「指摘なし」を出さない Claude の分も含む)
+                  (item.body?.startsWith("<!-- pr-review:codex -->") ||
+                    (REVIEWER_KIND === "claude" && item.body?.includes("Claude ·"))))) {
                 throw new Error("投稿済みレビューの保存結果がありません。新しい workflow run で再レビューしてください");
               }
             }
@@ -285,6 +417,7 @@ jobs:
               }
               fs.writeFileSync(path.join(dir, "publication.json"), JSON.stringify(metadata), { mode: 0o600 });
               core.setOutput("reviewer", metadata.model_label);
+              if (typeof metadata.merge_base === "string") core.setOutput("merge_base", metadata.merge_base);
               core.setOutput("restored", "true");
             } finally {
               fs.rmSync(zip, { force: true });
@@ -301,16 +434,56 @@ jobs:
         continue-on-error: true
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REVIEWER: ${{ matrix.reviewer }}
+        # REVIEW_BASE_SHA は codex ジョブだけが job の env で受け取る、Claude が差分を
+        # 取った merge-base。Claude の後にベースブランチが動いても、Codex は Claude と
+        # 同じ差分を見る (合同の「指摘なし」が同じ差分についての判定になる)
         run: |
           set -euo pipefail
-          base="origin/${BASE_REF}"
-          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
-          git merge-base "${base}" HEAD >/dev/null
+          # Codex 固有の失敗は理由をステップ出力に残し、codex-review の説明と PR の
+          # コメントに出す (Claude が0件で何も投稿していないと、PR に何も残らないため)
+          fail_codex() {
+            echo "::error::$1"
+            echo "codex_failure=$1" >> "${GITHUB_OUTPUT}"
+            exit 1
+          }
+          # Codex で現在の base に切り替えると、Claude と違う差分を見たまま合同の
+          # 「指摘なし」を出しうる。引き継げなければ止める
+          # Claude は環境に REVIEW_BASE_SHA があっても (セルフホストのランナー変数など)
+          # 使わず、常に base と HEAD から計算する
+          if [ "${REVIEWER:-}" = "codex" ]; then
+            if [ -z "${REVIEW_BASE_SHA:-}" ]; then
+              fail_codex "Claude の merge-base を引き継げませんでした"
+            fi
+            if ! [[ "${REVIEW_BASE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+              fail_codex "Claude の merge-base が不正です"
+            fi
+            merge_base="${REVIEW_BASE_SHA}"
+            # fetch-depth: 0 なので、HEAD の祖先は checkout 済み
+            git merge-base --is-ancestor "${merge_base}" HEAD ||
+              fail_codex "Claude の merge-base が PR head の祖先にありません"
+          else
+            git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+            merge_base="$(git merge-base "origin/${BASE_REF}" HEAD)"
+          fi
           install -d -m 700 "${RUNNER_TEMP}/pr-review"
-          git diff --no-ext-diff --no-color --unified=3 --src-prefix=a/ --dst-prefix=b/ \
-            "${base}...HEAD" > "${RUNNER_TEMP}/pr-review/pr.diff"
-          git diff --name-status -z --find-renames "${base}...HEAD" \
+          # `<merge-base> HEAD` は `origin/<base>...HEAD` と同じ差分
+          # --full-index: 短縮オブジェクト ID の桁数はリポジトリのオブジェクト数で変わり、
+          # Claude と Codex の差分のダイジェストを食い違わせるので、完全な ID にする
+          git diff --no-ext-diff --no-color --unified=3 --full-index --src-prefix=a/ --dst-prefix=b/ \
+            "${merge_base}" HEAD > "${RUNNER_TEMP}/pr-review/pr.diff"
+          git diff --name-status -z --find-renames "${merge_base}" HEAD \
             > "${RUNNER_TEMP}/pr-review/files.z"
+          echo "merge_base=${merge_base}" >> "${GITHUB_OUTPUT}"
+          # Codex は Claude と同じ差分でなければ起動しない (投稿前にも同じ照合をする)。
+          # 投稿ステップと同じく pr.diff・NUL・files.z を連結した SHA-256
+          if [ "${REVIEWER:-}" = "codex" ]; then
+            digest="$({ cat "${RUNNER_TEMP}/pr-review/pr.diff"; printf '\0'; cat "${RUNNER_TEMP}/pr-review/files.z"; } \
+              | shasum -a 256 | cut -d' ' -f1)"
+            if [ "${digest}" != "${REVIEW_DIFF_DIGEST:-}" ]; then
+              fail_codex "Claude と Codex の差分が一致しません。ランナーの Git 設定を確認し、新しい workflow run で再レビューしてください"
+            fi
+          fi
 
       # 変更行数 (追加 + 削除) で effort を決める。小さい PR に high を
       # 使うと利用枠を無駄に食い、大きい PR に low を使うと見落とす。
@@ -327,14 +500,14 @@ jobs:
         # 止めないと、pr.diff が無いままモデルが起動する
         if: steps.review_diff.outcome == 'success'
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          MERGE_BASE: ${{ steps.review_diff.outputs.merge_base }}
           EFFORT_OVERRIDE: >-
             ${{ matrix.reviewer == 'codex' && (inputs.codex_effort || inputs.effort) || inputs.effort }}
           SMALL_PR_MAX_LINES: ${{ inputs.small_pr_max_lines }}
           LARGE_PR_MIN_LINES: ${{ inputs.large_pr_min_lines }}
         run: |
           set -euo pipefail
-          changed_lines="$(git diff --numstat "origin/${BASE_REF}...HEAD" -- . \
+          changed_lines="$(git diff --numstat "${MERGE_BASE}" HEAD -- . \
               ':(exclude,glob)**/pnpm-lock.yaml' \
               ':(exclude,glob)**/package-lock.json' \
               ':(exclude,glob)**/yarn.lock' \
@@ -343,21 +516,21 @@ jobs:
               ':(exclude,glob)**/go.sum' \
             | awk '$1 != "-" { n += $1 + $2 } END { print n + 0 }')"
 
-          if [ -n "${EFFORT_OVERRIDE}" ]; then
-            case "${EFFORT_OVERRIDE}" in
-              low|medium|high|xhigh|max) effort="${EFFORT_OVERRIDE}" ;;
-              *)
-                echo "::error::effort は low / medium / high / xhigh / max のどれか (指定値: ${EFFORT_OVERRIDE})"
-                exit 1
-                ;;
-            esac
-          elif [ "${changed_lines}" -le "${SMALL_PR_MAX_LINES}" ]; then
-            effort=low
+          if [ "${changed_lines}" -le "${SMALL_PR_MAX_LINES}" ]; then
+            auto_effort=low
           elif [ "${changed_lines}" -ge "${LARGE_PR_MIN_LINES}" ]; then
-            effort=high
+            auto_effort=high
           else
-            effort=medium
+            auto_effort=medium
           fi
+          case "${EFFORT_OVERRIDE}" in
+            "") effort="${auto_effort}" ;;
+            low|medium|high|xhigh|max) effort="${EFFORT_OVERRIDE}" ;;
+            *)
+              echo "::error::effort は low / medium / high / xhigh / max のどれか (指定値: ${EFFORT_OVERRIDE})"
+              exit 1
+              ;;
+          esac
 
           echo "変更 ${changed_lines} 行 -> effort ${effort}"
           {
@@ -370,27 +543,22 @@ jobs:
       # いた。AWS の SSM に1本ずつ置き、OIDC で読む。
       #
       # 呼び出し側がトークンを渡した場合は AWS には触らない。渡さなかった方を
-      # SSM から読む。各 leg は自分のモデルの認証情報しか読まない。
+      # SSM から読む。各ジョブは自分のモデルの認証情報しか読まない。
       #
       # secrets コンテキストは step の if では読めないので、いったん env 経由で
       # 受けてフラグに落とす。
       - name: Decide where the token comes from
         id: token_source
         if: steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true'
-        # `a && b || c` で選ぶと、Codex の leg で secret が空のとき Claude の
-        # secret に落ちるので、シェル側で選ぶ
+        # 要るのは自分のモデルの secret の有無だけ。値をシェルに渡すと、両方の
+        # secret を渡した呼び出し側でもう一方の認証情報までこのジョブに入るので、
+        # 式で真偽値にしてから渡す (比較の結果は true / false で、空に落ちない)
         env:
-          REVIEWER: ${{ matrix.reviewer }}
-          CALLER_CLAUDE_TOKEN: ${{ secrets.claude_code_oauth_token }}
-          CALLER_CODEX_AUTH: ${{ secrets.codex_auth_json }}
+          HAS_CALLER_TOKEN: >-
+            ${{ (matrix.reviewer == 'codex' && secrets.codex_auth_json != '') ||
+            (matrix.reviewer != 'codex' && secrets.claude_code_oauth_token != '') }}
         run: |
-          if [ "${REVIEWER}" = "codex" ]; then
-            caller_token="${CALLER_CODEX_AUTH}"
-          else
-            caller_token="${CALLER_CLAUDE_TOKEN}"
-          fi
-
-          if [ -z "${caller_token}" ]; then
+          if [ "${HAS_CALLER_TOKEN}" != "true" ]; then
             echo "from_ssm=true" >> "${GITHUB_OUTPUT}"
           else
             echo "from_ssm=false" >> "${GITHUB_OUTPUT}"
@@ -444,7 +612,8 @@ jobs:
           (steps.token_source.outputs.from_ssm == 'false' || steps.token_aws.outcome == 'success')
         continue-on-error: true
         env:
-          CALLER_AUTH_JSON: ${{ secrets.codex_auth_json }}
+          # env はステップの if より先に展開されうるので、Claude のジョブでは式の時点で空にする
+          CALLER_AUTH_JSON: ${{ matrix.reviewer == 'codex' && secrets.codex_auth_json || '' }}
           FROM_SSM: ${{ steps.token_source.outputs.from_ssm }}
           PARAMETER_NAME: ${{ inputs.codex_auth_parameter }}
           PARAMETER_REGION: ${{ inputs.aws_region }}
@@ -502,7 +671,7 @@ jobs:
       - name: Review with Claude
         id: claude
         # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
-        # 先に切る。ジョブごと打ち切られると判定のステップが走らない
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、finalize が原因なしの error にする
         timeout-minutes: ${{ inputs.claude_timeout_minutes }}
         if: >-
           always() &&
@@ -516,7 +685,9 @@ jobs:
         # 起動直後に落ちる。v1.0.232 は 2.1.280 を入れる (v1.0.231 は 2.1.278)。
         uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1.0.266
         with:
-          claude_code_oauth_token: ${{ secrets.claude_code_oauth_token || steps.oauth_token.outputs.token }}
+          # Codex のジョブでは式の時点で空にし、Claude の token を展開しない
+          claude_code_oauth_token: >-
+            ${{ matrix.reviewer == 'claude' && (secrets.claude_code_oauth_token || steps.oauth_token.outputs.token) || '' }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           track_progress: false
           claude_args: |
@@ -634,7 +805,9 @@ jobs:
           }
           PROFILE
           sudo apparmor_parser --replace /etc/apparmor.d/bwrap
-          npm install --global @openai/codex@0.162.0
+          # gpt-6.2-astra は 0.162.0 では model_not_found (「ChatGPT アカウントの Codex では
+          # 未対応」) で起動直後に落ちる。0.166.0 で通ることを確認した
+          npm install --global @openai/codex@0.166.0
 
       # Claude と同じく、失敗しても job は止めず最後のステップで codex-review を
       # error にする。Codex は read-only のサンドボックスでシェルを使えるので、
@@ -642,7 +815,7 @@ jobs:
       - name: Review with Codex
         id: codex
         # 遅延・ハングしたときもチェックを出せるよう、ジョブのタイムアウトより
-        # 先に切る。ジョブごと打ち切られると判定のステップが走らない
+        # 先に切る。ジョブごと打ち切られると判定のステップが走らず、finalize が原因なしの error にする
         timeout-minutes: ${{ inputs.codex_timeout_minutes }}
         if: >-
           always() &&
@@ -839,37 +1012,75 @@ jobs:
             echo "AWS_SESSION_TOKEN="
           } >> "${GITHUB_ENV}"
 
-      # 両方の leg が同じ失敗をするので、コメントは Claude の leg だけが出す
+      # Codex は Claude と同じ差分を作れなかったとき (merge-base の引き継ぎ・差分の照合の
+      # 失敗) にも止まる。Claude が0件だと PR には何も投稿されていないので、Codex も出す
       - name: Report PR diff preparation failure
-        if: ${{ always() && matrix.reviewer == 'claude' && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome != 'success' }}
+        if: ${{ !cancelled() && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome == 'failure' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REVIEWER: ${{ matrix.reviewer }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CODEX_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
         run: |
           set -euo pipefail
-          body="**❌ レビュー不能** — PR 差分を取得できませんでした。
+          # 古い run の再実行で、PR の head かベースがもう動いていれば通知しない
+          # 取得の失敗は if の条件の中だと set -e が効かず空文字で比べてしまうので、先に変数へ入れる
+          current="$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '.head.sha + " " + .base.ref')"
+          if [ "${current}" != "${HEAD_SHA} ${BASE_REF}" ]; then
+            echo "PR の head かベースが動いているため、差分取得失敗を通知しません"
+            exit 0
+          fi
+          # 失敗ジョブの再実行で同じ通知を重ねない。run・head・モデルの目印で照合する
+          # grep -q で途中終了すると、gh が SIGPIPE で落ちて pipefail で偽になるので、
+          # jq で絞り込んだ出力が空かどうかで判定する
+          export MARKER="<!-- pr-review:diff-failure:${REVIEWER}:${HEAD_SHA}:${RUN_URL} -->"
+          marker="${MARKER}"
+          existing="$(gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains(env.MARKER))) | .id')"
+          if [ -n "${existing}" ]; then
+            exit 0
+          fi
+          if [ "${REVIEWER}" = "codex" ]; then
+            reason="${CODEX_FAILURE:-PR 差分を取得できませんでした。}"
+            body="**❌ Codex のレビュー不能** — ${reason}
+
+          Codex のレビューを実行していません。Claude のレビューは指摘なしで完了しています。
+
+          ---
+          _[Workflow run](${RUN_URL})_"
+          else
+            body="**❌ レビュー不能** — PR 差分を取得できませんでした。
 
           レビューを実行していません。Prepare PR diff の job log で base branch の取得・比較エラーを確認してください。
 
           ---
           _[Workflow run](${RUN_URL})_"
+          fi
           gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
-            -f body="${body}" >/dev/null
+            -f body="${body}
+          ${marker}" >/dev/null
 
       # モデルの結果を検証し、1指摘1スレッドで投稿してから件数をチェックに表示する。
       # 通常コメントへの返信には解決ボタンがないため、pull request review を使う。
       # 再利用可能ワークフローの checkout 先は呼び出し側なので、処理はここに置く。
       - name: Publish review threads and status
         id: publish_review
-        if: always()
+        # キャンセルされた run は判定を書かない (同じ PR の後続 run の判定を古い結果で覆わない)。
+        # 判定が出なかったチェックは finalize が error にする
+        if: ${{ !cancelled() }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           SHA: ${{ github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FINDINGS_STATE: ${{ inputs.findings_state }}
           REVIEW_DIFF_OUTCOME: ${{ steps.review_diff.outcome }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
+          CODEX_DIFF_FAILURE: ${{ steps.review_diff.outputs.codex_failure }}
           EFFORT_OUTCOME: ${{ steps.effort.outcome }}
           RESTORE_OUTCOME: ${{ steps.restore_review.outcome }}
           RESTORED: ${{ steps.restore_review.outputs.restored }}
@@ -879,23 +1090,50 @@ jobs:
           CODEX_AUTH_OUTCOME: ${{ steps.codex_auth.outcome }}
           CLAUDE_TOKEN: ${{ matrix.reviewer == 'claude' && (secrets.claude_code_oauth_token || steps.oauth_token.outputs.token) || '' }}
           IS_CODEX: ${{ matrix.reviewer == 'codex' }}
+          MERGE_BASE: ${{ steps.review_diff.outputs.merge_base }}
+          # 指摘なしのコメントの出し方。Codex が続けて見る Claude は出さず (skip)、
+          # Codex は Claude の分もまとめて1件だけ出す (combined)。Codex を使わない
+          # 呼び出し側の Claude は自分の分を出す (own)
+          CLEAN_COMMENT: >-
+            ${{ matrix.reviewer == 'codex' && 'combined' ||
+            (inputs.codex_review && inputs.codex_fallback && 'skip' || 'own') }}
           REVIEWER: >-
             ${{ steps.restore_review.outputs.reviewer || (matrix.reviewer == 'codex' &&
             format('Codex · {0} · effort {1}', inputs.codex_model, steps.effort.outputs.effort) ||
             format('Claude · {0} · effort {1}', inputs.model || 'default', steps.effort.outputs.effort)) }}
         with:
+          # 作成系 (createReview・createComment など) は、投稿が確定したのに 5xx が返る
+          # ことがあり、自動で再送すると重複投稿になるので再試行しない
           script: |
             const { SHA, RUN_URL, FINDINGS_STATE, REVIEWER } = process.env;
             const isCodex = process.env.IS_CODEX === "true";
             const statusContext = isCodex ? "codex-review" : "claude-review";
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
-            const footer = `---\n_${REVIEWER} [Workflow run](${RUN_URL})_`;
+            const cleanComment = process.env.CLEAN_COMMENT || "own";
+            // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
+            const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
+            let claudeLabel = process.env.CLAUDE_LABEL;
+            let restoredMergeBase;
             const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
             const fs = require("node:fs");
             const path = require("node:path");
             const resultDir = path.join(process.env.RUNNER_TEMP, "pr-review-results");
             let secretsChecked = false;
+            let findingsCount;
+            let supersededRetry = false;
+            // 見送った理由。head が動いたとき (古い SHA) は null で、チェックも書かない
+            let supersedeReason = null;
+            // 古い head の run を再実行したときは、成功・失敗どちらの経路でも古い SHA に書かない。
+            // 復元やモデルの失敗で下の確認まで届かない場合があるので、最初に確かめる
+            let headMovedEarly = false;
+            try {
+              const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: issue_number });
+              headMovedEarly = pr.head?.sha !== SHA;
+            } catch (error) {
+              core.warning(`PR を取得できませんでした: ${error.message}`);
+            }
+            let diffDigest;
             let savePublication = () => {};
             let state = "error";
             let description = "レビューを完了できませんでした";
@@ -906,7 +1144,7 @@ jobs:
               }
               const restored = process.env.RESTORED === "true";
               if (!restored && process.env.REVIEW_DIFF_OUTCOME !== "success") {
-                throw new Error("PR差分を取得できませんでした");
+                throw new Error(process.env.CODEX_DIFF_FAILURE || "PR差分を取得できませんでした");
               }
               if (!restored && process.env.EFFORT_OUTCOME !== "success") {
                 throw new Error("effort を決められませんでした");
@@ -942,6 +1180,9 @@ jobs:
                   throw new Error("認証情報の検査記録がありません。新しい workflow run で再レビューしてください");
                 }
                 fingerprints.push(...metadata.secret_fingerprints);
+                // 再試行では effort を決めないので、Claude のラベルは前回の記録を使う
+                if (typeof metadata.claude_label === "string") claudeLabel = metadata.claude_label;
+                if (typeof metadata.merge_base === "string") restoredMergeBase = metadata.merge_base;
               } else if (isCodex) {
                 if (process.env.CODEX_AUTH_OUTCOME !== "success") throw new Error("認証情報の検査を準備できませんでした");
                 for (const name of ["auth-before.json", "auth.json"]) {
@@ -959,6 +1200,15 @@ jobs:
               }
               if (!fingerprints.length) throw new Error("認証情報の検査対象がありません");
               publication.secret_fingerprints = fingerprints;
+              if (cleanComment === "combined") publication.claude_label = claudeLabel;
+              publication.merge_base = restoredMergeBase ?? process.env.MERGE_BASE;
+              // モデルに渡した差分そのもののダイジェスト。merge-base が同じでも、ランナーの
+              // Git 設定 (diff 属性・bigFileThreshold など) で差分の中身は変わりうる
+              diffDigest = createHash("sha256")
+                .update(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/pr.diff")))
+                .update("\0")
+                .update(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/files.z")))
+                .digest("hex");
               function assertNoSecrets(text) {
                 for (const { length, sha256 } of fingerprints) {
                   if (!Number.isSafeInteger(length) || length < 1 || !/^[a-f0-9]{64}$/.test(sha256)) {
@@ -977,7 +1227,9 @@ jobs:
               let result;
               try {
                 if (isCodex) {
-                  const blocks = [...raw.matchAll(/^```json\s*\n([\s\S]*?)^```[ \t]*$/gm)];
+                  // 閉じフェンスを付けずに終わる回答がある (gpt-6.2-astra で実測)。
+                  // 末尾まで閉じていないブロックも1つとして数える
+                  const blocks = [...raw.matchAll(/^```json\s*\n([\s\S]*?)(?:^```[ \t]*$|(?![\s\S]))/gm)];
                   if (blocks.length !== 1) throw new Error("invalid JSON block");
                   result = JSON.parse(blocks[0][1]);
                 } else {
@@ -1111,12 +1363,25 @@ jobs:
                 if (file[finding.side].has(finding.line)) lineComments.push(comment);
                 else fileComments.push(comment);
               });
+              // Codex の結果は、Claude と同じ差分を見たときだけ出す (合同の「指摘なし」に
+              // 限らない)。保存結果からの再試行でも、Codex の差分の基点と Claude から
+              // 受け取った基点の一致を確かめる。食い違いは復元可能にする前に弾き、
+              // 再実行では保存結果を使わずモデルからやり直させる
+              if (cleanComment === "combined" && (!/^[0-9a-f]{40}$/.test(process.env.REVIEW_BASE_SHA || "") ||
+                  publication.merge_base !== process.env.REVIEW_BASE_SHA)) {
+                throw new Error("Claude と Codex の差分の基点が一致しません。新しい workflow run で再レビューしてください");
+              }
+              if (cleanComment === "combined" && diffDigest !== process.env.REVIEW_DIFF_DIGEST) {
+                throw new Error("Claude と Codex に渡した差分が一致しません。新しい workflow run で再レビューしてください");
+              }
               publication.restorable = true;
               savePublication();
               const headline = result.summary.replace(/[\r\n]+/g, " ").trim();
+              const combined = !findings.length && cleanComment === "combined";
               const verdict = findings.length
                 ? `**⚠️ 指摘 ${findings.length}件**${headline ? ` — ${headline}` : ""}`
-                : "**✅ 指摘なし**";
+                : combined ? "**✅ 指摘なし** (Claude・Codex)" : "**✅ 指摘なし**";
+              const footer = `---\n_${combined ? `${claudeLabel} / ${REVIEWER}` : REVIEWER} [Workflow run](${RUN_URL})_`;
               const fileLinks = new Map();
               const summary = () => `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n` +
                 [...fileLinks].sort(([a], [b]) => a - b)
@@ -1137,13 +1402,63 @@ jobs:
               }
               // マーカーだけでなく投稿者も確認する。通常コメントにも同じ判定を使う。
               const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
-              if (findings.length) {
+              // 古い run の再実行が、新しいレビューの後に古い結果を付けないよう、投稿の直前に
+              // この PR 自体を確かめる (commit status は SHA 単位で、別の PR と区別できないので使わない)。
+              // - PR の head がレビューした SHA から動いていれば投稿しない
+              // - この PR に、同じ head への自分より新しい run のサマリーがあれば投稿しない
+              // run ID は、投稿側が付けるフッター (サマリーの目印の直前の [Workflow run](...)_) の
+              // このリポジトリの run URL からだけ取る。モデルの要約に含まれる URL は使わない
+              const runsPrefix = RUN_URL.replace(/\d+$/, "");
+              const ownRunId = Number(RUN_URL.slice(runsPrefix.length));
+              const runIdOf = text => {
+                const footers = [...(text || "").matchAll(/\[Workflow run\]\(([^)\s]+)\)_\n<!-- pr-review:summary:/g)]
+                  .map(match => match[1]).filter(url => url.startsWith(runsPrefix));
+                return footers.length ? Number(/^\d+$/.exec(footers.at(-1).slice(runsPrefix.length))?.[0] ?? NaN) : NaN;
+              };
+              const { data: currentPr } = await github.rest.pulls.get({ ...repo, pull_number: issue_number });
+              const [prReviews, prComments] = await Promise.all([
+                github.paginate(github.rest.pulls.listReviews, { ...repo, pull_number: issue_number, per_page: 100 }),
+                github.paginate(github.rest.issues.listComments, { ...repo, issue_number, per_page: 100 }),
+              ]);
+              // 同じワークフロー・同じ head で、この PR に対する自分より新しい run があれば止める。
+              // サマリーを投稿できなかった新しい run (認証エラーなど) も検出できる
+              const { data: thisRun } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: context.runId });
+              const laterRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                ...repo, workflow_id: thisRun.workflow_id, head_sha: SHA, per_page: 100,
+              });
+              const headMoved = currentPr.head?.sha !== SHA;
+              // ベースブランチを変えた PR では差分が変わる
+              const baseChanged = currentPr.base?.ref !== process.env.BASE_REF;
+              const laterRun = laterRuns.some(item => item.id > context.runId &&
+                  (item.pull_requests || []).some(pr => pr.number === issue_number)) ||
+                [...prReviews, ...prComments].some(item => isPublisher(item) &&
+                  item.body?.includes(`<!-- pr-review:head:${SHA} -->`) &&
+                  item.body.includes("<!-- pr-review:summary:") &&
+                  runIdOf(item.body) > ownRunId);
+              // ベースの履歴が書き換わる (巻き戻しなど) と、名前が同じでも差分が変わる。
+              // 現在のベースと head の merge-base を、モデルに渡した差分の基点と比べる
+              let mergeBaseChanged = false;
+              if (!headMoved && !baseChanged) {
+                const { data: compared } = await github.rest.repos.compareCommitsWithBasehead({
+                  ...repo, basehead: `${currentPr.base.sha}...${SHA}`,
+                });
+                mergeBaseChanged = compared.merge_base_commit?.sha !== publication.merge_base;
+              }
+              const superseded = headMoved || baseChanged || mergeBaseChanged || laterRun;
+              if (!headMoved) {
+                supersedeReason = baseChanged || mergeBaseChanged
+                  ? "ベースブランチが変わったため未投稿。push か close / reopen で再レビューしてください"
+                  : "同じ head への新しい run があるため、この run の結果は投稿しません";
+              }
+              if (superseded) {
+                supersededRetry = true;
+                core.warning("PR の head・ベースが動いたか、同じ head への新しい run があるため、この run の結果を投稿しません");
+              } else if (findings.length) {
                 const params = { ...repo, pull_number: issue_number, per_page: 100 };
                 // 再実行時は公開済みの同一指摘を再利用する。履歴はモデルには渡さない。
-                const [reviews, comments] = await Promise.all([
-                  github.paginate(github.rest.pulls.listReviews, params),
-                  github.paginate(github.rest.pulls.listReviewComments, params),
-                ]);
+                // レビュー一覧は投稿前の確認で取得済みのものを使う
+                const reviews = prReviews;
+                const comments = await github.paginate(github.rest.pulls.listReviewComments, params);
                 let review = reviews.find(item => isPublisher(item) &&
                   item.body?.includes(summaryMarker) && item.state !== "PENDING");
                 const remaining = [];
@@ -1219,10 +1534,12 @@ jobs:
                 }
                 // 前回の投稿後に更新が失敗したサマリーも、再実行でリンクを復元する。
                 if (reviews.includes(review)) await updateSummary();
+              } else if (cleanComment === "skip") {
+                // 続けて Codex が見る。指摘なしのコメントは Codex のジョブが両方の分を
+                // まとめて1件だけ出すので、ここでは何も投稿しない (チェックだけ出す)
               } else {
-                const comments = await github.paginate(github.rest.issues.listComments, {
-                  ...repo, issue_number, per_page: 100,
-                });
+                // コメント一覧は投稿前の確認で取得済みのものを使う
+                const comments = prComments;
                 let posted = comments.find(item => isPublisher(item) && item.body?.includes(summaryMarker));
                 if (!posted) {
                   ({ data: posted } = await github.rest.issues.createComment({ ...repo, issue_number, body: summary() }));
@@ -1231,6 +1548,7 @@ jobs:
               }
               publication.complete = true;
               savePublication();
+              findingsCount = findings.length;
               state = findings.length ? FINDINGS_STATE : "success";
               description = findings.length
                 ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
@@ -1248,17 +1566,93 @@ jobs:
               core.setFailed(description);
             }
 
-            await github.rest.repos.createCommitStatus({
-              ...repo, sha: SHA, state, context: statusContext,
-              description, target_url: RUN_URL,
-            });
+            // 同じ head の後続 run がこのチェックを一度でも書いていたら、古い結果で戻さない。
+            // 前回の run の結果は、今回の結果で確定させる
+            if (headMovedEarly) {
+              supersededRetry = true;
+              supersedeReason = null;
+            }
+            // 古い run の再実行で投稿を見送ったときは、判定のチェックは書かない。head が同じまま
+            // (ベースの変更・新しい run) なら、理由付きの error で確定させる (finalize の
+            // 「キャンセル・タイムアウト」と取り違えないため)。Claude は Codex の分も確定させる。
+            // 新しい run がすでに書いていれば writeOwnedStatus が書かない
+            if (supersededRetry) {
+              core.setOutput("superseded", "true");
+              if (supersedeReason) {
+                const contexts = !isCodex && process.env.CODEX_ENABLED === "true"
+                  ? [statusContext, "codex-review"] : [statusContext];
+                for (const item of contexts) await writeOwnedStatus(item, "error", supersedeReason);
+              }
+            }
+            const written = supersededRetry ? "superseded" : await writeOwnedStatus(statusContext, state, description);
+            if (written === "superseded") {
+              core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
+            }
+            if (findingsCount !== undefined && !supersededRetry) {
+              // 後続の codex ジョブを走らせるかの判定に使う。0件の Claude はコメントを出さず
+              // claude-review が唯一の公開結果なので、それを書けたとき (後続 run が書いていて
+              // 書かなかったときを含む) だけ出す。書き込みが失敗すれば例外でここに来ない。
+              // この後の artifact 保存などが失敗しても Codex は走る
+              core.setOutput("findings", String(findingsCount));
+              // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
+              core.setOutput("label", REVIEWER);
+              core.setOutput("diff_digest", diffDigest);
+            }
+
+      # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
+      # 状態は指摘ありの claude-review と同じ findings_state にする。codex-review を
+      # claude-review より緩くも厳しくもしないため。常に success だと failure の
+      # 呼び出し側でも Codex を経ずに揃って見え、pending だと success の呼び出し側で
+      # Claude の誤検知が残る PR が永久にマージできなくなる。
+      # 指摘を直して Claude が0件になれば、その head で Codex が走って本当の結果に
+      # 置き換わる
+      - name: Mark Codex review as skipped
+        if: >-
+          !cancelled() &&
+          matrix.reviewer == 'claude' &&
+          inputs.codex_review && inputs.codex_fallback &&
+          steps.publish_review.outputs.findings != '' &&
+          steps.publish_review.outputs.findings != '0'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          FINDINGS: ${{ steps.publish_review.outputs.findings }}
+          # 投稿ステップが success / failure 以外を拒否してから findings を出すので、検証済み
+          FINDINGS_STATE: ${{ inputs.findings_state }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const { FINDINGS, FINDINGS_STATE } = process.env;
+            // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
+            const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
+            await writeOwnedStatus("codex-review", FINDINGS_STATE,
+              `Claude の指摘 ${FINDINGS}件があるため未実行。0件になると Codex が走る`);
+
+      # Claude が投稿まで終えなかったとき (認証切れ・JSON 不正・投稿失敗など) は
+      # Codex を走らせない。開始時に pending にした codex-review を理由付きで確定させる
+      - name: Mark Codex review as not run
+        if: >-
+          !cancelled() &&
+          matrix.reviewer == 'claude' &&
+          inputs.codex_review && inputs.codex_fallback &&
+          steps.publish_review.outputs.findings == '' &&
+          steps.publish_review.outputs.superseded != 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
+            const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
+            await writeOwnedStatus("codex-review", "error", "Claude のレビューが完了しなかったため未実行");
 
       - name: Remove Codex authentication
         if: ${{ always() && matrix.reviewer == 'codex' }}
         run: |
           rm -f -- "${RUNNER_TEMP}/codex-home/auth.json" "${RUNNER_TEMP}/codex-home/auth-before.json"
 
-      # 成功した leg も保存し、Re-run all jobs でも同じ結果を再利用する。
+      # 成功したジョブも保存し、Re-run all jobs でも同じ結果を再利用する。
       - name: Preserve review result and publication state
         if: ${{ always() && steps.publish_review.outcome != 'skipped' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1267,3 +1661,89 @@ jobs:
           path: ${{ runner.temp }}/pr-review-results/
           if-no-files-found: ignore
           retention-days: 7
+
+  # Claude の指摘が0件だったときだけ、Codex で続けてレビューする。
+  # review ジョブがスキップした場合 (fork・draft・skip_authors を含む) や Claude が
+  # 投稿まで終えなかった場合は findings が空なので走らない
+  codex:
+    needs: review
+    # findings は Claude が投稿まで終えたときだけ出る。その後の artifact 保存などで
+    # review ジョブが失敗しても Codex は走らせる (暗黙の success() にしない)。
+    # 出ていないときの値は null で、式の `null == '0'` は数値比較で真になるので、
+    # 先に有無を確かめる (文字列 '0' は真)
+    if: >-
+      !cancelled() &&
+      inputs.codex_review && inputs.codex_fallback &&
+      needs.review.outputs.findings &&
+      needs.review.outputs.findings == '0'
+    strategy:
+      matrix:
+        reviewer: [codex]
+    name: ${{ matrix.reviewer }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    # 「指摘なし」を Claude の分もまとめて出すときのラベル。steps は共有なので、
+    # needs を読むのはこのジョブの env に限る
+    env:
+      CLAUDE_LABEL: ${{ needs.review.outputs.label }}
+      REVIEW_BASE_SHA: ${{ needs.review.outputs.merge_base }}
+      REVIEW_DIFF_DIGEST: ${{ needs.review.outputs.diff_digest }}
+    steps: *review_steps
+
+  # この run が担当したチェックに、この run の判定が出ていなければ error で確定させる。
+  # キャンセル (Codex のランナー待ちの間を含む)・ジョブのタイムアウトなど、各ジョブの
+  # 中の終了処理では拾えない終わり方が対象。最新が「この run の pending のまま」
+  # 「前回の run の結果のまま」「まだ無い」のときに書き換える。この run が確定させた
+  # もの、後続の run が一度でも書いたチェックには触らない
+  finalize:
+    needs: [review, codex]
+    if: always() && needs.review.result != 'skipped'
+    # commit status の一覧取得と作成、PR の head の確認しか呼ばない
+    permissions:
+      statuses: write
+      pull-requests: read
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    steps:
+      - name: Close out pending checks
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CODEX_ENABLED: ${{ inputs.codex_review && inputs.codex_fallback }}
+        with:
+          script: |
+            const { RUN_URL, CODEX_ENABLED, SHA } = process.env;
+            // 古い run の再実行で PR の head がもう動いていれば、古い SHA のチェックには触らない
+            const { data: currentPr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: context.payload.pull_request.number,
+            });
+            if (currentPr.head?.sha !== SHA) {
+              core.info("PR の head が動いているため、古い head のチェックは確定させません");
+              return;
+            }
+            // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
+            const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
+            const contexts = CODEX_ENABLED === "true" ? ["claude-review", "codex-review"] : ["claude-review"];
+            // 1つの context の書き込みが失敗しても、残りの context も確定させてから失敗させる
+            const failures = [];
+            for (const statusContext of contexts) {
+              // この run が確定させたもの (pending 以外) は触らない。この run の pending のまま・
+              // 前回の run の結果のまま・まだ無いときは、この run の判定が出ていないので error にする。
+              // 既知の制限: 判定は run 単位で attempt を区別しない。Re-run failed jobs では成功した
+              // ジョブの結果が前の attempt から引き継がれ、attempt 単位で見ると再実行していない
+              // ジョブの正しい結果まで error になるため。再実行の開始時に pending を書けず、さらに
+              // 判定前に止まった場合は、同じ run・同じ head で前の attempt が出した結果が残る
+              try {
+                await writeOwnedStatus(statusContext, "error", "レビューが完了しませんでした (キャンセル・タイムアウトなど)",
+                  history => {
+                    const latest = history.find(item => item.context === statusContext);
+                    // このワークフローが書いた、この run の確定結果だけを確定済みとみなす
+                    return latest?.creator?.login === "github-actions[bot]" &&
+                      latest.target_url === RUN_URL && latest.state !== "pending";
+                  });
+              } catch (error) {
+                failures.push(`${statusContext}: ${error.message}`);
+              }
+            }
+            if (failures.length) throw new Error(failures.join(" / "));

@@ -29,6 +29,9 @@ const defaultDiff = `diff --git a/src/example.ts b/src/example.ts
 +new
 `;
 const runUrl = 'https://github.com/example/repo/actions/runs/123';
+const bot = { login: 'github-actions[bot]' };
+// 全ステップが読み込むチェックの書き込み手順 (ワークフロー冒頭の env)
+const statusHelper = workflow.match(/^  PR_REVIEW_STATUS_HELPER: \|\n((?: {4}[^\n]*\n|\n)*)/m)[1].replace(/^ {4}/gm, '');
 const finding = {
   path: 'src/example.ts', line: 42, side: 'RIGHT',
   body: '**境界値で失敗する**\n入力が 0 の場合に例外になるため、境界条件を修正してください。',
@@ -36,6 +39,9 @@ const finding = {
 const result = { summary: '境界値で失敗する', findings: [finding] };
 const invalidResult = { summary: '', findings: [{ ...finding, path: 'missing.ts' }] };
 const jsonBlock = value => '```json\n' + JSON.stringify(value) + '\n```';
+
+const defaultDiffDigest = require('node:crypto').createHash('sha256')
+  .update(defaultDiff).update('\0').update('M\0src/example.ts\0').digest('hex');
 
 async function run(options = {}) {
   const isCodex = options.isCodex ?? true;
@@ -52,7 +58,7 @@ async function run(options = {}) {
   writeFileSync(join(tempDir, 'pr-review/pr.diff'), options.diff ?? defaultDiff);
   writeFileSync(join(tempDir, 'pr-review/files.z'), options.files ?? 'M\0src/example.ts\0');
   const env = {
-    RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken,
+    RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken, PR_REVIEW_STATUS_HELPER: statusHelper, BASE_REF: 'main',
     SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
     REVIEWER: isCodex ? 'Codex · test-model · effort medium' : 'Claude · test-model · effort medium',
     IS_CODEX: String(isCodex), REVIEW_DIFF_OUTCOME: 'success',
@@ -117,23 +123,30 @@ async function run(options = {}) {
     paginate: async (method, params) => {
       fetches.push({ method, params });
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
+      if (method === 'listCommitStatusesForRef') return structuredClone(server.statuses ?? []);
+      if (method === 'listWorkflowRuns') return structuredClone(server.workflowRuns ?? []);
       const rows = method === 'listIssueComments' ? server.issueComments : method === 'listReviews' ? server.reviews : method === 'listCommentsForReview'
         ? server.comments.filter(comment => comment.pull_request_review_id === params.review_id) : server.comments;
       return structuredClone(rows);
     },
     rest: {
-      pulls: { createReview: api('createReview'), createReviewComment: api('createReviewComment'),
+      pulls: { get: async () => ({ data: { head: { sha: options.prHead ?? 'reviewed-head' }, base: { ref: options.prBase ?? 'main', sha: 'base-sha' } } }),
+        createReview: api('createReview'), createReviewComment: api('createReviewComment'),
         updateReview: api('updateReview'), listReviews: 'listReviews', listReviewComments: 'listReviewComments',
         listCommentsForReview: 'listCommentsForReview' },
       issues: { createComment: api('createComment'), listComments: 'listIssueComments' },
-      repos: { createCommitStatus: api('createCommitStatus') },
+      repos: { createCommitStatus: api('createCommitStatus'), listCommitStatusesForRef: 'listCommitStatusesForRef',
+        compareCommitsWithBasehead: async () => ({ data: { merge_base_commit: { sha: 'prMergeBase' in options ? options.prMergeBase : env.MERGE_BASE } } }) },
+      actions: { getWorkflowRun: async () => ({ data: { workflow_id: 1 } }), listWorkflowRuns: 'listWorkflowRuns' },
     },
   };
   try {
     let thrown;
+    const outputs = {};
     try { await publish(github, {
-      repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } },
-    }, { error: message => errors.push(message), setFailed: message => failures.push(message) }, { env }, require); } catch (error) { thrown = error; }
+      repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } }, runId: 123,
+    }, { error: message => errors.push(message), setFailed: message => failures.push(message), warning: () => {},
+      setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
     return {
       artifactFiles: Object.fromEntries(['codex.md', 'claude.json', 'publication.json', 'pr.diff', 'files.z']
@@ -142,7 +155,7 @@ async function run(options = {}) {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
       publication: existsSync(join(tempDir, 'pr-review-results/publication.json'))
         ? JSON.parse(readFileSync(join(tempDir, 'pr-review-results/publication.json'), 'utf8')) : undefined,
-      calls, failures, errors, server, fetches, thrown,
+      calls, failures, errors, server, fetches, thrown, outputs,
       review: calls.findLast(call => call.method === 'createReview')
         ? { ...calls.findLast(call => call.method === 'createReview').params,
             body: summaryReviews(server).at(-1)?.body ?? calls.findLast(call => call.method === 'createReview').params.body } : undefined,
@@ -176,13 +189,15 @@ async function recover(options = {}) {
       if (options.fail === method) throw new Error(`Simulated ${method} failure`);
       return method === 'listWorkflowRunArtifacts' ? (options.artifacts ?? [
         { id: 1, name: `pr-review-result-${env.REVIEWER_KIND}-1`, expired: false },
-      ]) : method === 'listIssueComments' ? (options.issueComments ?? []) : (options.reviews ?? []);
+      ]) : method === 'listIssueComments' ? (options.issueComments ?? [])
+        : method === 'listCommitStatusesForRef' ? (options.statuses ?? []) : (options.reviews ?? []);
     },
     rest: { actions: { listWorkflowRunArtifacts: 'listWorkflowRunArtifacts', downloadArtifact: async params => {
       calls.push({ method: 'downloadArtifact', params });
       if (options.fail === 'downloadArtifact') throw new Error('Simulated downloadArtifact failure');
       return { data: archive };
-    } }, pulls: { listReviews: 'listReviews' }, issues: { listComments: 'listIssueComments' } },
+    } }, pulls: { listReviews: 'listReviews' }, issues: { listComments: 'listIssueComments' },
+    repos: { listCommitStatusesForRef: 'listCommitStatusesForRef' } },
   };
   let error;
   try {
@@ -386,17 +401,59 @@ test('prepared diff stays aligned with PR head when base adds lines above the ch
     assert.ok(!readFileSync(join(checkout, 'file.txt'), 'utf8').includes('future PR change'));
     const prepareScript = workflow.match(/      - name: Prepare PR diff\n[\s\S]*?        run: \|\n((?: {10}[^\n]*\n|\n)*)/)[1]
       .replace(/^ {10}/gm, '');
+    const githubOutput = join(tempDir, 'github-output');
     execFileSync('bash', ['-c', prepareScript], {
-      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir },
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir, GITHUB_OUTPUT: githubOutput },
     });
     const actual = readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim();
-    assert.equal(actual, git(checkout, 'diff', `origin/main...${head}`));
+    assert.equal(actual, git(checkout, 'diff', '--full-index', `origin/main...${head}`));
+    // 行番号の検証は、下で origin/main を進める前の base で行う
     const changedLine = diff => {
       const hunk = diff.match(/@@ .* \+(\d+),(\d+) @@/);
       return Number(hunk[1]) + Number(hunk[2]) - 1;
     };
     assert.equal(changedLine(actual), 30);
-    assert.equal(changedLine(git(checkout, 'diff', `origin/main...${merged}`)), 31);
+    assert.equal(changedLine(git(checkout, 'diff', '--full-index', `origin/main...${merged}`)), 31);
+    const mergeBase = readFileSync(githubOutput, 'utf8').match(/^merge_base=([0-9a-f]{40})$/m)[1];
+    // Claude の投稿ステップと同じ計算 (pr.diff・NUL・files.z)
+    const claudeDigest = require('node:crypto').createHash('sha256')
+      .update(readFileSync(join(tempDir, 'pr-review/pr.diff'))).update('\0')
+      .update(readFileSync(join(tempDir, 'pr-review/files.z'))).digest('hex');
+    assert.equal(mergeBase, git(checkout, 'merge-base', 'origin/main', head));
+    // Codex は Claude の merge-base を使い、その後にベースが PR の変更を取り込んでも同じ差分を見る
+    git(origin, 'checkout', 'main');
+    git(origin, 'merge', '--no-edit', head);
+    git(checkout, 'fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main');
+    assert.equal(git(checkout, 'diff', '--full-index', `origin/main...${head}`), '');
+    rmSync(join(tempDir, 'pr-review'), { recursive: true, force: true });
+    execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: mergeBase, REVIEW_DIFF_DIGEST: claudeDigest },
+    });
+    assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), actual);
+    // Claude と差分が違えば、Codex を起動する前に止まる
+    assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: mergeBase, REVIEW_DIFF_DIGEST: 'c'.repeat(64) },
+    }));
+    // 理由はステップ出力に残し、codex-review の説明と PR のコメントに使う
+    assert.match(readFileSync(githubOutput, 'utf8'), /^codex_failure=Claude と Codex の差分が一致しません/m);
+    // Claude は環境に REVIEW_BASE_SHA があっても使わず、現在の base から計算する
+    execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'claude', REVIEW_BASE_SHA: mergeBase },
+    });
+    assert.equal(readFileSync(join(tempDir, 'pr-review/pr.diff'), 'utf8').trim(), git(checkout, 'diff', '--full-index', `origin/main...${head}`));
+    assert.notEqual(git(checkout, 'diff', '--full-index', `origin/main...${head}`), actual);
+    assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: '--output=/tmp/x' },
+    }));
+    // Codex は merge-base を引き継げなければ現在の base に切り替えず止まる
+    assert.throws(() => execFileSync('bash', ['-c', prepareScript], {
+      cwd: checkout, stdio: 'pipe', env: { ...process.env, BASE_REF: 'main', RUNNER_TEMP: tempDir,
+        GITHUB_OUTPUT: githubOutput, REVIEWER: 'codex', REVIEW_BASE_SHA: '' },
+    }));
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -777,7 +834,7 @@ test('failure to fetch batch thread URLs stops additional publication and recove
 });
 
 test('publication identities do not collide across reviewers, heads, or workflow runs', async () => {
-  for (const options of [{ isCodex: false }, { env: { SHA: 'another-head' } }, { env: { RUN_URL: runUrl + '4' } }]) {
+  for (const options of [{ isCodex: false }, { env: { SHA: 'another-head' }, prHead: 'another-head' }, { env: { RUN_URL: runUrl + '4' } }]) {
     const first = await run();
     const second = await run({ ...options, server: first.server });
     assert.equal(second.failures.length, 0);
@@ -792,7 +849,8 @@ for (const method of ['listReviews', 'listReviewComments']) {
     assert.equal(output.status.state, 'error');
     assert.equal(output.server.comments.length, 0);
     assert.equal(summaryReviews(output.server).length, 0);
-    assert.equal(output.fetches.length, 2);
+    // 投稿前の PR の確認 (listReviews・listIssueComments) の後で、失敗した取得で止まる
+    assert.ok(output.fetches.some(fetch => fetch.method === method));
     assert.ok(output.fetches.every(fetch => fetch.params.per_page === 100));
   });
 }
@@ -958,8 +1016,13 @@ test('missing artifact detection includes no-findings comments and is scoped to 
   assert.match(output.error.message, /保存結果がありません/);
   const otherHead = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { SHA: 'another-head' } });
   assert.equal(otherHead.error, undefined);
-  const otherReviewer = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
-  assert.equal(otherReviewer.error, undefined);
+  // Codex は Claude の投稿後にしか走らないので、Codex のサマリーは Claude の投稿済みも意味する
+  const claudeAfterCodex = await recover({ artifacts: [], issueComments: first.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
+  assert.match(claudeAfterCodex.error.message, /保存結果がありません/);
+  // 逆に Claude のサマリーは、まだ走っていない Codex を止めない
+  const claudeOnly = await run({ isCodex: false, result: { summary: '', findings: [] } });
+  const codexAfterClaude = await recover({ artifacts: [], issueComments: claudeOnly.server.issueComments, env: { REVIEWER_KIND: 'codex' } });
+  assert.equal(codexAfterClaude.error, undefined);
 });
 
 for (const findings of [[finding], []]) {
@@ -1206,4 +1269,461 @@ test('Codex artifact excludes unparsed prose containing escaped credentials outs
   assert.equal(output.failures.length, 0);
   assert.equal(output.savedResult, jsonBlock(result));
   assert.ok(!JSON.stringify(output.artifactFiles).includes(encoded));
+});
+
+test('findings output is published only after a completed review and gates the Codex job', async () => {
+  // codex ジョブの起動条件になるのは Claude 側の出力
+  const clean = await run({ isCodex: false, result: { summary: '', findings: [] } });
+  assert.equal(clean.outputs.findings, '0');
+  const found = await run({ isCodex: false, result });
+  assert.equal(found.outputs.findings, String(result.findings.length));
+  const broken = await run({ isCodex: false, claudeReview: 'not json' });
+  assert.equal(broken.outputs.findings, undefined);
+  const failed = await run({ isCodex: false, result: { summary: '', findings: [] }, env: { MODEL_OUTCOME: 'failure' } });
+  assert.equal(failed.outputs.findings, undefined);
+
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /needs: review/);
+  assert.match(codexJob, /needs\.review\.outputs\.findings == '0'/);
+  assert.match(codexJob, /reviewer: \[codex\]/);
+  assert.match(codexJob, /steps: \*review_steps/);
+  assert.match(workflow, /reviewer: \[claude\]/);
+  assert.match(workflow, /findings: \$\{\{ steps\.publish_review\.outputs\.findings \}\}/);
+  const skip = workflow.slice(workflow.indexOf('      - name: Mark Codex review as skipped')).split(/\n      - name: /)[0];
+  assert.match(skip, /matrix\.reviewer == 'claude'/);
+  assert.match(skip, /steps\.publish_review\.outputs\.findings != '0'/);
+  assert.match(skip, /writeOwnedStatus\("codex-review", FINDINGS_STATE,/);
+  assert.match(skip, /FINDINGS_STATE: \$\{\{ inputs\.findings_state \}\}/);
+  assert.doesNotMatch(skip, /gh api/);
+  const start = workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0];
+  assert.ok(workflow.indexOf('      - name: Mark reviews as in progress') < workflow.indexOf('      - uses: actions/checkout@'));
+  assert.match(start, /writeOwnedStatus\(statusContext, "pending", description\)/);
+  assert.match(start, /`\$\{REVIEWER_KIND\}-review`/);
+  assert.match(start, /codex-review/);
+  assert.doesNotMatch(start, /gh api/);
+});
+
+test('Codex accepts a single JSON block whose closing fence is missing', async () => {
+  const output = await run({ raw: '```json\n' + JSON.stringify(result, null, 2) + '\n', result });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.status.state, defaultFindingsState);
+  const twice = await run({ raw: jsonBlock(result) + '\n```json\n' + JSON.stringify(result) + '\n', result });
+  assert.match(twice.failures[0], /JSON ブロック/);
+});
+
+test('Claude posts no no-findings comment when Codex reviews next', async () => {
+  const output = await run({ isCodex: false, result: { summary: '', findings: [] }, env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.server.issueComments.length, 0);
+  assert.equal(output.server.reviews.length, 0);
+  assert.equal(output.status.state, 'success');
+  assert.equal(output.outputs.findings, '0');
+  // 指摘があるときは従来どおり投稿する
+  const found = await run({ isCodex: false, result, env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(summaryReviews(found.server).length, 1);
+});
+
+test('Codex posts one combined no-findings comment for both reviewers', async () => {
+  const claudeLabel = 'Claude · claude-test · effort low';
+  const output = await run({ result: { summary: '', findings: [] },
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel, MERGE_BASE: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_BASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.server.issueComments.length, 1);
+  const body = output.server.issueComments[0].body;
+  assert.match(body, /✅ 指摘なし\*\* \(Claude・Codex\)/);
+  assert.ok(body.includes(`${claudeLabel} / Codex · test-model · effort medium`));
+  assert.equal(output.publication.claude_label, claudeLabel);
+  // 再試行で新しく投稿する本文にも、保存した Claude のラベルを使う (再試行の job env は別の値でもよい)
+  const failed = await run({ result: { summary: '', findings: [] }, fail: 'createComment',
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel, MERGE_BASE: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_BASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.equal(failed.server.issueComments.length, 0);
+  const recovered = await recover({ artifactFiles: failed.artifactFiles, env: { REVIEWER_KIND: 'codex' } });
+  assert.equal(recovered.outputs.restored, 'true');
+  const resumed = await run({ server: failed.server, restoredRaw: recovered.raw,
+    restoredMetadata: JSON.parse(failed.artifactFiles['publication.json']), prMergeBase: 'a'.repeat(40),
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · other · effort ', RESTORED: 'true', REVIEW_BASE_SHA: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_DIFF_DIGEST: defaultDiffDigest,
+      REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped' } });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.server.issueComments.length, 1);
+  assert.ok(resumed.server.issueComments[0].body.includes(`${claudeLabel} / Codex`));
+  // 基点が Claude と違う・無いときは合同の「指摘なし」を出さない
+  for (const reviewBase of ['b'.repeat(40), '']) {
+    const mismatch = await run({ result: { summary: '', findings: [] },
+      env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel, MERGE_BASE: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', REVIEW_BASE_SHA: reviewBase, REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+    assert.match(mismatch.failures[0], /差分の基点が一致しません/);
+    assert.equal(mismatch.server.issueComments.length, 0);
+  }
+  // 指摘ありの Codex 結果も同じ
+  const withFindings = await run({ result, env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: claudeLabel,
+    MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'b'.repeat(40), REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.match(withFindings.failures[0], /差分の基点が一致しません/);
+  assert.equal(withFindings.server.reviews.length, 0);
+  // 基点が同じでも、渡した差分が Claude と違えば止める
+  const otherDiff = await run({ result: { summary: '', findings: [] }, env: { CLEAN_COMMENT: 'combined',
+    CLAUDE_LABEL: claudeLabel, MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: 'c'.repeat(64) } });
+  assert.match(otherDiff.failures[0], /差分が一致しません/);
+  assert.equal(otherDiff.server.issueComments.length, 0);
+  // Claude はダイジェストを出力し、Codex はそれを受け取る
+  const claudeOut = await run({ isCodex: false, result: { summary: '', findings: [] }, env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(claudeOut.outputs.diff_digest, defaultDiffDigest);
+  assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /REVIEW_DIFF_DIGEST: \$\{\{ needs\.review\.outputs\.diff_digest \}\}/);
+  // Codex のサマリーがあれば Claude も投稿を終えている。保存結果を失った Claude を再実行しない
+  const claude = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'claude' } });
+  assert.match(claude.error.message, /保存結果がありません/);
+  const codex = await recover({ artifacts: [], issueComments: output.server.issueComments, env: { REVIEWER_KIND: 'codex' } });
+  assert.match(codex.error.message, /保存結果がありません/);
+});
+
+test('a Claude summary quoting the Codex marker is still recognized as Claude', async () => {
+  const first = await run({ isCodex: false, result: { summary: '<!-- pr-review:codex -->', findings: [finding] } });
+  const reviews = first.server.reviews;
+  assert.ok(reviews.some(item => item.body?.includes('<!-- pr-review:codex -->') && !item.body.startsWith('<!-- pr-review:codex -->')));
+  const claude = await recover({ artifacts: [], reviews, env: { REVIEWER_KIND: 'claude' } });
+  assert.match(claude.error.message, /保存結果がありません/);
+  const codex = await recover({ artifacts: [], reviews, env: { REVIEWER_KIND: 'codex' } });
+  assert.equal(codex.error, undefined);
+});
+
+test('the Codex job reads the label Claude published, not a recomputed effort', () => {
+  assert.match(workflow, /core\.setOutput\("label", REVIEWER\)/);
+  assert.match(workflow, /label: \$\{\{ steps\.publish_review\.outputs\.label \}\}/);
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /CLAUDE_LABEL: \$\{\{ needs\.review\.outputs\.label \}\}/);
+  assert.doesNotMatch(workflow, /claude_effort/);
+});
+
+test('a finished claude-review status counts as published when Claude posted no comment', async () => {
+  const status = { context: 'claude-review', state: 'success', target_url: runUrl, creator: { login: 'github-actions[bot]' } };
+  const claude = await recover({ artifacts: [], statuses: [status], env: { REVIEWER_KIND: 'claude' } });
+  assert.match(claude.error.message, /保存結果がありません/);
+  for (const other of [{ ...status, state: 'pending' }, { ...status, target_url: 'https://example.com/other-run' },
+    { ...status, creator: { login: 'mallory' } }]) {
+    const output = await recover({ artifacts: [], statuses: [other], env: { REVIEWER_KIND: 'claude' } });
+    assert.equal(output.error, undefined);
+  }
+  const codex = await recover({ artifacts: [], statuses: [{ ...status, context: 'codex-review' }] });
+  assert.equal(codex.error, undefined);
+  // Codex はステータス履歴を取得しない
+  const codexFailing = await recover({ artifacts: [], fail: 'listCommitStatusesForRef' });
+  assert.equal(codexFailing.error, undefined);
+  assert.ok(!codexFailing.calls.some(call => call.method === 'listCommitStatusesForRef'));
+});
+
+test('the Codex job diffs against the merge-base Claude reviewed', () => {
+  assert.match(workflow, /merge_base: \$\{\{ steps\.review_diff\.outputs\.merge_base \|\| steps\.restore_review\.outputs\.merge_base \}\}/);
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /REVIEW_BASE_SHA: \$\{\{ needs\.review\.outputs\.merge_base \}\}/);
+  assert.match(workflow, /git diff --numstat "\$\{MERGE_BASE\}" HEAD/);
+});
+
+test('Codex still runs when Claude finished but its job failed afterwards, and is closed out when Claude did not finish', () => {
+  const codexJob = workflow.slice(workflow.indexOf('\n  codex:\n'));
+  assert.match(codexJob, /!cancelled\(\) &&/);
+  assert.match(codexJob, /needs\.review\.outputs\.findings &&\n\s+needs\.review\.outputs\.findings == '0'/);
+  const notRun = workflow.slice(workflow.indexOf('      - name: Mark Codex review as not run')).split(/\n      - name: /)[0];
+  assert.match(notRun, /steps\.publish_review\.outputs\.findings == ''/);
+  assert.match(notRun, /writeOwnedStatus\("codex-review", "error"/);
+});
+
+test('token source receives only a boolean, never the caller secrets', () => {
+  const section = workflow.slice(workflow.indexOf('      - name: Decide where the token comes from')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(section, /: \$\{\{ secrets\./);
+  assert.match(section, /secrets\.codex_auth_json != ''/);
+  assert.match(section, /secrets\.claude_code_oauth_token != ''/);
+});
+
+test('each job expands only its own model credentials, even in step env and with inputs', () => {
+  const codexAuth = workflow.slice(workflow.indexOf('      - name: Prepare Codex authentication')).split(/\n      - name: /)[0];
+  assert.match(codexAuth, /CALLER_AUTH_JSON: \$\{\{ matrix\.reviewer == 'codex' && secrets\.codex_auth_json \|\| '' \}\}/);
+  const claude = workflow.slice(workflow.indexOf('      - name: Review with Claude')).split(/\n      - name: /)[0];
+  assert.match(claude, /matrix\.reviewer == 'claude' && \(secrets\.claude_code_oauth_token/);
+});
+
+test('finalize turns only this run\'s still-pending checks into errors', async () => {
+  const finalizeScript = workflow.match(/- name: Close out pending checks[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);
+  const created = [];
+  const statuses = [
+    { context: 'codex-review', state: 'pending', target_url: runUrl, creator: bot },
+    { context: 'claude-review', state: 'success', target_url: runUrl, creator: bot },
+    { context: 'claude-review', state: 'pending', target_url: runUrl, creator: bot },
+  ];
+  const github = {
+    paginate: async () => statuses,
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: 'reviewed-head' } } }) } },
+  };
+  const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require);
+  assert.deepEqual(created.map(item => [item.context, item.state]), [['codex-review', 'error']]);
+  // 後続の run (run ID が大きい) のチェックには触らない
+  created.length = 0;
+  statuses[0] = { context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require);
+  assert.equal(created.length, 0);
+  // 前回の run の結果のまま・まだ無いチェックは、この run の判定が出ていないので error にする
+  created.length = 0;
+  statuses.splice(0, statuses.length, { context: 'claude-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122', creator: bot });
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require);
+  assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
+  // Codex を使わない呼び出し側では codex-review を作らない
+  created.length = 0;
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env: { ...env, CODEX_ENABLED: 'false' } }, require);
+  assert.deepEqual(created.map(item => item.context), ['claude-review']);
+  const job = workflow.slice(workflow.indexOf('\n  finalize:\n'));
+  assert.match(job, /needs: \[review, codex\]/);
+  assert.match(job, /if: always\(\) && needs\.review\.result != 'skipped'/);
+  assert.match(job, /permissions:\n      statuses: write\n/);
+});
+
+test('a status already updated by a later run is not overwritten', async () => {
+  const later = { context: 'codex-review', state: 'error', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
+  const output = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
+  assert.equal(output.status, undefined);
+  // 前回の run (run ID が小さい) の結果は、今回の結果で確定させる
+  const earlier = { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/122', creator: bot };
+  const overwritten = await run({ server: { reviews: [], comments: [], nextId: 88, statuses: [earlier] } });
+  assert.equal(overwritten.status.context, 'codex-review');
+  // 最新が古い run の pending でも、履歴に新しい run のものがあれば書かない
+  const buried = await run({ server: { reviews: [], comments: [], nextId: 88,
+    statuses: [{ context: 'codex-review', state: 'pending', target_url: 'https://github.com/example/repo/actions/runs/122', creator: bot }, later] } });
+  assert.equal(buried.status, undefined);
+  // 自分の run の pending が最新なら書く
+  const own = await run({ server: { reviews: [], comments: [], nextId: 88,
+    statuses: [{ context: 'codex-review', state: 'pending', target_url: runUrl, creator: bot }] } });
+  assert.equal(own.status.context, 'codex-review');
+  for (const name of ['Mark Codex review as skipped', 'Mark Codex review as not run']) {
+    const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
+    // 書き込みは共通の手順 (再試行のたびに履歴を読み直し、後続 run のものがあれば書かない)
+    assert.match(section, /new Function\("return " \+ process\.env\.PR_REVIEW_STATUS_HELPER\)\(\)\(github, context, process\.env\)/);
+    assert.doesNotMatch(section, /retries: 3/);
+  }
+});
+
+test('a Codex result whose diff does not match Claude is not made restorable', async () => {
+  const output = await run({ result: { summary: '', findings: [] }, env: { CLEAN_COMMENT: 'combined',
+    MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: 'c'.repeat(64) } });
+  assert.match(output.failures[0], /差分が一致しません/);
+  assert.equal(output.publication.restorable, false);
+  assert.deepEqual(output.publication.posted, []);
+});
+
+test('the start step does not reset a check that a later run already owns', async () => {
+  const startScript = workflow.match(/- name: Mark reviews as in progress[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const start = new AsyncFunction('github', 'context', 'core', 'process', 'require', startScript);
+  const created = [];
+  let prHead = 'reviewed-head';
+  const github = {
+    paginate: async () => [{ context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot }],
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: prHead } } }) } },
+  };
+  await start(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'codex', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.equal(created.length, 0);
+  await start(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.deepEqual(created.map(item => item.context), ['claude-review']);
+  // 履歴を取れないときは pending にしない (後続 run の確定結果を戻さないため)。ステップは止めない
+  created.length = 0;
+  const failing = { ...github, paginate: async () => { throw new Error('Simulated list failure'); } };
+  const warnings = [];
+  await start(failing, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { warning: message => warnings.push(message) },
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.deepEqual(created, []);
+  assert.equal(warnings.length, 2);
+  // 別の連携が同名のチェックに付けた大きい run ID は、後続 run とみなさない
+  const foreign = { ...github, paginate: async () => [
+    { context: 'claude-review', state: 'success', target_url: 'https://github.com/other/repo/actions/runs/999', creator: bot },
+    { context: 'codex-review', state: 'success', target_url: 'https://github.com/example/repo/actions/runs/999', creator: { login: 'other-app[bot]' } },
+  ] };
+  await start(foreign, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.deepEqual(created.map(item => item.context), ['claude-review', 'codex-review']);
+  assert.match(workflow.slice(workflow.indexOf('      - name: Mark reviews as in progress')).split(/\n      - name: /)[0],
+    /continue-on-error: true/);
+});
+
+test('a Codex diff preparation failure is reported with its reason', async () => {
+  const output = await run({ env: { REVIEW_DIFF_OUTCOME: 'failure', CODEX_DIFF_FAILURE: 'Claude と Codex の差分が一致しません。' } });
+  assert.equal(output.status.state, 'error');
+  assert.match(output.status.description, /差分が一致しません/);
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(report, /matrix\.reviewer == 'claude'/);
+  assert.match(report, /CODEX_FAILURE: \$\{\{ steps\.review_diff\.outputs\.codex_failure \}\}/);
+});
+
+test('when ownership cannot be checked, no status is written and the step fails', async () => {
+  // 履歴を確かめられないときは、どの状態も書かずにステップを失敗させる (再実行で書き直す)
+  for (const result of [{ summary: '', findings: [] }, undefined]) {
+    const output = await run({ ...(result ? { result } : {}), fail: 'listCommitStatusesForRef' });
+    assert.equal(output.status, undefined);
+    assert.match(output.thrown.message, /履歴を取得できず/);
+  }
+  const publishStep = workflow.slice(workflow.indexOf('      - name: Publish review threads and status')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(publishStep, /retries: 3/);
+});
+
+test('the publish step does not auto-retry create calls, and the comment dedupe avoids SIGPIPE', () => {
+  const publishStep = workflow.slice(workflow.indexOf('      - name: Publish review threads and status')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(publishStep, /retries: 3/);
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.doesNotMatch(report, /\| grep -q/);
+  assert.match(report, /contains\(env\.MARKER\)/);
+});
+
+test('Codex gating outputs are set only after claude-review is written, which is retried', async () => {
+  const output = await run({ isCodex: false, result: { summary: '', findings: [] }, fail: 'createCommitStatus' });
+  // 0件の Claude はコメントを出さず claude-review が唯一の公開結果なので、書けなければ Codex を起動しない
+  assert.equal(output.outputs.findings, undefined);
+  assert.equal(output.calls.filter(call => call.method === 'createCommitStatus').length, 3);
+  const written = await run({ isCodex: false, result: { summary: '', findings: [] } });
+  assert.equal(written.outputs.findings, '0');
+});
+
+test('an old run does not post after the PR head moved or a newer run reviewed the same head', async () => {
+  // PR の head が動いていれば投稿しない
+  const moved = await run({ result, prHead: 'newer-head' });
+  assert.equal(moved.server.reviews.length, 0);
+  assert.equal(moved.server.comments.length, 0);
+  assert.equal(moved.outputs.findings, undefined);
+  // チェックも書かず、Codex の未実行も出さない
+  assert.equal(moved.status, undefined);
+  assert.equal(moved.outputs.superseded, 'true');
+  const notRun = workflow.slice(workflow.indexOf('      - name: Mark Codex review as not run')).split(/\n      - name: /)[0];
+  assert.match(notRun, /steps\.publish_review\.outputs\.superseded != 'true'/);
+  // 同じ head に、この PR で自分より新しい run のサマリーがあれば投稿しない (保存結果の有無を問わない)
+  const newerSummary = { id: 5, user: { login: 'github-actions[bot]', type: 'Bot' },
+    body: '**✅ 指摘なし**\n\n---\n_Claude · x [Workflow run](https://github.com/example/repo/actions/runs/124)_\n<!-- pr-review:summary:abc -->\n<!-- pr-review:head:reviewed-head -->' };
+  const newer = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [newerSummary] } });
+  assert.equal(newer.server.issueComments.length, 1);
+  assert.equal(newer.outputs.findings, undefined);
+  assert.equal(newer.status.state, 'error');
+  // モデルの要約に含まれる run URL では判定しない (フッターの run URL だけを使う)
+  const quoted = { ...newerSummary, body: newerSummary.body
+    .replace('**✅ 指摘なし**', '**⚠️ 指摘 1件** — [参考](https://github.com/example/repo/actions/runs/999)')
+    .replace('/runs/124', '/runs/122') };
+  const notFooled = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [quoted] } });
+  assert.equal(notFooled.server.issueComments.length, 2);
+  // 古い run のサマリーや別の head のサマリーでは止めない
+  for (const body of [newerSummary.body.replace('/runs/124', '/runs/122'), newerSummary.body.replace('head:reviewed-head', 'head:other-head')]) {
+    const output = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [{ ...newerSummary, body }] } });
+    assert.equal(output.server.issueComments.length, 2);
+  }
+  // 別の PR の run がチェックを書いていても (commit status は SHA 単位)、この PR の投稿は止めない
+  const later = { context: 'claude-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
+  const otherPr = await run({ isCodex: false, result, server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
+  assert.equal(summaryReviews(otherPr.server).length, 1);
+  assert.equal(otherPr.outputs.findings, String(result.findings.length));
+  for (const name of ['Publish review threads and status', 'Mark Codex review as skipped']) {
+    const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
+    assert.match(section, /!cancelled\(\)/, name);
+    assert.doesNotMatch(section, /always\(\)/, name);
+  }
+});
+
+test('the status write procedure is defined once and loaded by every step that writes statuses', () => {
+  assert.equal(workflow.match(/async function writeOwnedStatus/g).length, 1);
+  assert.match(statusHelper, /runId\(item\.target_url, item\) > runId\(env\.RUN_URL\)\)\) return "superseded";/);
+  for (const name of ['Mark reviews as in progress', 'Publish review threads and status', 'Mark Codex review as skipped',
+    'Mark Codex review as not run', 'Close out pending checks']) {
+    const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
+    assert.match(section, /const writeOwnedStatus = new Function\("return " \+ process\.env\.PR_REVIEW_STATUS_HELPER\)\(\)\(github, context, process\.env\);/, name);
+  }
+});
+
+test('finalize ignores other posters and tries every context before failing', async () => {
+  const finalizeScript = workflow.match(/- name: Close out pending checks[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);
+  const created = [];
+  const statuses = [
+    { context: 'claude-review', state: 'success', target_url: runUrl, creator: { login: 'other-app[bot]' } },
+    { context: 'codex-review', state: 'pending', target_url: runUrl, creator: bot },
+  ];
+  const github = {
+    paginate: async () => statuses,
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => {
+      created.push(params);
+      if (params.context === 'claude-review') throw Object.assign(new Error('Validation Failed'), { status: 422 });
+    } }, pulls: { get: async () => ({ data: { head: { sha: 'reviewed-head' } } }) } },
+  };
+  const env = { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper };
+  await assert.rejects(finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} }, { env }, require), /claude-review/);
+  assert.deepEqual(created.map(item => [item.context, item.state]), [['claude-review', 'error'], ['codex-review', 'error']]);
+});
+
+test('the diff failure notice is only for a real failure, not a cancellation', () => {
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.match(report, /!cancelled\(\) &&/);
+  assert.match(report, /steps\.review_diff\.outcome == 'failure'/);
+});
+
+test('finalize leaves an old head alone once the PR head has moved', async () => {
+  const finalizeScript = workflow.match(/- name: Close out pending checks[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const finalize = new AsyncFunction('github', 'context', 'core', 'process', 'require', finalizeScript);
+  const created = [];
+  const github = {
+    paginate: async () => [],
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: 'newer-head' } } }) } },
+  };
+  await finalize(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
+    { env: { SHA: 'reviewed-head', RUN_URL: runUrl, CODEX_ENABLED: 'true', PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.equal(created.length, 0);
+  assert.match(workflow.slice(workflow.indexOf('\n  finalize:\n')), /pull-requests: read/);
+});
+
+test('an old run also stops for a base change or a later run without a summary, and lists are fetched once', async () => {
+  const based = await run({ result, prBase: 'release' });
+  assert.equal(based.server.reviews.length, 0);
+  // head は同じなので、理由付きの error で確定させる
+  assert.equal(based.status.state, 'error');
+  assert.match(based.status.description, /ベースブランチが変わった/);
+  // Claude は Codex の分も同じ理由で確定させる
+  const basedClaude = await run({ isCodex: false, result, prBase: 'release', env: { CODEX_ENABLED: 'true' } });
+  assert.deepEqual(basedClaude.calls.filter(call => call.method === 'createCommitStatus').map(call => [call.params.context, call.params.state]),
+    [['claude-review', 'error'], ['codex-review', 'error']]);
+  // サマリーを投稿できなかった新しい run も、この PR の run なら検出する
+  const laterRun = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88,
+    workflowRuns: [{ id: 124, pull_requests: [{ number: 7 }] }] } });
+  assert.equal(laterRun.server.issueComments.length, 0);
+  assert.equal(laterRun.status.state, 'error');
+  assert.match(laterRun.status.description, /新しい run/);
+  // 別の PR の新しい run では止めない
+  const otherPrRun = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88,
+    workflowRuns: [{ id: 124, pull_requests: [{ number: 8 }] }] } });
+  assert.equal(otherPrRun.server.issueComments.length, 1);
+  // 投稿前の確認で取ったレビュー・コメント一覧を使い回す
+  const once = await run({ result });
+  assert.equal(once.fetches.filter(fetch => fetch.method === 'listReviews').length, 1);
+  const onceClean = await run({ result: { summary: '', findings: [] } });
+  assert.equal(onceClean.fetches.filter(fetch => fetch.method === 'listIssueComments').length, 1);
+});
+
+test('the start step leaves an old head alone once the PR head has moved', async () => {
+  const startScript = workflow.match(/- name: Mark reviews as in progress[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+  const start = new AsyncFunction('github', 'context', 'core', 'process', 'require', startScript);
+  const created = [];
+  const github = {
+    paginate: async () => [],
+    rest: { repos: { listCommitStatusesForRef: 'list', createCommitStatus: async params => { created.push(params); } },
+      pulls: { get: async () => ({ data: { head: { sha: 'newer-head' } } }) } },
+  };
+  await start(github, { repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } } }, { info: () => {} },
+    { env: { SHA: 'reviewed-head', REVIEWER_KIND: 'claude', CODEX_ENABLED: 'true', RUN_URL: runUrl, PR_REVIEW_STATUS_HELPER: statusHelper } }, require);
+  assert.equal(created.length, 0);
+});
+
+test('a rewritten base history, or a moved head on a failure path, stops the old run', async () => {
+  // ベースの履歴が変わって merge-base が違えば、理由付きの error にして投稿しない
+  const rewound = await run({ result: { summary: '', findings: [] }, prMergeBase: 'b'.repeat(40), env: { MERGE_BASE: 'a'.repeat(40) } });
+  assert.equal(rewound.server.issueComments.length, 0);
+  assert.equal(rewound.status.state, 'error');
+  assert.match(rewound.status.description, /ベースブランチが変わった/);
+  // 復元やモデルの失敗の経路でも、head が動いていれば古い SHA に書かない
+  const failed = await run({ prHead: 'newer-head', env: { MODEL_OUTCOME: 'failure' } });
+  assert.equal(failed.status, undefined);
+  assert.equal(failed.outputs.superseded, 'true');
+  const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
+  assert.match(report, /current="\$\(gh api [^\n]*\.head\.sha \+ " " \+ \.base\.ref'\)"\n\s+if \[ "\$\{current\}" != /);
 });
