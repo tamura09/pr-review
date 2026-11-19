@@ -1594,6 +1594,12 @@ test('an old run does not post after the PR head moved or a newer run reviewed t
   assert.equal(newer.server.issueComments.length, 1);
   assert.equal(newer.outputs.findings, undefined);
   assert.equal(newer.status, undefined);
+  // モデルの要約に含まれる run URL では判定しない (フッターの run URL だけを使う)
+  const quoted = { ...newerSummary, body: newerSummary.body
+    .replace('**✅ 指摘なし**', '**⚠️ 指摘 1件** — [参考](https://github.com/example/repo/actions/runs/999)')
+    .replace('/runs/124', '/runs/122') };
+  const notFooled = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [quoted] } });
+  assert.equal(notFooled.server.issueComments.length, 2);
   // 古い run のサマリーや別の head のサマリーでは止めない
   for (const body of [newerSummary.body.replace('/runs/124', '/runs/122'), newerSummary.body.replace('head:reviewed-head', 'head:other-head')]) {
     const output = await run({ result: { summary: '', findings: [] }, server: { reviews: [], comments: [], nextId: 88, issueComments: [{ ...newerSummary, body }] } });

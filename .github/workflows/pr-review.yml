@@ -1371,7 +1371,15 @@ jobs:
               // この PR 自体を確かめる (commit status は SHA 単位で、別の PR と区別できないので使わない)。
               // - PR の head がレビューした SHA から動いていれば投稿しない
               // - この PR に、同じ head への自分より新しい run のサマリーがあれば投稿しない
-              const runIdOf = text => Number(/\/actions\/runs\/(\d+)\)/.exec(text || "")?.[1] ?? NaN);
+              // run ID は、投稿側が付けるフッター (サマリーの目印の直前の [Workflow run](...)_) の
+              // このリポジトリの run URL からだけ取る。モデルの要約に含まれる URL は使わない
+              const runsPrefix = RUN_URL.replace(/\d+$/, "");
+              const ownRunId = Number(RUN_URL.slice(runsPrefix.length));
+              const runIdOf = text => {
+                const footers = [...(text || "").matchAll(/\[Workflow run\]\(([^)\s]+)\)_\n<!-- pr-review:summary:/g)]
+                  .map(match => match[1]).filter(url => url.startsWith(runsPrefix));
+                return footers.length ? Number(/^\d+$/.exec(footers.at(-1).slice(runsPrefix.length))?.[0] ?? NaN) : NaN;
+              };
               const { data: currentPr } = await github.rest.pulls.get({ ...repo, pull_number: issue_number });
               const [prReviews, prComments] = await Promise.all([
                 github.paginate(github.rest.pulls.listReviews, { ...repo, pull_number: issue_number, per_page: 100 }),
@@ -1381,7 +1389,7 @@ jobs:
                 [...prReviews, ...prComments].some(item => isPublisher(item) &&
                   item.body?.includes(`<!-- pr-review:head:${SHA} -->`) &&
                   item.body.includes("<!-- pr-review:summary:") &&
-                  runIdOf(item.body) > runIdOf(`(${RUN_URL})`));
+                  runIdOf(item.body) > ownRunId);
               if (superseded) {
                 supersededRetry = true;
                 core.warning("PR の head が動いたか、同じ head への新しいレビューがあるため、この run の結果を投稿しません");
