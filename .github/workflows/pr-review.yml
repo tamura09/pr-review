@@ -221,6 +221,21 @@ env:
           }
         }
       }
+      // 後続 run がこの context を一度でも書いていたら真。レビューやコメントを作る前の確認に使う
+      writeOwnedStatus.supersededFor = async statusContext => {
+        for (let attempt = 1; ; attempt++) {
+          try {
+            const history = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+              ...context.repo, ref: env.SHA, per_page: 100,
+            });
+            return history.some(item => item.context === statusContext &&
+              runId(item.target_url, item) > runId(env.RUN_URL));
+          } catch (error) {
+            if (attempt >= 3) throw new Error(`チェックの履歴を取得できませんでした (${error.message})`);
+            await sleep(2000 * attempt);
+          }
+        }
+      };
       return writeOwnedStatus;
     })
 
@@ -1047,7 +1062,9 @@ jobs:
       # 再利用可能ワークフローの checkout 先は呼び出し側なので、処理はここに置く。
       - name: Publish review threads and status
         id: publish_review
-        if: always()
+        # キャンセルされた run は判定を書かない (同じ PR の後続 run の判定を古い結果で覆わない)。
+        # 判定が出なかったチェックは finalize が error にする
+        if: ${{ !cancelled() }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           SHA: ${{ github.event.pull_request.head.sha }}
@@ -1085,6 +1102,8 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.pull_request.number;
             const cleanComment = process.env.CLEAN_COMMENT || "own";
+            // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
+            const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
             let claudeLabel = process.env.CLAUDE_LABEL;
             let restoredMergeBase;
             const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
@@ -1362,7 +1381,12 @@ jobs:
               }
               // マーカーだけでなく投稿者も確認する。通常コメントにも同じ判定を使う。
               const isPublisher = item => item.user?.login === "github-actions[bot]" && item.user?.type === "Bot";
-              if (findings.length) {
+              // 同じ head の後続 run がすでに判定を書いていたら、古い結果のレビューやコメントを
+              // 投稿しない (保存結果からの再試行で、新しいレビューの後に古い結果が付くのを防ぐ)
+              const superseded = await writeOwnedStatus.supersededFor(statusContext);
+              if (superseded) {
+                core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果を投稿しません`);
+              } else if (findings.length) {
                 const params = { ...repo, pull_number: issue_number, per_page: 100 };
                 // 再実行時は公開済みの同一指摘を再利用する。履歴はモデルには渡さない。
                 const [reviews, comments] = await Promise.all([
@@ -1460,12 +1484,6 @@ jobs:
               publication.complete = true;
               savePublication();
               findingsCount = findings.length;
-              // 後続の codex ジョブを走らせるかの判定に使う。投稿まで終わったときだけ、
-              // チェックを書く前に出す (チェックの書き込みが失敗しても Codex は走らせる)
-              core.setOutput("findings", String(findingsCount));
-              // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
-              core.setOutput("label", REVIEWER);
-              core.setOutput("diff_digest", diffDigest);
               state = findings.length ? FINDINGS_STATE : "success";
               description = findings.length
                 ? `指摘 ${findings.length}件${headline ? `: ${headline}` : ""}`.slice(0, 130)
@@ -1483,12 +1501,19 @@ jobs:
               core.setFailed(description);
             }
 
-            // 書き込みの手順はワークフロー冒頭の PR_REVIEW_STATUS_HELPER (全ステップで共通)
-            const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
             // 同じ head の後続 run がこのチェックを一度でも書いていたら、古い結果で戻さない。
             // 前回の run の結果は、今回の結果で確定させる
-            if (await writeOwnedStatus(statusContext, state, description) === "superseded") {
+            const written = await writeOwnedStatus(statusContext, state, description);
+            if (written === "superseded") {
               core.warning(`${statusContext} は後続の run が更新済みのため、この run の結果では上書きしません`);
+            } else if (findingsCount !== undefined) {
+              // 後続の codex ジョブを走らせるかの判定に使う。0件の Claude はコメントを出さず
+              // claude-review が唯一の公開結果なので、それを書けたときだけ出す。
+              // この後の artifact 保存などが失敗しても Codex は走る
+              core.setOutput("findings", String(findingsCount));
+              // Codex の「指摘なし」コメントに、Claude が実際に使ったモデルと effort を載せる
+              core.setOutput("label", REVIEWER);
+              core.setOutput("diff_digest", diffDigest);
             }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
@@ -1500,7 +1525,7 @@ jobs:
       # 置き換わる
       - name: Mark Codex review as skipped
         if: >-
-          always() &&
+          !cancelled() &&
           matrix.reviewer == 'claude' &&
           inputs.codex_review && inputs.codex_fallback &&
           steps.publish_review.outputs.findings != '' &&

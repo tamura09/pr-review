@@ -1565,10 +1565,31 @@ test('the publish step does not auto-retry create calls, and the comment dedupe 
   assert.match(report, /contains\(env\.MARKER\)/);
 });
 
-test('Codex gating outputs are set before the status write, which is retried', async () => {
+test('Codex gating outputs are set only after claude-review is written, which is retried', async () => {
   const output = await run({ isCodex: false, result: { summary: '', findings: [] }, fail: 'createCommitStatus' });
-  assert.equal(output.outputs.findings, '0');
+  // 0件の Claude はコメントを出さず claude-review が唯一の公開結果なので、書けなければ Codex を起動しない
+  assert.equal(output.outputs.findings, undefined);
   assert.equal(output.calls.filter(call => call.method === 'createCommitStatus').length, 3);
+  const written = await run({ isCodex: false, result: { summary: '', findings: [] } });
+  assert.equal(written.outputs.findings, '0');
+});
+
+test('a run superseded by a later run posts no review, comment, or status, and cancelled runs do not publish', async () => {
+  const later = { context: 'codex-review', state: 'failure', target_url: 'https://github.com/example/repo/actions/runs/124', creator: bot };
+  for (const result of [{ summary: '', findings: [] }, undefined]) {
+    const output = await run({ ...(result ? { result } : {}), env: { CLEAN_COMMENT: 'own' },
+      server: { reviews: [], comments: [], nextId: 88, statuses: [later] } });
+    assert.equal(output.server.reviews.length, 0);
+    assert.equal(output.server.comments.length, 0);
+    assert.equal(output.server.issueComments.length, 0);
+    assert.equal(output.status, undefined);
+    assert.equal(output.outputs.findings, undefined);
+  }
+  for (const name of ['Publish review threads and status', 'Mark Codex review as skipped']) {
+    const section = workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
+    assert.match(section, /!cancelled\(\)/, name);
+    assert.doesNotMatch(section, /always\(\)/, name);
+  }
 });
 
 test('the status write procedure is defined once and loaded by every step that writes statuses', () => {
