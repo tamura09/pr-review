@@ -309,6 +309,9 @@ env:
       // 出現順のまま比べる (`x < 0 または y > 0` と `x > 0 または y < 0` を同じにしない)。
       // 単項の否定 `!` と論理演算子 `&&` `||` も数える (`!enabled` と `enabled`、`a && b` と `a || b` を同じにしない)
       const operators = text => (String(text ?? "").normalize("NFKC").match(/&&|\|\||[<>]=?|[!=]==?|!/g) ?? []).join(" ");
+      // 見出しを含む本文全体の英数字の識別子 (関数名・変数名など)。バッククォートで囲まれていなくても、
+      // 「createUser が空入力で失敗」と「deleteUser が空入力で失敗」を別の対象として区別する
+      const identifiers = text => new Set(String(text ?? "").normalize("NFKC").match(/[A-Za-z_$][\w$.]*/g) ?? []);
       function spanOverlap(a, b) {
         if (!a.size || !b.size) return 1;
         const shared = [...a].filter(span => b.has(span)).length;
@@ -332,6 +335,7 @@ env:
           if (!near && Number.isSafeInteger(item.line)) continue;
           if (item.key === contentKey(finding.path, finding.text)) return { item, how: "本文が一致" };
           if (spanOverlap(codeSpans(item.text), codeSpans(finding.text)) < MIN_SPAN_OVERLAP) continue;
+          if (spanOverlap(identifiers(item.text), identifiers(finding.text)) < MIN_SPAN_OVERLAP) continue;
           if (operators(item.text) !== operators(finding.text)) continue;
           // 類似度は見出しの行を除いた説明で測る (見出しが同じでも原因の説明が違う指摘を同じにしない)
           const body = similarity(description(item.text), description(finding.text));
@@ -688,7 +692,12 @@ jobs:
               threads.push(...page.nodes);
               cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
             } while (cursor);
+            // 指摘はこのワークフロー (github-actions) が投稿した、末尾に署名と印のあるスレッドに限る。
+            // 返信の続きのページは、対象のスレッドだけ取る (ほかのスレッドの取得の失敗で収集全体を落とさない)
+            const isFinding = root => root?.author?.__typename === "Bot" &&
+              ["github-actions", "github-actions[bot]"].includes(root.author.login) && declinedHelper.parsePosted(root.body) !== null;
             for (const thread of threads) {
+              if (!isFinding(thread.comments?.nodes?.[0])) continue;
               let info = thread.comments?.pageInfo;
               while (info?.hasNextPage) {
                 const data = await github.graphql(moreComments, { id: thread.id, cursor: info.endCursor });
@@ -722,10 +731,8 @@ jobs:
             const declined = [];
             for (const thread of threads) {
               const [root, ...replies] = thread.comments?.nodes ?? [];
-              // 指摘はこのワークフロー (github-actions) が投稿した、印付きのスレッドに限る
-              if (root?.author?.__typename !== "Bot" || !["github-actions", "github-actions[bot]"].includes(root.author.login)) continue;
+              if (!isFinding(root)) continue;
               const posted = declinedHelper.parsePosted(root.body);
-              if (!posted) continue;
               // 見送りの返信が複数あれば、最後のものの理由を使う
               let decision = null;
               for (const reply of replies) {

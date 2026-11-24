@@ -2291,3 +2291,21 @@ test('the Codex summary links the threads Claude matched, and only this PR\'s re
   assert.match(workflow, /declined_dropped_urls: \$\{\{ steps\.publish_review\.outputs\.declined_dropped_urls \}\}/);
   assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /CLAUDE_DECLINED_URLS: \$\{\{ needs\.review\.outputs\.declined_dropped_urls \}\}/);
 });
+
+test('a target named only in the headline, without backticks, still separates findings', () => {
+  const declined = [declinedItem('**createUser が空入力で失敗する**\n入力が空のとき、検証せずに保存処理へ進んで例外になります。', { item: { line: 10 } })];
+  const other = '**deleteUser が空入力で失敗する**\n入力が空のとき、検証せずに保存処理へ進んで例外になります。';
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 22, text: other }, declined), null);
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 12,
+    text: '**createUser が空の入力で失敗する**\n入力が空のとき、検証せずに保存処理へ進み、例外になります。' }, declined));
+});
+
+test('continuation pages are fetched only for finding threads', async () => {
+  const human = thread({ author: person('someone'), body: '人のコメント' }, [], { id: 'H1' });
+  human.comments.pageInfo = { hasNextPage: true, endCursor: 'H1:1' };
+  const output = await collectDeclined({ pages: [[human,
+    thread({ body: postedBody(finding.body) }, [{ author: person('author'), body: '見送り: x' }])]], moreComments: {} });
+  assert.equal(output.error, undefined);
+  assert.equal(output.queries.filter(query => query.id).length, 0);
+  assert.equal(output.declined.length, 1);
+});
