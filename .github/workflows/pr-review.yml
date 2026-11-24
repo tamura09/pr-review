@@ -661,7 +661,7 @@ jobs:
       # 見送り済みの指摘を集める。この PR のレビュースレッドのうち、このワークフローが投稿した
       # 指摘 (pr-review:finding の印付き) に、PR の作成者か書き込み権限のある人が「見送り:」で
       # 始まる返信を付けたもの。resolve の有無は問わない。bot や第三者の返信は数えない。
-      # 一覧は declined.md に書いてモデルに渡し (Claude は Read で読み、Codex はプロンプトに連結)、投稿ステップが
+      # 一覧は declined.md に書き、両モデルのプロンプトにはそのファイルを読む指示だけを入れる。投稿ステップが
       # declined.json と照らして同じ指摘を取り除く。範囲はこの PR だけで、ほかの PR には持ち越さない。
       # 取れなかったときもレビューは止めず、投稿ステップが「照合していない」とサマリーに書く
       - name: Collect declined findings
@@ -763,8 +763,9 @@ jobs:
               });
             }
             fs.writeFileSync(path.join(dir, "declined.json"), JSON.stringify(declined), { mode: 0o600 });
-            // 一覧はファイルでモデルに渡す。ステップの出力や環境変数に入れると、件数が多いときに
-            // 1つの環境変数の上限 (Linux は 128 KiB) を超えてステップを起動できない
+            // 一覧はファイルでモデルに渡し、両モデルが自分で読む。ステップの出力や環境変数に入れると、件数が
+            // 多いときに1つの環境変数の上限 (Linux は 128 KiB) を超えてステップを起動できない。初期プロンプトに
+            // 連結すると、長い理由が重なったときにモデルの入力の上限を超えうる
             const listFile = path.join(dir, "declined.md");
             fs.writeFileSync(listFile, declinedHelper.formatPrompt(declined), { mode: 0o600 });
             // パスや見出しはログに出さない。改行の後ろや行の途中の `##[` を、ランナーが
