@@ -2335,3 +2335,12 @@ test('reopen: null is treated like an omitted reopen, so the finding is still ma
     assert.doesNotMatch(output.review.comments[0].body, /挙げ直しています/);
   }
 });
+
+test('the sign of a number separates boundary conditions', () => {
+  const declined = [declinedItem('**登録が失敗する**\n入力が -1 のときに登録処理が失敗します。')];
+  for (const text of ['**登録が失敗する**\n入力が 1 のときに登録処理が失敗します。', '**登録が失敗する**\n入力が −1 のときに登録処理が失敗します。'.replace('−1', '2')]) {
+    assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text }, declined), null, text);
+  }
+  // 全角のマイナスも同じ負数として扱う
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: '**登録が失敗する**\n入力が −1 のとき、登録処理が失敗します。' }, declined));
+});

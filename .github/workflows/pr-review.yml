@@ -314,7 +314,9 @@ env:
       const identifiers = text => new Set(String(text ?? "").normalize("NFKC").match(/[A-Za-z_$][\w$.]*/g) ?? []);
       // 本文の数値の並び。ステータスコードや境界値が違えば、言い回しが同じでも別の条件の指摘
       // (`HTTP 403` と `HTTP 429` を同じにしない)
-      const numbers = text => (String(text ?? "").normalize("NFKC").match(/\d+(?:\.\d+)?/g) ?? []).join(" ");
+      // 符号も含める (`-1` と `1` を同じにしない)
+      const numbers = text => (String(text ?? "").normalize("NFKC").replace(/[\u2212\u2012-\u2015]/g, "-")
+        .match(/(?<![\w.])-?\d+(?:\.\d+)?|\d+(?:\.\d+)?/g) ?? []).join(" ");
       function spanOverlap(a, b) {
         if (!a.size || !b.size) return 1;
         const shared = [...a].filter(span => b.has(span)).length;
