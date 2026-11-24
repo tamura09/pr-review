@@ -2212,3 +2212,45 @@ test('a quoted marker thread from another workflow is not collected as a decline
     [{ author: person('author'), body: '見送り: x' }])]] });
   assert.equal(output.declined.length, 0);
 });
+
+test('a moved thread is compared at its current line only, not at the line it came from', () => {
+  const text = '**空配列で先頭要素を読むと例外になる**\n`items[0]` を確かめずに読むので、空配列のとき `undefined` の `id` を読んで落ちます。';
+  // 40行目の指摘を見送った後、スレッドは140行目へ動いた
+  const declined = [declinedItem(text, { item: { line: 140, original_line: 40 } })];
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 40, text }, declined), null);
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 141, text }, declined));
+  // 現在の行が分からなければ、当時の行で見る
+  const outdated = [declinedItem(text, { item: { line: null, original_line: 40 } })];
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 40, text }, outdated));
+});
+
+test('declined deletions only match deletions, and the side is collected from the thread', async () => {
+  const text = '**削除で呼び出し元が壊れる**\n`load` を消したので、`init` からの呼び出しが失敗します。';
+  const declined = [declinedItem(text, { item: { side: 'LEFT', line: 100 } })];
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 100, side: 'RIGHT', text }, declined), null);
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 100, side: 'LEFT', text }, declined));
+  const output = await collectDeclined({ pages: [[
+    thread({ body: postedBody(text) }, [{ author: person('author'), body: '見送り: x' }], { diffSide: 'LEFT' }),
+    thread({ body: postedBody(text, { fallback: 'LEFT 9行' }) }, [{ author: person('author'), body: '見送り: x' }],
+      { diffSide: 'RIGHT', line: null }),
+    thread({ body: postedBody(text) }, [{ author: person('author'), body: '見送り: x' }]),
+  ]] });
+  assert.deepEqual(output.declined.map(item => item.side), ['LEFT', 'LEFT', null]);
+  // 投稿ステップは指摘の側を渡す
+  assert.match(workflow, /matchDeclined\(\{ path: file\.path, line: finding\.line, side: finding\.side,/);
+});
+
+test('a shared headline does not make findings with different causes the same', () => {
+  const head = '**保存した設定を復元すると次の更新で利用者の変更が失われる**';
+  const declined = [declinedItem(`${head}\n既定値が既存値を上書きします。`)];
+  const other = `${head}\n古い応答が後着します。`;
+  assert.ok(declinedHelper.similarity(declined[0].text, other) > 0.55);
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: other }, declined), null);
+});
+
+test('a unary negation separates opposite conditions', () => {
+  const declined = [declinedItem('**保存できない**\n条件が !enabled のときエラーになり保存できません。')];
+  const opposite = '**保存できない**\n条件が enabled のときエラーになり保存できません。';
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: opposite }, declined), null);
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: '**保存できない**\n条件が !enabled のとき、エラーになって保存できません。' }, declined));
+});
