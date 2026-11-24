@@ -1873,6 +1873,8 @@ test('the declined list reaches both prompts with its summary, location and reas
   const collectStep = section('Collect declined findings');
   assert.match(collectStep, /continue-on-error: true/);
   assert.match(collectStep, /steps\.restore_review\.outcome == 'success'/);
+  // 保存結果から投稿し直すときは集めない (前回の照合結果を使う)
+  assert.match(collectStep, /steps\.restore_review\.outputs\.restored != 'true'/);
   assert.ok(workflow.indexOf('- name: Collect declined findings') < workflow.indexOf('- name: Review with Claude'));
   assert.ok(workflow.indexOf('- name: Collect declined findings') > workflow.indexOf('- name: Prepare PR diff'));
   const claude = section('Review with Claude');
@@ -1958,8 +1960,11 @@ test('matching needs the same file, and is stricter away from the declined line'
   const near = '**境界値で失敗します**\n入力が 0 のときに例外になるので、境界条件を直してください。';
   assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 50, text: near }, declined));
   assert.equal(declinedHelper.matchDeclined({ path: 'src/other.ts', line: 42, text: finding.body }, declined), null);
-  // 本文がそのままなら離れた行でも落とす (行が大きく動いた場合)
-  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 400, text: `  ${finding.body}\n` }, declined));
+  // スレッドの現在の行が分からない (outdated) とき、本文がそのままなら離れた行でも落とす
+  const outdated = [declinedItem(finding.body, { item: { line: null } })];
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 400, text: `  ${finding.body}\n` }, outdated));
+  // 現在の行が分かっていて離れていれば、同じ本文でも別の箇所の指摘として残す
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 400, text: finding.body }, declined), null);
   // 似ているだけの別の行の指摘は、近くなければ残す
   const loose = '**境界値の扱い**\nページ番号が負のときに一覧が空になります。範囲を確かめてください。';
   assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 400, text: loose }, declined), null);
@@ -2135,14 +2140,15 @@ test('a finding marker quoted in the body is not taken for the publisher marker'
   assert.equal(declinedHelper.declineReason('﻿見送り：理由'), '理由');
 });
 
-test('paths and headlines with newlines are logged as JSON, not as workflow commands', async () => {
-  const output = await collectDeclined({ pages: [[thread({ body: postedBody('**見出し\n::error::偽物**\n本文') },
+test('paths and headlines are not logged, so they cannot become workflow commands', async () => {
+  const output = await collectDeclined({ pages: [[thread({ body: postedBody('**見出し ##[error]偽物\n::error::偽物**\n本文') },
     [{ author: person('author'), body: '見送り: x' }], { path: 'src/a\n::warning::injected.ts' })]] });
   assert.equal(output.declined.length, 1);
   const lines = output.infos.filter(message => message.startsWith('見送り済み: '));
   assert.equal(lines.length, 1);
   assert.doesNotMatch(lines[0], /\n/);
-  assert.match(lines[0], /src\/a\\n::warning::injected\.ts/);
+  assert.doesNotMatch(lines[0], /injected|偽物|##\[|::/);
+  assert.equal(lines[0], '見送り済み: https://github.com/example/repo/pull/7#discussion_r1 (@author)');
 });
 
 test('a result saved before declined matching existed is restored with nothing dropped', async () => {
@@ -2168,4 +2174,41 @@ test('a result saved before declined matching existed is restored with nothing d
       REVIEWER: recovered.outputs.reviewer } });
   assert.equal(broken.status.state, 'error');
   assert.match(broken.failures[0], /見送りの照合結果が不正/);
+});
+
+test('the same wording in another function of the file is kept when the declined thread is elsewhere', () => {
+  const text = '**空配列で先頭要素を読むと例外になる**\n`items[0]` を確かめずに読むので、空配列のとき `undefined` の `id` を読んで落ちます。';
+  const declined = [declinedItem(text, { item: { line: 42, original_line: 42 } })];
+  // 本文が完全に同じでも、離れた行 (別の関数) の指摘は残す
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 120, text }, declined), null);
+  // 同じ箇所なら落とす
+  assert.match(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 44, text }, declined).how, /本文が一致/);
+});
+
+test('operator order matters, so swapped conditions are not the same finding', () => {
+  const declined = [declinedItem('**条件の取り違え**\n入力が x < 0 または y > 0 のとき、変換処理が例外を投げて一覧の表示が止まります。')];
+  const swapped = '**条件の取り違え**\n入力が x > 0 または y < 0 のとき、変換処理が例外を投げて一覧の表示が止まります。';
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: swapped }, declined), null);
+});
+
+test('only comments ending in the publisher\'s own signature and marker count as findings', () => {
+  const marker = `<!-- pr-review:finding:${'c'.repeat(64)} -->`;
+  // 別のワークフローのコメントが印を引用しているだけ
+  for (const body of [
+    `ビルドが失敗しました。\n${marker}\n詳細はログを見てください。`,
+    `**引用**\n\n_Claude · x · effort low_\n${marker}\n\n追記: 別の文章`,
+    `**署名が違う**\n\n_Deploy bot_\n${marker}`,
+  ]) {
+    assert.equal(declinedHelper.parsePosted(body), null, body);
+  }
+  // 投稿側の形 (行への指摘・ファイル単位・挙げ直し) は読める
+  assert.equal(declinedHelper.parsePosted(`**本文**\n説明\n\n_Claude · m · effort high_\n${marker}`).text, '**本文**\n説明');
+  assert.equal(declinedHelper.parsePosted(postedBody('**本文**', { fallback: 'LEFT 7行' })).fallback_line, 7);
+  assert.equal(declinedHelper.parsePosted(`**本文**\n\n${declinedHelper.REOPEN_NOTE}理由\n\n_Codex · m · effort low_\n${marker}`).text, '**本文**');
+});
+
+test('a quoted marker thread from another workflow is not collected as a declined finding', async () => {
+  const output = await collectDeclined({ pages: [[thread({ body: `ビルド失敗の説明 <!-- pr-review:finding:${'d'.repeat(64)} --> 続き` },
+    [{ author: person('author'), body: '見送り: x' }])]] });
+  assert.equal(output.declined.length, 0);
 });

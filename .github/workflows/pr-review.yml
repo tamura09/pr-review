@@ -232,7 +232,12 @@ env:
   PR_REVIEW_DECLINED_HELPER: |
     ((crypto) => {
       // --- 見送り済みの指摘 (収集・プロンプト・投稿前の照合で同じ手順) ---
-      const FINDING_MARKER = /<!-- pr-review:finding:([0-9a-f]{64}) -->/;
+      // 投稿側が指摘の末尾に付ける形: 本文、空行、_モデルの署名_、印。ファイル単位に切り替えた
+      // 指摘には、その後ろに元の位置の注記が1つだけ付く。末尾がこの形でないもの (同じ
+      // github-actions 名義の別のワークフローが印を引用したコメントなど) は指摘として扱わない
+      const POSTED_TAIL = new RegExp("\\r?\\n\\r?\\n_((?:Claude|Codex) · [^\\r\\n]*)_\\r?\\n" +
+        "<!-- pr-review:finding:([0-9a-f]{64}) -->" +
+        "(?:\\r?\\n\\r?\\n> [^\\r\\n]*（(LEFT|RIGHT) (\\d+)行）。ファイル全体への指摘として投稿しています。)?\\s*$");
       // モデルが見送り済みの指摘をあえて挙げ直したときに、投稿側が本文に付ける注記
       const REOPEN_NOTE = "> 見送り済みの指摘を挙げ直しています: ";
       // 見送りの印は、返信の本文の先頭の「見送り:」だけ (全角のコロンも同じに扱う)。
@@ -243,17 +248,16 @@ env:
       }
       // GraphQL の author。GitHub App は __typename が Bot、REST 由来の login は [bot] で終わる
       const isBot = author => !author?.login || author.__typename === "Bot" || /\[bot\]$/i.test(author.login);
-      // 投稿した指摘の本文から、モデルが書いた部分・印のハッシュ・ファイル単位にした元の行を取り出す
-      // 印は投稿側が署名の後に付けた最後のもの。モデルが本文に印を引用していても、それは本文として扱う
+      // 投稿した指摘の本文から、モデルが書いた部分・印のハッシュ・ファイル単位にした元の行を取り出す。
+      // 印は末尾の形 (POSTED_TAIL) のものだけを使う。本文に引用された印は本文として扱う
       function parsePosted(body) {
         body = String(body ?? "");
-        const marker = [...body.matchAll(new RegExp(FINDING_MARKER.source, "g"))].at(-1);
-        if (!marker) return null;
-        let text = body.slice(0, marker.index).replace(/\n+_[^\n]*_\s*$/, "");
+        const tail = POSTED_TAIL.exec(body);
+        if (!tail) return null;
+        let text = body.slice(0, tail.index);
         const reopen = text.lastIndexOf(`\n\n${REOPEN_NOTE}`);
         if (reopen >= 0) text = text.slice(0, reopen);
-        const fallback = /（(LEFT|RIGHT) (\d+)行）。ファイル全体への指摘/.exec(body.slice(marker.index));
-        return { hash: marker[1], text: text.trim(), fallback_line: fallback ? Number(fallback[2]) : null };
+        return { hash: tail[2], text: text.trim(), fallback_line: tail[4] ? Number(tail[4]) : null };
       }
       // 1行目の見出し (**...**) を要旨とする
       function headline(text) {
@@ -295,7 +299,8 @@ env:
         .map(match => match[1].trim()));
       // 比較演算子の並び。本文の言い回しが同じでも、`x < 0` と `x > 0` のように条件が逆なら別の指摘
       // (コード片の外に書かれた演算子も見る)
-      const operators = text => (String(text ?? "").normalize("NFKC").match(/[<>]=?|[!=]==?/g) ?? []).sort().join(" ");
+      // 出現順のまま比べる (`x < 0 または y > 0` と `x > 0 または y < 0` を同じにしない)
+      const operators = text => (String(text ?? "").normalize("NFKC").match(/[<>]=?|[!=]==?/g) ?? []).join(" ");
       function spanOverlap(a, b) {
         if (!a.size || !b.size) return 1;
         const shared = [...a].filter(span => b.has(span)).length;
@@ -307,9 +312,13 @@ env:
         for (const item of declined) {
           if (item.path !== finding.path) continue;
           if (finding.hash && item.hash === finding.hash) return { item, how: "印のハッシュが一致" };
-          if (item.key === contentKey(finding.path, finding.text)) return { item, how: "本文が一致" };
           const near = [item.line, item.original_line, item.fallback_line].some(line =>
             Number.isSafeInteger(line) && Math.abs(line - finding.line) <= NEAR_LINES);
+          // 見送ったスレッドの現在の行が分かっていて離れていれば、別の箇所 (同じファイルの別の関数など)
+          // の指摘として残す。本文が同じでも落とさない。離れた行で照合するのは、スレッドが古くなって
+          // 現在の行が分からないとき (outdated・ファイル単位) だけ
+          if (!near && Number.isSafeInteger(item.line)) continue;
+          if (item.key === contentKey(finding.path, finding.text)) return { item, how: "本文が一致" };
           if (spanOverlap(codeSpans(item.text), codeSpans(finding.text)) < MIN_SPAN_OVERLAP) continue;
           if (operators(item.text) !== operators(finding.text)) continue;
           const body = similarity(item.text, finding.text);
@@ -626,7 +635,8 @@ jobs:
       # 取れなかったときもレビューは止めず、投稿ステップが「照合していない」とサマリーに書く
       - name: Collect declined findings
         id: declined
-        if: ${{ !cancelled() && steps.restore_review.outcome == 'success' }}
+        # 保存結果から投稿し直すときは、前回 attempt の照合結果を使うので集めない
+        if: ${{ !cancelled() && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' }}
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
@@ -721,11 +731,9 @@ jobs:
             // 1つの環境変数の上限 (Linux は 128 KiB) を超えてステップを起動できない
             const listFile = path.join(dir, "declined.md");
             fs.writeFileSync(listFile, declinedHelper.formatPrompt(declined), { mode: 0o600 });
-            // パス・見出し・login は改行を含みうるので、JSON 文字列にしてから出す (改行の後ろを
-            // workflow command として解釈させない)
-            for (const item of declined) {
-              core.info(`見送り済み: ${JSON.stringify({ path: item.path, headline: item.headline, by: item.by, url: item.url })}`);
-            }
+            // パスや見出しはログに出さない。改行の後ろや行の途中の `##[` を、ランナーが
+            // workflow command として解釈しうるため。GitHub が作るスレッドの URL と login だけを出す
+            for (const item of declined) core.info(`見送り済み: ${item.url} (@${item.by})`);
             core.info(`見送り済みの指摘: ${declined.length}件`);
             core.setOutput("count", String(declined.length));
             // Claude のプロンプトには、一覧のファイルを読む指示だけを入れる (Codex は run の中で
