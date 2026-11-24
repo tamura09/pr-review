@@ -150,7 +150,7 @@ async function run(options = {}) {
     let thrown;
     const outputs = {};
     try { await publish(github, {
-      repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } }, runId: 123,
+      repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7, html_url: 'https://github.com/example/repo/pull/7' } }, runId: 123,
     }, { error: message => errors.push(message), setFailed: message => failures.push(message), warning: () => {},
       notice: message => notices.push(message), setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
@@ -2253,4 +2253,41 @@ test('a unary negation separates opposite conditions', () => {
   const opposite = '**保存できない**\n条件が enabled のときエラーになり保存できません。';
   assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: opposite }, declined), null);
   assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: '**保存できない**\n条件が !enabled のとき、エラーになって保存できません。' }, declined));
+});
+
+test('logical operators separate conditions joined differently', () => {
+  const declined = [declinedItem('**権限の判定が誤る**\n利用者が admin && owner のときだけ削除を許すため、所有者でも削除できません。')];
+  const other = '**権限の判定が誤る**\n利用者が admin || owner のときだけ削除を許すため、所有者でも削除できません。';
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: other }, declined), null);
+});
+
+test('the declined list tells the models which side of the diff each line is on', () => {
+  const text = '**削除で呼び出し元が壊れる**\n本文';
+  const prompt = declinedHelper.formatPrompt([
+    { ...declinedItem(text), side: 'LEFT', line: 42 },
+    { ...declinedItem(text), side: 'RIGHT', line: null, original_line: 42 },
+    { ...declinedItem(text), side: null, line: 7 },
+  ]);
+  assert.match(prompt, /`src\/example\.ts` 削除側 \(LEFT\) の42行/);
+  assert.match(prompt, /`src\/example\.ts` 追加側 \(RIGHT\) の42行付近 \(当時\)/);
+  assert.match(prompt, /`src\/example\.ts` 7行/);
+});
+
+test('the Codex summary links the threads Claude matched, and only this PR\'s review threads', async () => {
+  const claude = await run({ isCodex: false, declined: [declinedItem(finding.body)], env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(claude.outputs.declined_dropped_urls, JSON.stringify(['https://github.com/example/repo/pull/7#discussion_r1']));
+  const output = await run({ result,
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · c · effort low', CLAUDE_DECLINED_DROPPED: '2',
+      CLAUDE_DECLINED_URLS: JSON.stringify(['https://github.com/example/repo/pull/7#discussion_r1',
+        'https://evil.example/pull/7#discussion_r2', 'https://github.com/example/repo/pull/7#discussion_r3)x']),
+      MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.match(output.summary.body, /除外 \(Claude\): 2件 — 照合した見送り: \[1\]\(https:\/\/github\.com\/example\/repo\/pull\/7#discussion_r1\)\n/);
+  assert.doesNotMatch(output.summary.body, /evil|r3\)x/);
+  // 壊れた値は無視する
+  const broken = await run({ result, env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'c', CLAUDE_DECLINED_DROPPED: '1',
+    CLAUDE_DECLINED_URLS: 'not json', MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.equal(broken.failures.length, 0);
+  assert.match(broken.summary.body, /除外 \(Claude\): 1件\n/);
+  assert.match(workflow, /declined_dropped_urls: \$\{\{ steps\.publish_review\.outputs\.declined_dropped_urls \}\}/);
+  assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /CLAUDE_DECLINED_URLS: \$\{\{ needs\.review\.outputs\.declined_dropped_urls \}\}/);
 });
