@@ -2324,3 +2324,14 @@ test('the total number of dropped findings is logged apart from the declined lis
   const output = await run({ declined: [declinedItem(finding.body), declinedItem('**別の見送り**\n本文', { item: { line: 9 } })] });
   assert.ok(output.infos.includes('見送り済みの指摘と同じため除外: 1件 (照合した見送りの一覧: 2件)'));
 });
+
+test('reopen: null is treated like an omitted reopen, so the finding is still matched and nothing fails', async () => {
+  for (const isCodex of [false, true]) {
+    const output = await run({ isCodex, declined: [declinedItem(finding.body)],
+      result: { summary: '境界値で失敗する', findings: [{ ...finding, reopen: null }, { ...finding, line: 9, side: 'LEFT', body: '**別**\n本文', reopen: null }] } });
+    assert.equal(output.failures.length, 0);
+    assert.equal(output.outputs.findings, '1');
+    assert.equal(output.outputs.declined_dropped, '1');
+    assert.doesNotMatch(output.review.comments[0].body, /挙げ直しています/);
+  }
+});

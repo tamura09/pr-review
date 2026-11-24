@@ -1685,7 +1685,8 @@ jobs:
                     !Number.isSafeInteger(finding.line) || finding.line < 1 ||
                     !["LEFT", "RIGHT"].includes(finding.side) ||
                     typeof finding.body !== "string" || !finding.body.trim() ||
-                    (finding.reopen !== undefined && typeof finding.reopen !== "string")) {
+                    // reopen は省略・null・文字列だけを受け付ける (null は省略と同じ。Codex は JSON を自由に書くため)
+                    (finding.reopen !== undefined && finding.reopen !== null && typeof finding.reopen !== "string")) {
                   throw new Error("指摘のパス・行番号・本文が不正です");
                 }
                 // LEFT の旧パスと RIGHT の現行パスは別の名前空間で解決する。
