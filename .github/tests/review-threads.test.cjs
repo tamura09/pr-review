@@ -2021,3 +2021,20 @@ test('a publication retry reuses the declined matching of the first attempt inst
     assert.deepEqual(resumed.publication.declined_dropped, first.publication.declined_dropped);
   }
 });
+
+test('a different problem whose headline only differs by its target is not dropped', () => {
+  const declined = [declinedItem('**`foo` が null のとき例外になる**\n`foo` を設定から読む処理で、未設定だと null のまま `foo.trim()` を呼んで落ちます。')];
+  const other = '**`bar` が null のとき例外になる**\n`bar` は API の応答から取りますが、空応答だと null のまま `bar.length` を読んで落ちます。';
+  // 見出しはほぼ同じ (0.8) でも、近い行・離れた行のどちらでも残す
+  assert.ok(declinedHelper.similarity(declinedHelper.headline(declined[0].text), declinedHelper.headline(other)) > 0.7);
+  for (const line of [42, 400]) {
+    assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line, text: other }, declined), null);
+  }
+  // コード片が共通しない指摘は、本文が似ていても別の対象として残す
+  const sameWords = '**`bar` が null のとき例外になる**\n`bar` を設定から読む処理で、未設定だと null のまま `bar.trim()` を呼んで落ちます。';
+  assert.ok(declinedHelper.similarity(declined[0].text, sameWords) >= 0.55);
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: sameWords }, declined), null);
+  // 同じ対象の言い直しは落とす
+  const repeat = '**`foo` が null のときに例外になります**\n設定に `foo` が無いと null のまま `foo.trim()` を呼ぶので落ちます。';
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: repeat }, declined));
+});

@@ -276,11 +276,16 @@ env:
         for (const count of right.values()) total += count;
         return total ? 2 * shared / total : 0;
       }
-      // 照合の閾値。近い行 (±NEAR_LINES) なら緩く、同じファイルの離れた行・行の分からない
-      // スレッドなら厳しく見る。別のファイルは照合しない
+      // 照合の閾値 (本文の類似度)。近い行 (±NEAR_LINES) なら緩く、同じファイルの離れた行・
+      // 行の分からないスレッドなら厳しく見る。別のファイルは照合しない。
+      // 見出しだけの類似では落とさない。「`foo` が null で落ちる」と「`bar` が null で落ちる」の
+      // ように、対象だけ違う別の問題の見出しはほぼ同じになるため (見出しの類似度はログに出すだけ)
       const NEAR_LINES = 20;
-      const NEAR = { body: 0.4, headline: 0.5 };
-      const FAR = { body: 0.6, headline: 0.7 };
+      const NEAR_BODY = 0.55;
+      const FAR_BODY = 0.65;
+      // 本文のコード片 (`...`)。どちらにもあって一つも共通しなければ、別の対象についての指摘とみなす
+      const codeSpans = text => new Set([...String(text ?? "").matchAll(/`([^`\n]+)`/g)]
+        .map(match => match[1].trim().toLowerCase()));
       // finding: { path, line, text, hash }。一致した見送りと理由、なければ null
       function matchDeclined(finding, declined) {
         let best = null;
@@ -290,11 +295,12 @@ env:
           if (item.key === contentKey(finding.path, finding.text)) return { item, how: "本文が一致" };
           const near = [item.line, item.original_line, item.fallback_line].some(line =>
             Number.isSafeInteger(line) && Math.abs(line - finding.line) <= NEAR_LINES);
+          const spans = codeSpans(item.text), findingSpans = codeSpans(finding.text);
+          if (spans.size && findingSpans.size && ![...spans].some(span => findingSpans.has(span))) continue;
           const body = similarity(item.text, finding.text);
           const head = similarity(item.headline, headline(finding.text));
-          const limit = near ? NEAR : FAR;
-          if (body < limit.body && head < limit.headline) continue;
-          const score = Math.max(body, head);
+          if (body < (near ? NEAR_BODY : FAR_BODY)) continue;
+          const score = body;
           if (!best || score > best.score) {
             best = { item, score, how: `類似 (本文 ${body.toFixed(2)}・要旨 ${head.toFixed(2)}${near ? "・近い行" : ""})` };
           }
