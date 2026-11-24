@@ -381,8 +381,11 @@ env:
               `- ファイルと行: \`${item.path}\` ${where}`,
               `- 要旨: ${clip(item.headline, 200)}`,
               `- 指摘の本文:`,
-              ...clip(item.text, 800).split("\n").map(line => `  > ${line}`),
-              `- 見送りの理由 (@${item.by}): ${clip(item.reason, 1000).replace(/\s*\n\s*/g, " ") || "(記載なし)"}`,
+              // 一覧はファイルで渡すので、長さの上限で切らない。理由の末尾にある結論や前提も、
+              // `reopen` を判断するために全文を渡す
+              ...String(item.text ?? "").trim().split("\n").map(line => `  > ${line}`),
+              `- 見送りの理由 (@${item.by}):`,
+              ...(String(item.reason ?? "").trim() || "(記載なし)").split("\n").map(line => `  > ${line}`),
               "",
             ].join("\n");
           }),

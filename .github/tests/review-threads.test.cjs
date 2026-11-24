@@ -1867,7 +1867,7 @@ test('the declined list reaches both prompts with its summary, location and reas
   assert.match(prompt, /`reopen`/);
   assert.match(prompt, /`src\/example\.ts` 42行/);
   assert.match(prompt, /要旨: 境界値で失敗する/);
-  assert.match(prompt, /見送りの理由 \(@author\): 0 は呼び出し側で弾いている 2行目/);
+  assert.match(prompt, /見送りの理由 \(@author\):\n  > 0 は呼び出し側で弾いている\n  > 2行目/);
   assert.equal(declinedHelper.formatPrompt([]), '');
 
   const section = name => workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
@@ -2352,4 +2352,13 @@ test('code spans are compared verbatim in the exact-body match', () => {
   assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: full }, [declinedItem(half)]), null);
   // コード片の外の全角半角・空白の違いは同じ本文
   assert.equal(declinedHelper.contentKey('src/example.ts', half.replace('のとき', 'の　とき')), declinedHelper.contentKey('src/example.ts', half.replace('のとき', 'の とき')));
+});
+
+test('long declined bodies and reasons reach the models in full', () => {
+  const reason = `${'調査の経緯。'.repeat(300)}\n結論: 呼び出し側で検証しているため見送る`;
+  const body = `**長い指摘**\n${'説明。'.repeat(500)}末尾の条件`;
+  const prompt = declinedHelper.formatPrompt([{ ...declinedItem(body), reason }]);
+  assert.match(prompt, /  > 結論: 呼び出し側で検証しているため見送る/);
+  assert.match(prompt, /末尾の条件/);
+  assert.doesNotMatch(prompt, /…/);
 });
