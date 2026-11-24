@@ -1749,7 +1749,7 @@ const thread = (root, replies, extra = {}) => ({ path: 'src/example.ts', line: 4
 
 async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', permissionError, moreComments = {} } = {}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-declined-test-'));
-  const outputs = {}, queries = [], permissionCalls = [];
+  const outputs = {}, queries = [], permissionCalls = [], infos = [];
   const github = {
     graphql: async (query, variables) => {
       queries.push(variables);
@@ -1776,12 +1776,12 @@ async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', p
     try {
       await collect(github, { repo: { owner: 'example', repo: 'repo' },
         payload: { pull_request: { number: 7, user: { login: prAuthor } } } },
-      { info: () => {}, setOutput: (key, value) => { outputs[key] = value; } },
+      { info: message => infos.push(message), setOutput: (key, value) => { outputs[key] = value; } },
       { env: { RUNNER_TEMP: tempDir, PR_REVIEW_DECLINED_HELPER: declinedHelperSource } }, require);
     } catch (failure) { error = failure; }
     const file = join(tempDir, 'pr-review/declined.json');
     const list = join(tempDir, 'pr-review/declined.md');
-    return { outputs, queries, permissionCalls, error, tempDir,
+    return { outputs, queries, permissionCalls, error, tempDir, infos,
       declined: existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined,
       listFile: existsSync(list) ? readFileSync(list, 'utf8') : undefined };
   } finally { rmSync(tempDir, { recursive: true, force: true }); }
@@ -2111,4 +2111,61 @@ test('Claude\'s dropped count and warning stay in the Codex summary even when Co
   assert.match(warned.outputs.declined_warning, /取得できなかった/);
   assert.match(workflow, /declined_warning: \$\{\{ steps\.publish_review\.outputs\.declined_warning \}\}/);
   assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /CLAUDE_DECLINED_WARNING: \$\{\{ needs\.review\.outputs\.declined_warning \}\}/);
+});
+
+test('comparison operators written outside code spans still separate opposite conditions', () => {
+  const declined = [declinedItem('**範囲外で失敗する**\n入力 x が x < 0 のとき、変換処理が例外を投げて一覧の表示が止まります。範囲を確かめてください。')];
+  const flipped = '**範囲外で失敗する**\n入力 x が x > 0 のとき、変換処理が例外を投げて一覧の表示が止まります。範囲を確かめてください。';
+  assert.equal(declinedHelper.similarity(declined[0].text, flipped), 1);
+  for (const line of [42, 400]) {
+    assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line, text: flipped }, declined), null);
+  }
+  // 同じ条件の言い直しは落とす
+  const repeat = '**範囲外で失敗します**\n入力 x が x < 0 のとき、変換処理が例外を投げ、一覧の表示が止まります。範囲を確かめてください。';
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: repeat }, declined));
+});
+
+test('a finding marker quoted in the body is not taken for the publisher marker', () => {
+  const quoted = `**印の処理が壊れる**\n本文に \`<!-- pr-review:finding:${'b'.repeat(64)} -->\` があると、その後ろが切れます。\n続きの説明。`;
+  const posted = declinedHelper.parsePosted(postedBody(quoted, { fallback: 'RIGHT 12行' }));
+  assert.equal(posted.hash, 'a'.repeat(64));
+  assert.equal(posted.text, quoted);
+  assert.equal(posted.fallback_line, 12);
+  // 先頭の BOM と全角コロンの見送り
+  assert.equal(declinedHelper.declineReason('﻿見送り：理由'), '理由');
+});
+
+test('paths and headlines with newlines are logged as JSON, not as workflow commands', async () => {
+  const output = await collectDeclined({ pages: [[thread({ body: postedBody('**見出し\n::error::偽物**\n本文') },
+    [{ author: person('author'), body: '見送り: x' }], { path: 'src/a\n::warning::injected.ts' })]] });
+  assert.equal(output.declined.length, 1);
+  const lines = output.infos.filter(message => message.startsWith('見送り済み: '));
+  assert.equal(lines.length, 1);
+  assert.doesNotMatch(lines[0], /\n/);
+  assert.match(lines[0], /src\/a\\n::warning::injected\.ts/);
+});
+
+test('a result saved before declined matching existed is restored with nothing dropped', async () => {
+  const value = { summary: '境界値で失敗する', findings: [finding, { ...finding, line: 998 }] };
+  const first = await run({ result: value, fail: 'createReviewComment', failAt: 1 });
+  const recovered = await recover({ artifactFiles: first.artifactFiles });
+  // 旧版の publication.json には declined_dropped / declined_warning が無い
+  const { declined_dropped, declined_warning, ...oldMetadata } = first.publication;
+  const resumed = await run({ server: structuredClone(first.server), restoredRaw: recovered.raw,
+    restoredMetadata: oldMetadata, diff: recovered.diff, files: recovered.files,
+    // 再試行の間に1件目へ見送りが付いても、件数とスレッドは前回と揃える
+    declined: [declinedItem(finding.body)],
+    env: { RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped',
+      REVIEWER: recovered.outputs.reviewer } });
+  assert.equal(resumed.failures.length, 0);
+  assert.equal(resumed.outputs.findings, '2');
+  assert.match(resumed.summary.body, /\*\*⚠️ 指摘 2件\*\*/);
+  assert.equal(resumed.server.comments.length, 2);
+  // 壊れた記録は推測で補わずに止める
+  const broken = await run({ server: structuredClone(first.server), restoredRaw: recovered.raw,
+    restoredMetadata: { ...oldMetadata, declined_dropped: 'x' }, diff: recovered.diff, files: recovered.files,
+    env: { RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped',
+      REVIEWER: recovered.outputs.reviewer } });
+  assert.equal(broken.status.state, 'error');
+  assert.match(broken.failures[0], /見送りの照合結果が不正/);
 });

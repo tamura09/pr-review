@@ -238,15 +238,16 @@ env:
       // 見送りの印は、返信の本文の先頭の「見送り:」だけ (全角のコロンも同じに扱う)。
       // 印が無ければ null、あれば理由 (空文字もある) を返す
       function declineReason(body) {
-        const match = /^見送り[:：]([\s\S]*)$/.exec(String(body ?? "").replace(/^﻿/, "").trimStart());
+        const match = /^見送り[:：]([\s\S]*)$/.exec(String(body ?? "").replace(/^\uFEFF/, "").trimStart());
         return match ? match[1].trim() : null;
       }
       // GraphQL の author。GitHub App は __typename が Bot、REST 由来の login は [bot] で終わる
       const isBot = author => !author?.login || author.__typename === "Bot" || /\[bot\]$/i.test(author.login);
       // 投稿した指摘の本文から、モデルが書いた部分・印のハッシュ・ファイル単位にした元の行を取り出す
+      // 印は投稿側が署名の後に付けた最後のもの。モデルが本文に印を引用していても、それは本文として扱う
       function parsePosted(body) {
         body = String(body ?? "");
-        const marker = FINDING_MARKER.exec(body);
+        const marker = [...body.matchAll(new RegExp(FINDING_MARKER.source, "g"))].at(-1);
         if (!marker) return null;
         let text = body.slice(0, marker.index).replace(/\n+_[^\n]*_\s*$/, "");
         const reopen = text.lastIndexOf(`\n\n${REOPEN_NOTE}`);
@@ -292,6 +293,9 @@ env:
       const MIN_SPAN_OVERLAP = 0.5;
       const codeSpans = text => new Set([...String(text ?? "").matchAll(/`([^`\n]+)`/g)]
         .map(match => match[1].trim()));
+      // 比較演算子の並び。本文の言い回しが同じでも、`x < 0` と `x > 0` のように条件が逆なら別の指摘
+      // (コード片の外に書かれた演算子も見る)
+      const operators = text => (String(text ?? "").normalize("NFKC").match(/[<>]=?|[!=]==?/g) ?? []).sort().join(" ");
       function spanOverlap(a, b) {
         if (!a.size || !b.size) return 1;
         const shared = [...a].filter(span => b.has(span)).length;
@@ -307,6 +311,7 @@ env:
           const near = [item.line, item.original_line, item.fallback_line].some(line =>
             Number.isSafeInteger(line) && Math.abs(line - finding.line) <= NEAR_LINES);
           if (spanOverlap(codeSpans(item.text), codeSpans(finding.text)) < MIN_SPAN_OVERLAP) continue;
+          if (operators(item.text) !== operators(finding.text)) continue;
           const body = similarity(item.text, finding.text);
           const head = similarity(item.headline, headline(finding.text));
           if (body < (near ? NEAR_BODY : FAR_BODY)) continue;
@@ -716,7 +721,11 @@ jobs:
             // 1つの環境変数の上限 (Linux は 128 KiB) を超えてステップを起動できない
             const listFile = path.join(dir, "declined.md");
             fs.writeFileSync(listFile, declinedHelper.formatPrompt(declined), { mode: 0o600 });
-            for (const item of declined) core.info(`見送り済み: ${item.path} ${item.headline} (@${item.by}) ${item.url}`);
+            // パス・見出し・login は改行を含みうるので、JSON 文字列にしてから出す (改行の後ろを
+            // workflow command として解釈させない)
+            for (const item of declined) {
+              core.info(`見送り済み: ${JSON.stringify({ path: item.path, headline: item.headline, by: item.by, url: item.url })}`);
+            }
             core.info(`見送り済みの指摘: ${declined.length}件`);
             core.setOutput("count", String(declined.length));
             // Claude のプロンプトには、一覧のファイルを読む指示だけを入れる (Codex は run の中で
@@ -1442,10 +1451,16 @@ jobs:
                 // 再試行では effort を決めないので、Claude のラベルは前回の記録を使う
                 if (typeof metadata.claude_label === "string") claudeLabel = metadata.claude_label;
                 if (typeof metadata.merge_base === "string") restoredMergeBase = metadata.merge_base;
-                if (Array.isArray(metadata.declined_dropped) &&
+                // 見送りの照合より前の版が保存した結果には declined_dropped が無い。その版は何も
+                // 取り除いていないので、空の除外として扱う (照合し直すと、投稿済みの指摘が件数から消える)
+                if (metadata.declined_dropped === undefined) {
+                  restoredDeclined = { dropped: [], warning: "" };
+                } else if (Array.isArray(metadata.declined_dropped) &&
                     metadata.declined_dropped.every(item => Number.isSafeInteger(item?.index))) {
                   restoredDeclined = { dropped: metadata.declined_dropped,
                     warning: typeof metadata.declined_warning === "string" ? metadata.declined_warning : "" };
+                } else {
+                  throw new Error("保存済みの見送りの照合結果が不正です。新しい workflow run で再レビューしてください");
                 }
               } else if (isCodex) {
                 if (process.env.CODEX_AUTH_OUTCOME !== "success") throw new Error("認証情報の検査を準備できませんでした");
