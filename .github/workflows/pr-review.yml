@@ -275,8 +275,10 @@ env:
       const normalize = text => String(text ?? "").normalize("NFKC").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
       // 本文の一致では、全角半角と空白の違いだけを同じとみなす。記号と大文字小文字は残す
       // (`x < 0` と `x > 0`、`Foo` と `foo` を同じ本文にしない)
+      // コード片 (`...`) の中は原文のまま残す (`" "` と `"　"` を同じにしない)
       const contentKey = (path, text) => crypto.createHash("sha256")
-        .update(JSON.stringify([path, String(text ?? "").normalize("NFKC").replace(/\s+/g, " ").trim()])).digest("hex");
+        .update(JSON.stringify([path, String(text ?? "").trim().split(/(`[^`\n]*`)/)
+          .map(part => part.startsWith("`") ? part : part.normalize("NFKC").replace(/\s+/g, " ")).join("")])).digest("hex");
       // 文字 bigram の Dice 係数 (0〜1)。日本語は単語に区切れないので文字単位で比べる
       function similarity(a, b) {
         const grams = text => {

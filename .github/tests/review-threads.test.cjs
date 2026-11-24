@@ -2344,3 +2344,12 @@ test('the sign of a number separates boundary conditions', () => {
   // 全角のマイナスも同じ負数として扱う
   assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: '**登録が失敗する**\n入力が −1 のとき、登録処理が失敗します。' }, declined));
 });
+
+test('code spans are compared verbatim in the exact-body match', () => {
+  const half = '**空白を受理しない**\n入力が `" "` のとき検証で弾かれます。';
+  const full = '**空白を受理しない**\n入力が `"　"` のとき検証で弾かれます。';
+  assert.notEqual(declinedHelper.contentKey('src/example.ts', half), declinedHelper.contentKey('src/example.ts', full));
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: full }, [declinedItem(half)]), null);
+  // コード片の外の全角半角・空白の違いは同じ本文
+  assert.equal(declinedHelper.contentKey('src/example.ts', half.replace('のとき', 'の　とき')), declinedHelper.contentKey('src/example.ts', half.replace('のとき', 'の とき')));
+});
