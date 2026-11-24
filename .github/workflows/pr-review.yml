@@ -49,12 +49,12 @@ on:
         description: "変更行数 (追加 + 削除、ロックファイルを除く) がこれ以下なら effort を low にする"
         type: number
         required: false
-        default: 30
+        default: 500
       large_pr_min_lines:
         description: "変更行数 (追加 + 削除、ロックファイルを除く) がこれ以上なら effort を high にする"
         type: number
         required: false
-        default: 500
+        default: 1501
       max_turns:
         description: "Claude の最大ターン数"
         type: number

@@ -186,16 +186,16 @@ GPT-6.2 Astra は effort の段階名 (`low`〜`max`) が同じなので、両�
 
 | 変更行数 | effort |
 | --- | --- |
-| `small_pr_max_lines` (30) 以下 | `low` |
+| `small_pr_max_lines` (500) 以下 | `low` |
 | その間 | `medium` |
-| `large_pr_min_lines` (500) 以上 | `high` |
+| `large_pr_min_lines` (1501) 以上 | `high` |
 
 ロックファイル (`pnpm-lock.yaml`・`package-lock.json`・`yarn.lock`・`*.lock`・
 `.terraform.lock.hcl`・`go.sum`) は生成物で、1行の依存追加でも数百行動くので数えない。
 バイナリも数えない。
 
-閾値は導入時点の人間の PR (直近 93 件) の分布から決めた。中央値 14 行、p75 で 40 行、
-p90 で 174 行。`effort` を指定すると行数に関係なく両方にその値を使う。Codex だけ
+閾値は利用枠を抑えるために緩めにしている。導入時点の人間の PR (直近 93 件) は
+中央値 14 行、p75 で 40 行、p90 で 174 行なので、ほとんどの PR は `low` になる。`effort` を指定すると行数に関係なく両方にその値を使う。Codex だけ
 変えたい場合は `codex_effort` を指定する。不正な値ならそのモデルは起動せず、
 そのチェックは error になる。
 
@@ -466,8 +466,8 @@ Claude は読み取り専用ツールと構造化出力だけを使う。`--tool
 | `extra_instructions` | string | `""` | リポジトリ固有の追加指示。観点は残したまま末尾に足される |
 | `model` | string | `claude-opus-5-5` | レビューに使う Claude のモデル。空文字なら Claude Code の既定 |
 | `effort` | string | `""` | Claude と Codex の effort (`low` / `medium` / `high` / `xhigh` / `max`)。空文字なら変更行数で決める |
-| `small_pr_max_lines` | number | `30` | 変更行数がこれ以下なら effort を `low` にする |
-| `large_pr_min_lines` | number | `500` | 変更行数がこれ以上なら effort を `high` にする |
+| `small_pr_max_lines` | number | `500` | 変更行数がこれ以下なら effort を `low` にする |
+| `large_pr_min_lines` | number | `1501` | 変更行数がこれ以上なら effort を `high` にする |
 | `max_turns` | number | `40` | Claude の最大ターン数 |
 | `timeout_minutes` | number | `30` | ジョブのタイムアウト。Claude と Codex のジョブそれぞれに掛かる |
 | `claude_timeout_minutes` | number | `20` | Claude のステップのタイムアウト。超えたら `claude-review` を error にする |
