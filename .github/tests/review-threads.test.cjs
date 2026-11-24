@@ -32,6 +32,9 @@ const runUrl = 'https://github.com/example/repo/actions/runs/123';
 const bot = { login: 'github-actions[bot]' };
 // 全ステップが読み込むチェックの書き込み手順 (ワークフロー冒頭の env)
 const statusHelper = workflow.match(/^  PR_REVIEW_STATUS_HELPER: \|\n((?: {4}[^\n]*\n|\n)*)/m)[1].replace(/^ {4}/gm, '');
+// 見送り済みの指摘の判定と照合 (ワークフロー冒頭の env)
+const declinedHelperSource = workflow.match(/^  PR_REVIEW_DECLINED_HELPER: \|\n((?: {4}[^\n]*\n|\n)*)/m)[1].replace(/^ {4}/gm, '');
+const declinedHelper = new Function('return ' + declinedHelperSource)()(require('node:crypto'));
 const finding = {
   path: 'src/example.ts', line: 42, side: 'RIGHT',
   body: '**境界値で失敗する**\n入力が 0 の場合に例外になるため、境界条件を修正してください。',
@@ -49,6 +52,7 @@ async function run(options = {}) {
   const calls = [];
   const failures = [];
   const errors = [];
+  const notices = [];
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-result-test-'));
   mkdirSync(join(tempDir, 'pr-review'));
   mkdirSync(join(tempDir, 'codex-home'));
@@ -57,7 +61,9 @@ async function run(options = {}) {
   }
   writeFileSync(join(tempDir, 'pr-review/pr.diff'), options.diff ?? defaultDiff);
   writeFileSync(join(tempDir, 'pr-review/files.z'), options.files ?? 'M\0src/example.ts\0');
+  if (options.declined !== null) writeFileSync(join(tempDir, 'pr-review/declined.json'), JSON.stringify(options.declined ?? []));
   const env = {
+    PR_REVIEW_DECLINED_HELPER: declinedHelperSource, DECLINED_OUTCOME: 'success',
     RUNNER_TEMP: tempDir, CODEX_AUTH_OUTCOME: 'success', CLAUDE_TOKEN: testToken, PR_REVIEW_STATUS_HELPER: statusHelper, BASE_REF: 'main',
     SHA: 'reviewed-head', RUN_URL: runUrl, FINDINGS_STATE: defaultFindingsState,
     REVIEWER: isCodex ? 'Codex · test-model · effort medium' : 'Claude · test-model · effort medium',
@@ -146,7 +152,7 @@ async function run(options = {}) {
     try { await publish(github, {
       repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7 } }, runId: 123,
     }, { error: message => errors.push(message), setFailed: message => failures.push(message), warning: () => {},
-      setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
+      notice: message => notices.push(message), setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
     return {
       artifactFiles: Object.fromEntries(['codex.md', 'claude.json', 'publication.json', 'pr.diff', 'files.z']
@@ -155,7 +161,7 @@ async function run(options = {}) {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
       publication: existsSync(join(tempDir, 'pr-review-results/publication.json'))
         ? JSON.parse(readFileSync(join(tempDir, 'pr-review-results/publication.json'), 'utf8')) : undefined,
-      calls, failures, errors, server, fetches, thrown, outputs,
+      calls, failures, errors, notices, server, fetches, thrown, outputs,
       review: calls.findLast(call => call.method === 'createReview')
         ? { ...calls.findLast(call => call.method === 'createReview').params,
             body: summaryReviews(server).at(-1)?.body ?? calls.findLast(call => call.method === 'createReview').params.body } : undefined,
@@ -1726,4 +1732,262 @@ test('a rewritten base history, or a moved head on a failure path, stops the old
   assert.equal(failed.outputs.superseded, 'true');
   const report = workflow.slice(workflow.indexOf('      - name: Report PR diff preparation failure')).split(/\n      - name: /)[0];
   assert.match(report, /current="\$\(gh api [^\n]*\.head\.sha \+ " " \+ \.base\.ref'\)"\n\s+if \[ "\$\{current\}" != /);
+});
+
+// --- 見送り済みの指摘 ---
+const collectScript = workflow.match(/- name: Collect declined findings[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
+const collect = new AsyncFunction('github', 'context', 'core', 'process', 'require', collectScript);
+const actionsBot = { __typename: 'Bot', login: 'github-actions' };
+const person = login => ({ __typename: 'User', login });
+// 投稿ステップが付ける形の指摘本文
+const postedBody = (body, { hash = 'a'.repeat(64), reviewer = 'Codex · gpt-test · effort high', fallback } = {}) =>
+  `${body}\n\n_${reviewer}_\n<!-- pr-review:finding:${hash} -->` +
+  (fallback ? `\n\n> 指定位置を差分内の行に紐付けられません（${fallback}）。ファイル全体への指摘として投稿しています。` : '');
+const thread = (root, replies, extra = {}) => ({ path: 'src/example.ts', line: 42, originalLine: 40, ...extra,
+  comments: { nodes: [{ author: actionsBot, url: 'https://github.com/example/repo/pull/7#discussion_r1', ...root },
+    ...replies.map((reply, index) => ({ url: `https://github.com/example/repo/pull/7#discussion_r${index + 2}`, ...reply }))] } });
+
+async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', permissionError } = {}) {
+  const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-declined-test-'));
+  const outputs = {}, queries = [], permissionCalls = [];
+  const github = {
+    graphql: async (query, variables) => {
+      queries.push(variables);
+      const index = variables.cursor ? Number(variables.cursor) : 0;
+      return { repository: { pullRequest: { reviewThreads: { nodes: pages[index],
+        pageInfo: { hasNextPage: index + 1 < pages.length, endCursor: String(index + 1) } } } } };
+    },
+    rest: { repos: { getCollaboratorPermissionLevel: async ({ username }) => {
+      permissionCalls.push(username);
+      if (permissionError) throw Object.assign(new Error('boom'), { status: permissionError });
+      if (!(username in permissions)) throw Object.assign(new Error('Not Found'), { status: 404 });
+      return { data: { permission: permissions[username], role_name: permissions[username] } };
+    } } },
+  };
+  let error;
+  try {
+    try {
+      await collect(github, { repo: { owner: 'example', repo: 'repo' },
+        payload: { pull_request: { number: 7, user: { login: prAuthor } } } },
+      { info: () => {}, setOutput: (key, value) => { outputs[key] = value; } },
+      { env: { RUNNER_TEMP: tempDir, PR_REVIEW_DECLINED_HELPER: declinedHelperSource } }, require);
+    } catch (failure) { error = failure; }
+    const file = join(tempDir, 'pr-review/declined.json');
+    return { outputs, queries, permissionCalls, error,
+      declined: existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined };
+  } finally { rmSync(tempDir, { recursive: true, force: true }); }
+}
+
+test('only a 見送り: reply by the PR author or a write collaborator declines a finding', async () => {
+  const root = { body: postedBody(finding.body) };
+  const cases = [
+    [{ author: person('author'), body: '見送り: 0 は呼び出し側で弾いている' }, true],
+    [{ author: person('Author'), body: '  見送り：全角のコロンも同じ' }, true],
+    [{ author: person('maintainer'), body: '見送り: 書き込み権限あり' }, true],
+    [{ author: person('admin-user'), body: '見送り: 管理者' }, true],
+    [{ author: person('reader'), body: '見送り: 読み取りだけ' }, false],
+    [{ author: person('triager'), body: '見送り: triage' }, false],
+    [{ author: person('stranger'), body: '見送り: 第三者' }, false],
+    [{ author: { __typename: 'Bot', login: 'renovate' }, body: '見送り: bot' }, false],
+    [{ author: person('helper[bot]'), body: '見送り: bot の login' }, false],
+    [{ author: null, body: '見送り: 削除済みユーザー' }, false],
+    [{ author: person('author'), body: 'やはり見送り: 先頭に無い' }, false],
+    [{ author: person('author'), body: '<!-- pr-review:wontfix --> もう一方の印は使わない' }, false],
+  ];
+  for (const [reply, expected] of cases) {
+    const output = await collectDeclined({ pages: [[thread(root, [reply])]],
+      permissions: { maintainer: 'write', 'admin-user': 'admin', reader: 'read', triager: 'triage' } });
+    assert.equal(output.error, undefined, JSON.stringify(reply));
+    assert.equal(output.declined.length, expected ? 1 : 0, JSON.stringify(reply));
+    assert.equal(output.outputs.count, expected ? '1' : '0');
+    if (expected) {
+      assert.equal(output.declined[0].reason, reply.body.trim().replace(/^見送り[:：]/, '').trim());
+      assert.equal(output.declined[0].by, reply.author.login);
+    } else {
+      assert.equal(output.outputs.prompt, '');
+    }
+  }
+});
+
+test('declined findings are read from every page, regardless of resolution, and only from the publisher', async () => {
+  const decline = { author: person('author'), body: '見送り: 仕様どおり' };
+  const output = await collectDeclined({ pages: [
+    [thread({ body: postedBody('**一件目**\n本文1') }, [decline]),
+      // 投稿者以外が印を写したスレッドは数えない
+      thread({ author: person('mallory'), body: postedBody('**偽物**\n本文') }, [decline]),
+      thread({ author: { __typename: 'User', login: 'github-actions' }, body: postedBody('**偽物2**\n本文') }, [decline]),
+      // 印の無いスレッドも数えない
+      thread({ body: '**人のコメント**' }, [decline])],
+    [thread({ body: postedBody('**二件目**\n本文2', { fallback: 'RIGHT 349行' }) },
+      [{ author: person('author'), body: '見送り: 古い理由' }, { author: person('other'), body: '了解です' },
+        { author: person('author'), body: '見送り: 新しい理由' }], { line: null, originalLine: null })],
+  ] });
+  assert.equal(output.queries.length, 2);
+  assert.equal(output.queries[1].cursor, '1');
+  assert.deepEqual(output.declined.map(item => item.headline), ['一件目', '二件目']);
+  assert.equal(output.declined[1].reason, '新しい理由');
+  assert.equal(output.declined[1].fallback_line, 349);
+  assert.equal(output.declined[1].text, '**二件目**\n本文2');
+  assert.equal(output.declined[0].hash, 'a'.repeat(64));
+  // PR の作成者の権限と、見送りの印の無い返信の書き手の権限は問い合わせない
+  assert.deepEqual(output.permissionCalls, []);
+});
+
+test('a permission lookup failure other than 404 fails the collection instead of guessing', async () => {
+  const output = await collectDeclined({ pages: [[thread({ body: postedBody(finding.body) },
+    [{ author: person('someone'), body: '見送り: x' }])]], permissionError: 500 });
+  assert.match(output.error.message, /boom/);
+  assert.equal(output.declined, undefined);
+});
+
+test('the declined list reaches both prompts with its summary, location and reason', async () => {
+  const output = await collectDeclined({ pages: [[thread({ body: postedBody(finding.body) },
+    [{ author: person('author'), body: '見送り: 0 は呼び出し側で弾いている\n2行目' }])]] });
+  const prompt = output.outputs.prompt;
+  assert.match(prompt, /## 見送り済みの指摘/);
+  assert.match(prompt, /同じ問題 \(同じ原因・同じ失敗の筋書き\)/);
+  assert.match(prompt, /別の箇所の問題/);
+  assert.match(prompt, /前提にしている事実/);
+  assert.match(prompt, /`reopen`/);
+  assert.match(prompt, /`src\/example\.ts` 42行/);
+  assert.match(prompt, /要旨: 境界値で失敗する/);
+  assert.match(prompt, /見送りの理由 \(@author\): 0 は呼び出し側で弾いている 2行目/);
+  assert.equal(declinedHelper.formatPrompt([]), '');
+
+  const section = name => workflow.slice(workflow.indexOf(`      - name: ${name}`)).split(/\n      - name: /)[0];
+  const collectStep = section('Collect declined findings');
+  assert.match(collectStep, /continue-on-error: true/);
+  assert.match(collectStep, /steps\.restore_review\.outcome == 'success'/);
+  assert.ok(workflow.indexOf('- name: Collect declined findings') < workflow.indexOf('- name: Review with Claude'));
+  assert.ok(workflow.indexOf('- name: Collect declined findings') > workflow.indexOf('- name: Prepare PR diff'));
+  const claude = section('Review with Claude');
+  assert.match(claude, /\$\{\{ steps\.declined\.outputs\.prompt \}\}/);
+  assert.match(claude, /"reopen":\{"type":"string"\}/);
+  assert.match(claude, /「見送り済みの指摘」の一覧にあるものは含めません/);
+  const codex = section('Review with Codex');
+  assert.match(codex, /DECLINED_PROMPT: \$\{\{ steps\.declined\.outputs\.prompt \}\}/);
+  assert.match(codex, /printf '\\n%s\\n' "\$\{DECLINED_PROMPT\}"/);
+  assert.match(codex, /「見送り済みの指摘」の一覧にあるものは含めません/);
+  // 式展開を run: に直接埋めない
+  assert.doesNotMatch(codex.split('run: |')[1], /steps\.declined/);
+  assert.match(section('Publish review threads and status'), /DECLINED_OUTCOME: \$\{\{ steps\.declined\.outcome \}\}/);
+});
+
+// 収集ステップが declined.json に書く形
+const declinedItem = (body, extra = {}) => {
+  const posted = declinedHelper.parsePosted(postedBody(body, extra));
+  return { path: 'src/example.ts', line: 42, original_line: 42, fallback_line: posted.fallback_line, hash: posted.hash,
+    text: posted.text, headline: declinedHelper.headline(posted.text),
+    key: declinedHelper.contentKey('src/example.ts', posted.text), reason: '仕様', by: 'author',
+    url: 'https://github.com/example/repo/pull/7#discussion_r1', ...extra.item };
+};
+
+test('a finding the same as a declined one is dropped, logged, and does not count', async () => {
+  for (const isCodex of [false, true]) {
+    const output = await run({ isCodex, declined: [declinedItem(finding.body)] });
+    assert.equal(output.failures.length, 0);
+    assert.equal(output.review, undefined);
+    assert.match(output.summary.body, /\*\*✅ 指摘なし\*\*/);
+    assert.match(output.summary.body, /見送り済みの指摘と同じため除外: 1件 — \[指摘 1\]\(https:\/\/github\.com\/example\/repo\/pull\/7#discussion_r1\)/);
+    assert.equal(output.status.state, 'success');
+    assert.equal(output.status.description, '指摘なし (見送り済みと同じ 1件を除外)');
+    assert.equal(output.outputs.findings, '0');
+    assert.equal(output.outputs.declined_dropped, '1');
+    assert.equal(output.notices.length, 1);
+    assert.match(output.notices[0], /除外: 指摘 1 src\/example\.ts:42 「境界値で失敗する」 本文が一致/);
+    assert.equal(output.publication.declined_dropped.length, 1);
+  }
+});
+
+test('Claude with only declined findings left lets Codex run and posts nothing itself', async () => {
+  const output = await run({ isCodex: false, declined: [declinedItem(finding.body)], env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(output.server.reviews.length, 0);
+  assert.equal(output.server.issueComments.length, 0);
+  assert.equal(output.outputs.findings, '0');
+  assert.equal(output.outputs.declined_dropped, '1');
+  assert.equal(output.notices.length, 1);
+  assert.match(workflow, /declined_dropped: \$\{\{ steps\.publish_review\.outputs\.declined_dropped \}\}/);
+  assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /CLAUDE_DECLINED_DROPPED: \$\{\{ needs\.review\.outputs\.declined_dropped \}\}/);
+});
+
+test('the combined no-findings comment counts what Claude and Codex dropped', async () => {
+  const output = await run({ declined: [declinedItem(finding.body)],
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · c · effort low', CLAUDE_DECLINED_DROPPED: '2',
+      MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.equal(output.failures.length, 0);
+  assert.match(output.summary.body, /\*\*✅ 指摘なし\*\* \(Claude・Codex\)/);
+  assert.match(output.summary.body, /除外 \(Claude\): 2件/);
+  assert.match(output.summary.body, /除外 \(Codex\): 1件/);
+});
+
+test('a reworded repeat near the declined line is dropped, while a different problem in the same file is kept', async () => {
+  const original = '**更新探しは依然として全 mod を 1 回の呼び出しで処理します**\n例えば release を使う Modrinth の mod が多数あり、それぞれの最新版が beta なら、`findUpdates` は mod ごとに互換版の一覧を引きます。この件数だけでサブリクエスト上限を超えると、途中まで見つけた Modrinth の更新も `collectUpdates` の catch で空配列に置き換わります。収集も件数で区切り、候補と続きの位置を保存してください。';
+  const reworded = '**更新探しが全 mod を 1 回の呼び出しで処理したままです**\nrelease 指定の Modrinth の mod が多く、各最新版が beta だと、`findUpdates` が mod ごとに互換版を問い合わせます。これでサブリクエストの上限を超えると、`collectUpdates` の catch が見つけた途中までの更新も空配列にします。収集も件数で区切って続きの位置を保存してください。';
+  const other = '**遅れて届いた読み取り応答が画面を古い下書きに戻します**\n確認の進捗による `reloadDraft` と 5 秒ごとの `useVisibleRefresh` は並行して走ります。後から始めた読み取りが新版を先に表示し、先の読み取りが旧版を返すと、旧版で上書きされます。';
+  const declined = [declinedItem(original, { item: { line: 38, original_line: 30 } })];
+  const output = await run({ declined, result: { summary: '更新探しが全 mod を処理したまま', findings: [
+    { ...finding, body: reworded }, { ...finding, line: 9, side: 'LEFT', body: other }] } });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.review.comments.length, 1);
+  assert.ok(output.review.comments[0].body.startsWith('**遅れて届いた'));
+  // 先頭の指摘を落としたので、要約は残った指摘の見出しにする
+  assert.match(output.summary.body, /\*\*⚠️ 指摘 1件\*\* — 遅れて届いた読み取り応答が画面を古い下書きに戻します/);
+  assert.match(output.status.description, /^指摘 1件: 遅れて届いた/);
+  assert.equal(output.outputs.findings, '1');
+  assert.match(output.notices[0], /類似 \(本文 0\.\d\d・要旨 0\.\d\d・近い行\)/);
+});
+
+test('matching needs the same file, and is stricter away from the declined line', () => {
+  const declined = [declinedItem(finding.body)];
+  const near = '**境界値で失敗します**\n入力が 0 のときに例外になるので、境界条件を直してください。';
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 50, text: near }, declined));
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/other.ts', line: 42, text: finding.body }, declined), null);
+  // 本文がそのままなら離れた行でも落とす (行が大きく動いた場合)
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 400, text: `  ${finding.body}\n` }, declined));
+  // 似ているだけの別の行の指摘は、近くなければ残す
+  const loose = '**境界値の扱い**\nページ番号が負のときに一覧が空になります。範囲を確かめてください。';
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 400, text: loose }, declined), null);
+  // 印のハッシュが一致すれば本文が違っても同じ指摘
+  assert.match(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 400, text: '別', hash: 'a'.repeat(64) }, declined).how, /印のハッシュ/);
+  // ファイル単位に切り替えたスレッドは、元の行で近さを見る
+  const fileLevel = [declinedItem(finding.body, { fallback: 'RIGHT 300行', item: { line: null, original_line: null } })];
+  assert.equal(fileLevel[0].fallback_line, 300);
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 310, text: near }, fileLevel));
+  const far = declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: near }, fileLevel);
+  assert.ok(!far || !far.how.includes('近い行'));
+});
+
+test('a finding re-raised with reopen is posted with its reason instead of being dropped', async () => {
+  const output = await run({ declined: [declinedItem(finding.body)],
+    result: { summary: '境界値で失敗する', findings: [{ ...finding, reopen: '呼び出し側の 0 の検査が\nこの PR で消えた' }] } });
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.review.comments.length, 1);
+  assert.match(output.review.comments[0].body, /> 見送り済みの指摘を挙げ直しています: 呼び出し側の 0 の検査が この PR で消えた\n\n_Codex/);
+  assert.equal(output.outputs.findings, '1');
+  // 挙げ直した指摘の本文からも、元の本文を取り出せる
+  assert.equal(declinedHelper.parsePosted(output.review.comments[0].body).text, finding.body);
+  const invalid = await run({ result: { summary: '', findings: [{ ...finding, reopen: 1 }] } });
+  assert.equal(invalid.status.state, 'error');
+});
+
+test('a failed or unreadable collection is not silent and filters nothing', async () => {
+  for (const options of [{ env: { DECLINED_OUTCOME: 'failure' } }, { declined: null }]) {
+    const output = await run(options);
+    assert.equal(output.failures.length, 0);
+    assert.equal(output.review.comments.length, 1);
+    assert.match(output.summary.body, /⚠️ 見送り済みの指摘(を取得|の一覧を読め)/);
+  }
+});
+
+test('threads posted by a previous run are recognized end to end and the repeat is dropped', async () => {
+  const first = await run({});
+  const body = first.review.comments[0].body;
+  const collected = await collectDeclined({ pages: [[thread({ body }, [{ author: person('author'), body: '見送り: 入力は検証済み' }])]] });
+  assert.equal(collected.declined.length, 1);
+  assert.equal(collected.declined[0].text, finding.body);
+  // 次の run は印のハッシュが変わる (run URL を含む) が、本文で照合できる
+  const second = await run({ declined: collected.declined, env: { RUN_URL: 'https://github.com/example/repo/actions/runs/124' } });
+  assert.equal(second.review, undefined);
+  assert.equal(second.outputs.findings, '0');
+  assert.match(second.notices[0], /本文が一致/);
 });
