@@ -1857,7 +1857,7 @@ test('the declined list reaches both prompts with its summary, location and reas
   // (一覧が大きくても、ステップの出力や環境変数の上限に掛からない)
   assert.match(output.outputs.prompt, /## 見送り済みの指摘/);
   assert.match(output.outputs.prompt, /1件あります/);
-  assert.ok(output.outputs.prompt.includes(`\`${join(output.tempDir, 'pr-review/declined.md')}\` を**必ず Read で読み**`));
+  assert.ok(output.outputs.prompt.includes(`\`${join(output.tempDir, 'pr-review/declined.md')}\` を**必ず読み**`));
   assert.doesNotMatch(output.outputs.prompt, /0 は呼び出し側/);
   const prompt = output.listFile;
   assert.match(prompt, /## 見送り済みの指摘/);
@@ -1883,9 +1883,12 @@ test('the declined list reaches both prompts with its summary, location and reas
   assert.match(claude, /"reopen":\{"type":"string"\}/);
   assert.match(claude, /「見送り済みの指摘」の一覧にあるものは含めません/);
   const codex = section('Review with Codex');
-  assert.match(codex, /DECLINED_COUNT: \$\{\{ steps\.declined\.outputs\.count \}\}/);
-  assert.match(codex, /cat "\$\{RUNNER_TEMP\}\/pr-review\/declined\.md"/);
-  assert.doesNotMatch(codex, /steps\.declined\.outputs\.prompt/);
+  // Codex にも一覧の本文ではなく、ファイルを読む指示だけを渡す (初期プロンプトを大きくしない)
+  assert.match(codex, /DECLINED_NOTE: \$\{\{ steps\.declined\.outputs\.prompt \}\}/);
+  assert.match(codex, /printf '\\n%s\\n' "\$\{DECLINED_NOTE\}"/);
+  assert.doesNotMatch(codex, /cat "\$\{RUNNER_TEMP\}\/pr-review\/declined\.md"/);
+  // 一覧のあるディレクトリは Codex のサンドボックスで読める
+  assert.ok(codex.includes('\\"${RUNNER_TEMP}/pr-review\\"=\\"read\\"'));
   assert.match(codex, /「見送り済みの指摘」の一覧にあるものは含めません/);
   // 式展開を run: に直接埋めない
   assert.doesNotMatch(codex.split('run: |')[1], /steps\.declined/);
