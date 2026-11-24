@@ -312,6 +312,9 @@ env:
       // 見出しを含む本文全体の英数字の識別子 (関数名・変数名など)。バッククォートで囲まれていなくても、
       // 「createUser が空入力で失敗」と「deleteUser が空入力で失敗」を別の対象として区別する
       const identifiers = text => new Set(String(text ?? "").normalize("NFKC").match(/[A-Za-z_$][\w$.]*/g) ?? []);
+      // 本文の数値の並び。ステータスコードや境界値が違えば、言い回しが同じでも別の条件の指摘
+      // (`HTTP 403` と `HTTP 429` を同じにしない)
+      const numbers = text => (String(text ?? "").normalize("NFKC").match(/\d+(?:\.\d+)?/g) ?? []).join(" ");
       function spanOverlap(a, b) {
         if (!a.size || !b.size) return 1;
         const shared = [...a].filter(span => b.has(span)).length;
@@ -337,6 +340,7 @@ env:
           if (spanOverlap(codeSpans(item.text), codeSpans(finding.text)) < MIN_SPAN_OVERLAP) continue;
           if (spanOverlap(identifiers(item.text), identifiers(finding.text)) < MIN_SPAN_OVERLAP) continue;
           if (operators(item.text) !== operators(finding.text)) continue;
+          if (numbers(item.text) !== numbers(finding.text)) continue;
           // 類似度は見出しの行を除いた説明で測る (見出しが同じでも原因の説明が違う指摘を同じにしない)
           const body = similarity(description(item.text), description(finding.text));
           const head = similarity(item.headline, headline(finding.text));
@@ -1734,6 +1738,8 @@ jobs:
               publication.declined_dropped = dropped;
               publication.declined_warning = declinedWarning;
               savePublication();
+              core.info(`見送り済みの指摘と同じため除外: ${dropped.length}件 ` +
+                (restoredDeclined ? "(前回 attempt の照合結果を再利用)" : `(照合した見送りの一覧: ${declined.length}件)`));
               for (const item of dropped) {
                 core.notice(`見送り済みの指摘と同じため除外: 指摘 ${item.index} ${item.path}:${item.line} ` +
                   `「${item.headline}」 ${item.how} ${item.url}`);

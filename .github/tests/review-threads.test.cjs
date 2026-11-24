@@ -53,6 +53,7 @@ async function run(options = {}) {
   const failures = [];
   const errors = [];
   const notices = [];
+  const infos = [];
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-result-test-'));
   mkdirSync(join(tempDir, 'pr-review'));
   mkdirSync(join(tempDir, 'codex-home'));
@@ -152,7 +153,7 @@ async function run(options = {}) {
     try { await publish(github, {
       repo: { owner: 'example', repo: 'repo' }, payload: { pull_request: { number: 7, html_url: 'https://github.com/example/repo/pull/7' } }, runId: 123,
     }, { error: message => errors.push(message), setFailed: message => failures.push(message), warning: () => {},
-      notice: message => notices.push(message), setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
+      info: message => infos.push(message), notice: message => notices.push(message), setOutput: (key, value) => { outputs[key] = value; } }, { env }, require); } catch (error) { thrown = error; }
     const resultPath = join(tempDir, 'pr-review-results', isCodex ? 'codex.md' : 'claude.json');
     return {
       artifactFiles: Object.fromEntries(['codex.md', 'claude.json', 'publication.json', 'pr.diff', 'files.z']
@@ -161,7 +162,7 @@ async function run(options = {}) {
       savedResult: existsSync(resultPath) ? readFileSync(resultPath, 'utf8') : undefined,
       publication: existsSync(join(tempDir, 'pr-review-results/publication.json'))
         ? JSON.parse(readFileSync(join(tempDir, 'pr-review-results/publication.json'), 'utf8')) : undefined,
-      calls, failures, errors, notices, server, fetches, thrown, outputs,
+      calls, failures, errors, notices, infos, server, fetches, thrown, outputs,
       review: calls.findLast(call => call.method === 'createReview')
         ? { ...calls.findLast(call => call.method === 'createReview').params,
             body: summaryReviews(server).at(-1)?.body ?? calls.findLast(call => call.method === 'createReview').params.body } : undefined,
@@ -2308,4 +2309,18 @@ test('continuation pages are fetched only for finding threads', async () => {
   assert.equal(output.error, undefined);
   assert.equal(output.queries.filter(query => query.id).length, 0);
   assert.equal(output.declined.length, 1);
+});
+
+test('a different number in the condition keeps the finding', () => {
+  const declined = [declinedItem('**失敗した項目の扱い**\nHTTP 403 の応答を受けると処理済みの項目までキューに戻します。')];
+  const other = '**失敗した項目の扱い**\nHTTP 429 の応答を受けると処理済みの項目までキューに戻します。';
+  assert.ok(declinedHelper.similarity(declined[0].text, other) > 0.9);
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: other }, declined), null);
+  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42,
+    text: '**失敗した項目の扱い**\nHTTP 403 の応答を受けると、処理済みの項目までキューに戻してしまいます。' }, declined));
+});
+
+test('the total number of dropped findings is logged apart from the declined list size', async () => {
+  const output = await run({ declined: [declinedItem(finding.body), declinedItem('**別の見送り**\n本文', { item: { line: 9 } })] });
+  assert.ok(output.infos.includes('見送り済みの指摘と同じため除外: 1件 (照合した見送りの一覧: 2件)'));
 });
