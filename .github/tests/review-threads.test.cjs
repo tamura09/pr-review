@@ -1747,12 +1747,19 @@ const thread = (root, replies, extra = {}) => ({ path: 'src/example.ts', line: 4
   comments: { nodes: [{ author: actionsBot, url: 'https://github.com/example/repo/pull/7#discussion_r1', ...root },
     ...replies.map((reply, index) => ({ url: `https://github.com/example/repo/pull/7#discussion_r${index + 2}`, ...reply }))] } });
 
-async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', permissionError } = {}) {
+async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', permissionError, moreComments = {} } = {}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-declined-test-'));
   const outputs = {}, queries = [], permissionCalls = [];
   const github = {
     graphql: async (query, variables) => {
       queries.push(variables);
+      if (variables.id) {
+        // スレッドの続きのコメント。cursor は '<id>:<ページ番号>'
+        const index = Number(variables.cursor.split(':')[1]);
+        const rest = moreComments[variables.id];
+        return { node: { comments: { nodes: rest[index - 1],
+          pageInfo: { hasNextPage: index < rest.length, endCursor: `${variables.id}:${index + 1}` } } } };
+      }
       const index = variables.cursor ? Number(variables.cursor) : 0;
       return { repository: { pullRequest: { reviewThreads: { nodes: pages[index],
         pageInfo: { hasNextPage: index + 1 < pages.length, endCursor: String(index + 1) } } } } };
@@ -1773,8 +1780,10 @@ async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', p
       { env: { RUNNER_TEMP: tempDir, PR_REVIEW_DECLINED_HELPER: declinedHelperSource } }, require);
     } catch (failure) { error = failure; }
     const file = join(tempDir, 'pr-review/declined.json');
-    return { outputs, queries, permissionCalls, error,
-      declined: existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined };
+    const list = join(tempDir, 'pr-review/declined.md');
+    return { outputs, queries, permissionCalls, error, tempDir,
+      declined: existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined,
+      listFile: existsSync(list) ? readFileSync(list, 'utf8') : undefined };
   } finally { rmSync(tempDir, { recursive: true, force: true }); }
 }
 
@@ -1843,7 +1852,13 @@ test('a permission lookup failure other than 404 fails the collection instead of
 test('the declined list reaches both prompts with its summary, location and reason', async () => {
   const output = await collectDeclined({ pages: [[thread({ body: postedBody(finding.body) },
     [{ author: person('author'), body: '見送り: 0 は呼び出し側で弾いている\n2行目' }])]] });
-  const prompt = output.outputs.prompt;
+  // 一覧はファイルに書き、Claude のプロンプトにはそのファイルを読む指示だけを入れる
+  // (一覧が大きくても、ステップの出力や環境変数の上限に掛からない)
+  assert.match(output.outputs.prompt, /## 見送り済みの指摘/);
+  assert.match(output.outputs.prompt, /1件あります/);
+  assert.ok(output.outputs.prompt.includes(`\`${join(output.tempDir, 'pr-review/declined.md')}\` を**必ず Read で読み**`));
+  assert.doesNotMatch(output.outputs.prompt, /0 は呼び出し側/);
+  const prompt = output.listFile;
   assert.match(prompt, /## 見送り済みの指摘/);
   assert.match(prompt, /同じ問題 \(同じ原因・同じ失敗の筋書き\)/);
   assert.match(prompt, /別の箇所の問題/);
@@ -1865,8 +1880,9 @@ test('the declined list reaches both prompts with its summary, location and reas
   assert.match(claude, /"reopen":\{"type":"string"\}/);
   assert.match(claude, /「見送り済みの指摘」の一覧にあるものは含めません/);
   const codex = section('Review with Codex');
-  assert.match(codex, /DECLINED_PROMPT: \$\{\{ steps\.declined\.outputs\.prompt \}\}/);
-  assert.match(codex, /printf '\\n%s\\n' "\$\{DECLINED_PROMPT\}"/);
+  assert.match(codex, /DECLINED_COUNT: \$\{\{ steps\.declined\.outputs\.count \}\}/);
+  assert.match(codex, /cat "\$\{RUNNER_TEMP\}\/pr-review\/declined\.md"/);
+  assert.doesNotMatch(codex, /steps\.declined\.outputs\.prompt/);
   assert.match(codex, /「見送り済みの指摘」の一覧にあるものは含めません/);
   // 式展開を run: に直接埋めない
   assert.doesNotMatch(codex.split('run: |')[1], /steps\.declined/);
@@ -2037,4 +2053,62 @@ test('a different problem whose headline only differs by its target is not dropp
   // 同じ対象の言い直しは落とす
   const repeat = '**`foo` が null のときに例外になります**\n設定に `foo` が無いと null のまま `foo.trim()` を呼ぶので落ちます。';
   assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: repeat }, declined));
+});
+
+test('an empty declined list gives no prompt section and an empty list file', async () => {
+  const output = await collectDeclined({ pages: [[thread({ body: postedBody(finding.body) }, [])]] });
+  assert.equal(output.outputs.prompt, '');
+  assert.equal(output.listFile, '');
+});
+
+test('replies after the first 100 comments of a thread are read', async () => {
+  const filler = Array.from({ length: 99 }, (_, index) => ({ author: person('author'), body: `返信 ${index}` }));
+  const first = thread({ body: postedBody(finding.body) }, filler, { id: 'T1' });
+  first.comments.pageInfo = { hasNextPage: true, endCursor: 'T1:1' };
+  const output = await collectDeclined({ pages: [[first]], moreComments: { T1: [
+    [{ author: person('author'), body: '見送り: 古い理由', url: 'u1' }],
+    [{ author: person('author'), body: '見送り: 101件目より後で書き直した理由', url: 'u2' }],
+  ] } });
+  assert.equal(output.error, undefined);
+  assert.deepEqual(output.queries.filter(query => query.id).map(query => query.cursor), ['T1:1', 'T1:2']);
+  assert.equal(output.declined.length, 1);
+  assert.equal(output.declined[0].reason, '101件目より後で書き直した理由');
+});
+
+test('the exact-body match keeps operators and case, and a single shared value does not make the same target', () => {
+  const declined = [declinedItem('**範囲外で失敗する**\n`x < 0` のときに `clamp` が例外を投げます。')];
+  // 演算子だけが違う本文は「本文が一致」にしない (コード片も共通しないので類似でも落とさない)
+  const flipped = '**範囲外で失敗する**\n`x > 0` のときに `clamp` が例外を投げます。';
+  assert.notEqual(declinedHelper.contentKey('src/example.ts', flipped), declined[0].key);
+  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: flipped }, declined), null);
+  // 大文字小文字だけが違う識別子も別の本文
+  assert.notEqual(declinedHelper.contentKey('src/example.ts', declined[0].text.replace('clamp', 'Clamp')), declined[0].key);
+  // 全角半角と空白の違いは同じ本文
+  assert.equal(declinedHelper.contentKey('src/example.ts', `  ${declined[0].text.replace('範囲外', '範囲外 ')}\n`.replace('範囲外 ', '範囲外')), declined[0].key);
+  // `null` だけが共通する別の関数への指摘は残す
+  const createUser = [declinedItem('**`createUser` に `null` を渡すと例外になる**\n`createUser` は引数を検証せず、`null` のまま `name.trim()` を呼んで落ちます。')];
+  const deleteUser = '**`deleteUser` に `null` を渡すと例外になる**\n`deleteUser` は引数を検証せず、`null` のまま `id.trim()` を呼んで落ちます。';
+  assert.ok(declinedHelper.similarity(createUser[0].text, deleteUser) >= 0.65);
+  for (const line of [42, 400]) {
+    assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line, text: deleteUser }, createUser), null);
+  }
+});
+
+test('Claude\'s dropped count and warning stay in the Codex summary even when Codex has findings', async () => {
+  const output = await run({ result,
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'Claude · c · effort low', CLAUDE_DECLINED_DROPPED: '2',
+      CLAUDE_DECLINED_WARNING: '見送り済みの指摘を取得できなかったため、照合していません',
+      MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.equal(output.failures.length, 0);
+  assert.match(output.summary.body, /\*\*⚠️ 指摘 1件\*\*/);
+  assert.match(output.summary.body, /除外 \(Claude\): 2件/);
+  assert.match(output.summary.body, /⚠️ 見送り済みの指摘を取得できなかったため、照合していません \(Claude\)/);
+  // Claude だけの run (Codex を使わない呼び出し側) には載せない
+  const own = await run({ isCodex: false, result, env: { CLAUDE_DECLINED_DROPPED: '2' } });
+  assert.doesNotMatch(own.summary.body, /Claude\): 2件/);
+  // 警告は Claude のジョブの出力から codex ジョブへ渡す
+  const warned = await run({ isCodex: false, result: { summary: '', findings: [] }, env: { CLEAN_COMMENT: 'skip', DECLINED_OUTCOME: 'failure' } });
+  assert.match(warned.outputs.declined_warning, /取得できなかった/);
+  assert.match(workflow, /declined_warning: \$\{\{ steps\.publish_review\.outputs\.declined_warning \}\}/);
+  assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /CLAUDE_DECLINED_WARNING: \$\{\{ needs\.review\.outputs\.declined_warning \}\}/);
 });

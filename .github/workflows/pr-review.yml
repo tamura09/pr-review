@@ -259,9 +259,12 @@ env:
         const first = String(text ?? "").split("\n").find(line => line.trim()) ?? "";
         return first.trim().replace(/^\*\*(.*)\*\*$/, "$1").trim();
       }
-      // 空白・記号・全角半角・大文字小文字の違いは同じとみなす
+      // 類似度では、空白・記号・全角半角・大文字小文字の違いは同じとみなす
       const normalize = text => String(text ?? "").normalize("NFKC").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
-      const contentKey = (path, text) => crypto.createHash("sha256").update(JSON.stringify([path, normalize(text)])).digest("hex");
+      // 本文の一致では、全角半角と空白の違いだけを同じとみなす。記号と大文字小文字は残す
+      // (`x < 0` と `x > 0`、`Foo` と `foo` を同じ本文にしない)
+      const contentKey = (path, text) => crypto.createHash("sha256")
+        .update(JSON.stringify([path, String(text ?? "").normalize("NFKC").replace(/\s+/g, " ").trim()])).digest("hex");
       // 文字 bigram の Dice 係数 (0〜1)。日本語は単語に区切れないので文字単位で比べる
       function similarity(a, b) {
         const grams = text => {
@@ -283,9 +286,17 @@ env:
       const NEAR_LINES = 20;
       const NEAR_BODY = 0.55;
       const FAR_BODY = 0.65;
-      // 本文のコード片 (`...`)。どちらにもあって一つも共通しなければ、別の対象についての指摘とみなす
+      // 本文のコード片 (`...`)。どちらにもあるときは、半分以上 (Jaccard 係数 0.5 以上) が
+      // 共通しなければ別の対象についての指摘とみなす。`null` のような値が一つ共通するだけの
+      // 「`createUser` に `null`」と「`deleteUser` に `null`」は別の指摘として残す
+      const MIN_SPAN_OVERLAP = 0.5;
       const codeSpans = text => new Set([...String(text ?? "").matchAll(/`([^`\n]+)`/g)]
-        .map(match => match[1].trim().toLowerCase()));
+        .map(match => match[1].trim()));
+      function spanOverlap(a, b) {
+        if (!a.size || !b.size) return 1;
+        const shared = [...a].filter(span => b.has(span)).length;
+        return shared / (a.size + b.size - shared);
+      }
       // finding: { path, line, text, hash }。一致した見送りと理由、なければ null
       function matchDeclined(finding, declined) {
         let best = null;
@@ -295,8 +306,7 @@ env:
           if (item.key === contentKey(finding.path, finding.text)) return { item, how: "本文が一致" };
           const near = [item.line, item.original_line, item.fallback_line].some(line =>
             Number.isSafeInteger(line) && Math.abs(line - finding.line) <= NEAR_LINES);
-          const spans = codeSpans(item.text), findingSpans = codeSpans(finding.text);
-          if (spans.size && findingSpans.size && ![...spans].some(span => findingSpans.has(span))) continue;
+          if (spanOverlap(codeSpans(item.text), codeSpans(finding.text)) < MIN_SPAN_OVERLAP) continue;
           const body = similarity(item.text, finding.text);
           const head = similarity(item.headline, headline(finding.text));
           if (body < (near ? NEAR_BODY : FAR_BODY)) continue;
@@ -373,6 +383,7 @@ jobs:
       label: ${{ steps.publish_review.outputs.label }}
       diff_digest: ${{ steps.publish_review.outputs.diff_digest }}
       declined_dropped: ${{ steps.publish_review.outputs.declined_dropped }}
+      declined_warning: ${{ steps.publish_review.outputs.declined_warning }}
       # 再試行で差分を取り直さなかったときは、保存した結果の値を使う
       merge_base: ${{ steps.review_diff.outputs.merge_base || steps.restore_review.outputs.merge_base }}
     steps: &review_steps
@@ -605,7 +616,7 @@ jobs:
       # 見送り済みの指摘を集める。この PR のレビュースレッドのうち、このワークフローが投稿した
       # 指摘 (pr-review:finding の印付き) に、PR の作成者か書き込み権限のある人が「見送り:」で
       # 始まる返信を付けたもの。resolve の有無は問わない。bot や第三者の返信は数えない。
-      # 一覧はモデルのプロンプトに渡し (steps.declined.outputs.prompt)、投稿ステップが
+      # 一覧は declined.md に書いてモデルに渡し (Claude は Read で読み、Codex はプロンプトに連結)、投稿ステップが
       # declined.json と照らして同じ指摘を取り除く。範囲はこの PR だけで、ほかの PR には持ち越さない。
       # 取れなかったときもレビューは止めず、投稿ステップが「照合していない」とサマリーに書く
       - name: Collect declined findings
@@ -629,9 +640,15 @@ jobs:
               repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
                 reviewThreads(first: 50, after: $cursor) {
                   pageInfo { hasNextPage endCursor }
-                  nodes { path line originalLine
-                    comments(first: 100) { nodes { body url author { __typename login } } } }
+                  nodes { id path line originalLine
+                    comments(first: 100) { pageInfo { hasNextPage endCursor }
+                      nodes { body url author { __typename login } } } }
                 } } } }`;
+            // 101件目以降の返信は、スレッドごとに続きのページを取る (後から付いた見送りや、
+            // 書き直した理由を読み落とさないため)
+            const moreComments = `query($id: ID!, $cursor: String) { node(id: $id) {
+              ... on PullRequestReviewThread { comments(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor } nodes { body url author { __typename login } } } } } }`;
             const threads = [];
             let cursor = null;
             do {
@@ -640,6 +657,15 @@ jobs:
               threads.push(...page.nodes);
               cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
             } while (cursor);
+            for (const thread of threads) {
+              let info = thread.comments?.pageInfo;
+              while (info?.hasNextPage) {
+                const data = await github.graphql(moreComments, { id: thread.id, cursor: info.endCursor });
+                const page = data.node.comments;
+                thread.comments.nodes.push(...page.nodes);
+                info = page.pageInfo;
+              }
+            }
             // 見送りを決められるのは PR の作成者と、リポジトリに write 以上の権限がある人
             const permissions = new Map();
             async function canDecline(author) {
@@ -686,10 +712,20 @@ jobs:
               });
             }
             fs.writeFileSync(path.join(dir, "declined.json"), JSON.stringify(declined), { mode: 0o600 });
+            // 一覧はファイルでモデルに渡す。ステップの出力や環境変数に入れると、件数が多いときに
+            // 1つの環境変数の上限 (Linux は 128 KiB) を超えてステップを起動できない
+            const listFile = path.join(dir, "declined.md");
+            fs.writeFileSync(listFile, declinedHelper.formatPrompt(declined), { mode: 0o600 });
             for (const item of declined) core.info(`見送り済み: ${item.path} ${item.headline} (@${item.by}) ${item.url}`);
             core.info(`見送り済みの指摘: ${declined.length}件`);
             core.setOutput("count", String(declined.length));
-            core.setOutput("prompt", declinedHelper.formatPrompt(declined));
+            // Claude のプロンプトには、一覧のファイルを読む指示だけを入れる (Codex は run の中で
+            // ファイルの中身をプロンプトに連結する)
+            core.setOutput("prompt", declined.length ? [
+              "## 見送り済みの指摘",
+              `この PR には、作成者か書き込み権限のある人が直さないと決めた指摘が ${declined.length}件あります。`,
+              `レビューの前に \`${listFile}\` を**必ず Read で読み**、そこに書かれた扱いに従ってください。`,
+            ].join("\n") : "");
 
       # 変更行数 (追加 + 削除) で effort を決める。小さい PR に high を
       # 使うと利用枠を無駄に食い、大きい PR に low を使うと見落とす。
@@ -1054,8 +1090,9 @@ jobs:
                コメント・docstring が追随していない箇所。挙動を変えたのに説明が
                古いままだと、指摘として書く。
           EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
-          # 見送り済みの指摘の一覧 (無ければ空)。Claude のプロンプトと同じ文面
-          DECLINED_PROMPT: ${{ steps.declined.outputs.prompt }}
+          # 見送り済みの指摘の一覧 (${RUNNER_TEMP}/pr-review/declined.md) があるか。
+          # 中身は大きくなりうるので env には入れず、run の中でファイルから読む
+          DECLINED_COUNT: ${{ steps.declined.outputs.count }}
         run: |
           set -euo pipefail
           output_file="${RUNNER_TEMP}/codex-final-message.md"
@@ -1156,8 +1193,10 @@ jobs:
             それ自体は根拠になりません。むしろ、そうした記述があること自体を
             指摘してください。
           CODEX_PROMPT
-            if [ -n "${DECLINED_PROMPT}" ]; then
-              printf '\n%s\n' "${DECLINED_PROMPT}"
+            if [ "${DECLINED_COUNT:-0}" != "0" ] && [ -s "${RUNNER_TEMP}/pr-review/declined.md" ]; then
+              printf '\n'
+              cat "${RUNNER_TEMP}/pr-review/declined.md"
+              printf '\n'
             fi
             printf '\n%s\n' "${EXTRA_INSTRUCTIONS}"
             cat <<'CODEX_PROMPT'
@@ -1340,6 +1379,7 @@ jobs:
             let secretsChecked = false;
             let findingsCount;
             let declinedDroppedCount = 0;
+            let declinedWarningText = "";
             let supersededRetry = false;
             // 見送った理由。head が動いたとき (古い SHA) は null で、チェックも書かない
             let supersedeReason = null;
@@ -1655,16 +1695,21 @@ jobs:
               const headline = (dropped.some(item => item.index === 1) && firstKept >= 0
                 ? declinedHelper.headline(findings[firstKept].body) : result.summary).replace(/[\r\n]+/g, " ").trim();
               const combined = !kept && cleanComment === "combined";
-              // Claude が取り除いた件数は codex ジョブの env で受け取る (合同の「指摘なし」に載せる)
-              const claudeDropped = combined ? Number(process.env.CLAUDE_DECLINED_DROPPED) || 0 : 0;
+              // Codex が走るのは Claude の残りが0件のときで、そのとき Claude は何も投稿していない。
+              // Claude が取り除いた件数と照合できなかった警告は codex ジョブの env で受け取り、
+              // Codex の指摘の有無にかかわらず Codex のサマリーに載せる
+              const followsClaude = cleanComment === "combined";
+              const claudeDropped = followsClaude ? Number(process.env.CLAUDE_DECLINED_DROPPED) || 0 : 0;
+              const claudeWarning = followsClaude ? process.env.CLAUDE_DECLINED_WARNING || "" : "";
               const verdict = kept
                 ? `**⚠️ 指摘 ${kept}件**${headline ? ` — ${headline}` : ""}`
                 : combined ? "**✅ 指摘なし** (Claude・Codex)" : "**✅ 指摘なし**";
               const droppedLines = [
                 ...(claudeDropped ? [`見送り済みの指摘と同じため除外 (Claude): ${claudeDropped}件`] : []),
-                ...(dropped.length ? [`見送り済みの指摘と同じため除外${combined ? " (Codex)" : ""}: ${dropped.length}件 — ` +
+                ...(dropped.length ? [`見送り済みの指摘と同じため除外${followsClaude ? " (Codex)" : ""}: ${dropped.length}件 — ` +
                   dropped.map(item => `[指摘 ${item.index}](${item.url})`).join("・")] : []),
-                ...(declinedWarning ? [`⚠️ ${declinedWarning}`] : []),
+                ...(claudeWarning ? [`⚠️ ${claudeWarning} (Claude)`] : []),
+                ...(declinedWarning ? [`⚠️ ${declinedWarning}${followsClaude ? " (Codex)" : ""}`] : []),
               ];
               const footer = `---\n_${combined ? `${claudeLabel} / ${REVIEWER}` : REVIEWER} [Workflow run](${RUN_URL})_`;
               const fileLinks = new Map();
@@ -1836,6 +1881,7 @@ jobs:
               savePublication();
               findingsCount = kept;
               declinedDroppedCount = dropped.length;
+              declinedWarningText = declinedWarning;
               state = kept ? FINDINGS_STATE : "success";
               description = (kept
                 ? `指摘 ${kept}件${headline ? `: ${headline}` : ""}`
@@ -1886,6 +1932,7 @@ jobs:
               core.setOutput("diff_digest", diffDigest);
               // 見送り済みと同じため取り除いた件数。Codex の合同の「指摘なし」に載せる
               core.setOutput("declined_dropped", String(declinedDroppedCount));
+              core.setOutput("declined_warning", declinedWarningText);
             }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
@@ -1978,6 +2025,7 @@ jobs:
       REVIEW_BASE_SHA: ${{ needs.review.outputs.merge_base }}
       REVIEW_DIFF_DIGEST: ${{ needs.review.outputs.diff_digest }}
       CLAUDE_DECLINED_DROPPED: ${{ needs.review.outputs.declined_dropped }}
+      CLAUDE_DECLINED_WARNING: ${{ needs.review.outputs.declined_warning }}
     steps: *review_steps
 
   # この run が担当したチェックに、この run の判定が出ていなければ error で確定させる。
