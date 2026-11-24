@@ -1916,7 +1916,7 @@ test('a finding the same as a declined one is dropped, logged, and does not coun
     assert.equal(output.outputs.findings, '0');
     assert.equal(output.outputs.declined_dropped, '1');
     assert.equal(output.notices.length, 1);
-    assert.match(output.notices[0], /除外: 指摘 1 src\/example\.ts:42 「境界値で失敗する」 近い行で本文が一致/);
+    assert.match(output.notices[0], /除外: 指摘 1 src\/example\.ts:42 「境界値で失敗する」 同じ行で本文が一致/);
     assert.equal(output.publication.declined_dropped.length, 1);
   }
 });
@@ -2092,15 +2092,6 @@ test('a result saved before declined matching existed is restored with nothing d
   assert.match(broken.failures[0], /見送りの照合結果が不正/);
 });
 
-test('the same wording in another function of the file is kept when the declined thread is elsewhere', () => {
-  const text = '**空配列で先頭要素を読むと例外になる**\n`items[0]` を確かめずに読むので、空配列のとき `undefined` の `id` を読んで落ちます。';
-  const declined = [declinedItem(text, { item: { line: 42, original_line: 42 } })];
-  // 本文が完全に同じでも、離れた行 (別の関数) の指摘は残す
-  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 120, text }, declined), null);
-  // 同じ箇所なら落とす
-  assert.match(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 44, text }, declined).how, /本文が一致/);
-});
-
 test('only comments ending in the publisher\'s own signature and marker count as findings', () => {
   const marker = `<!-- pr-review:finding:${'c'.repeat(64)} -->`;
   // 別のワークフローのコメントが印を引用しているだけ
@@ -2121,17 +2112,6 @@ test('a quoted marker thread from another workflow is not collected as a decline
   const output = await collectDeclined({ pages: [[thread({ body: `ビルド失敗の説明 <!-- pr-review:finding:${'d'.repeat(64)} --> 続き` },
     [{ author: person('author'), body: '見送り: x' }])]] });
   assert.equal(output.declined.length, 0);
-});
-
-test('a moved thread is compared at its current line only, not at the line it came from', () => {
-  const text = '**空配列で先頭要素を読むと例外になる**\n`items[0]` を確かめずに読むので、空配列のとき `undefined` の `id` を読んで落ちます。';
-  // 40行目の指摘を見送った後、スレッドは140行目へ動いた
-  const declined = [declinedItem(text, { item: { line: 140, original_line: 40 } })];
-  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 40, text }, declined), null);
-  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 141, text }, declined));
-  // 現在の行が分からなければ、当時の行で見る
-  const outdated = [declinedItem(text, { item: { line: null, original_line: 40 } })];
-  assert.ok(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 40, text }, outdated));
 });
 
 test('declined deletions only match deletions, and the side is collected from the thread', async () => {
@@ -2207,15 +2187,6 @@ test('reopen: null is treated like an omitted reopen, so the finding is still ma
   }
 });
 
-test('code spans are compared verbatim in the exact-body match', () => {
-  const half = '**空白を受理しない**\n入力が `" "` のとき検証で弾かれます。';
-  const full = '**空白を受理しない**\n入力が `"　"` のとき検証で弾かれます。';
-  assert.notEqual(declinedHelper.contentKey('src/example.ts', half), declinedHelper.contentKey('src/example.ts', full));
-  assert.equal(declinedHelper.matchDeclined({ path: 'src/example.ts', line: 42, text: full }, [declinedItem(half)]), null);
-  // コード片の外の全角半角・空白の違いは同じ本文
-  assert.equal(declinedHelper.contentKey('src/example.ts', half.replace('のとき', 'の　とき')), declinedHelper.contentKey('src/example.ts', half.replace('のとき', 'の とき')));
-});
-
 test('long declined bodies and reasons reach the models in full', () => {
   const reason = `${'調査の経緯。'.repeat(300)}\n結論: 呼び出し側で検証しているため見送る`;
   const body = `**長い指摘**\n${'説明。'.repeat(500)}末尾の条件`;
@@ -2225,49 +2196,52 @@ test('long declined bodies and reasons reach the models in full', () => {
   assert.doesNotMatch(prompt, /…/);
 });
 
-test('only an exact repeat near the declined thread is dropped; rewordings and look-alike problems are kept', () => {
+test('the prompt tells the models that only exact repeats are removed automatically', () => {
+  const prompt = declinedHelper.formatPrompt([declinedItem(finding.body)]);
+  assert.match(prompt, /言い換えた指摘は取り除かれずにそのまま投稿される/);
+});
+
+test('only a verbatim repeat on the declined thread\'s own line is dropped; everything else is kept', () => {
   const at = (text, extra = {}) => declinedItem(text, { item: { line: 42, original_line: 42, ...extra } });
   const find = (text, line = 42, side) => ({ path: 'src/example.ts', line, side, text });
-  // 同じ箇所で本文がそのまま同じなら落とす (コード片の外の全角半角・空白の違いは同じとみなす)
-  assert.match(declinedHelper.matchDeclined(find(`  ${finding.body.replace('入力が 0', '入力が　0')}\n`, 50), [at(finding.body)]).how,
-    /近い行で本文が一致/);
+  // 同じ行で本文がそのまま同じなら落とす (前後の空白と改行コードの違いだけは無視する)
+  assert.match(declinedHelper.matchDeclined(find(`  ${finding.body.replace('\n', '\r\n')}\n`), [at(finding.body)]).how,
+    /同じ行で本文が一致/);
   // 言い換えた指摘は、同じ問題でも落とさない (プロンプトで出さないよう指示する)
   assert.equal(declinedHelper.matchDeclined(find('**境界値で失敗します**\n入力が 0 のときに例外になるので、境界条件を直してください。'),
     [at(finding.body)]), null);
-  // これまでに見つかった、対象や条件だけが違う別の問題はどれも残る
+  // 本文の違いは文字単位で区別する (全角半角・互換文字も揃えない)
   for (const [declined, other] of [
     ['**`foo` が null のとき例外になる**\n`foo` を読む処理で落ちます。', '**`bar` が null のとき例外になる**\n`bar` を読む処理で落ちます。'],
-    ['**範囲外で失敗する**\n`x < 0` のときに例外を投げます。', '**範囲外で失敗する**\n`x > 0` のときに例外を投げます。'],
     ['**範囲外で失敗する**\n入力が x < 0 のとき例外を投げます。', '**範囲外で失敗する**\n入力が x > 0 のとき例外を投げます。'],
     ['**条件が逆**\nstart < end のとき登録します。', '**条件が逆**\nend < start のとき登録します。'],
     ['**権限の判定**\nadmin && owner のときだけ許します。', '**権限の判定**\nadmin || owner のときだけ許します。'],
-    ['**保存できない**\n条件が !enabled のとき失敗します。', '**保存できない**\n条件が enabled のとき失敗します。'],
     ['**扱いが誤る**\nHTTP 403 のとき項目を戻します。', '**扱いが誤る**\nHTTP 429 のとき項目を戻します。'],
     ['**登録が失敗する**\n入力が -1 のとき失敗します。', '**登録が失敗する**\n入力が 1 のとき失敗します。'],
-    ['**createUser が空入力で失敗する**\n検証せずに保存して例外になります。', '**deleteUser が空入力で失敗する**\n検証せずに保存して例外になります。'],
     ['**送信先アドレスの検証漏れ**\n空欄のまま保存すると例外になります。', '**送信元アドレスの検証漏れ**\n空欄のまま保存すると例外になります。'],
+    ['**入力で失敗する**\n入力①で失敗します。', '**入力で失敗する**\n入力1で失敗します。'],
     ['**空白を受理しない**\n入力が `" "` のとき弾かれます。', '**空白を受理しない**\n入力が `"　"` のとき弾かれます。'],
+    ['**空白を受理しない**\n入力が ``" "`` のとき弾かれます。', '**空白を受理しない**\n入力が ``"　"`` のとき弾かれます。'],
+    ['**全角**\n値が ＡＢＣ のとき失敗します。', '**全角**\n値が ABC のとき失敗します。'],
     ['**大文字**\n`clamp` が例外を投げます。', '**大文字**\n`Clamp` が例外を投げます。'],
   ]) {
     assert.equal(declinedHelper.matchDeclined(find(other), [at(declined)]), null, other);
   }
-  // 別のファイル・別の側・離れた行では、本文が同じでも落とさない
+  // 同じ本文でも、別のファイル・別の側・別の行 (近くの別の関数を含む) なら落とさない
   assert.equal(declinedHelper.matchDeclined({ ...find(finding.body), path: 'src/other.ts' }, [at(finding.body)]), null);
   assert.equal(declinedHelper.matchDeclined(find(finding.body, 42, 'RIGHT'), [at(finding.body, { side: 'LEFT' })]), null);
-  assert.equal(declinedHelper.matchDeclined(find(finding.body, 400), [at(finding.body)]), null);
-  // 現在の行が分かればそれだけで近さを見る (動いたスレッドの元の行に出た指摘は残す)
+  for (const line of [41, 43, 55, 400]) {
+    assert.equal(declinedHelper.matchDeclined(find(finding.body, line), [at(finding.body)]), null, String(line));
+  }
+  // 現在の行が分かればそれだけを見る (動いたスレッドの元の行に出た指摘は残す)
   assert.equal(declinedHelper.matchDeclined(find(finding.body, 40), [at(finding.body, { line: 140, original_line: 40 })]), null);
-  // 古くなったスレッドは当時の行・ファイル単位にした元の行で近さを見る。離れていれば残す
-  assert.ok(declinedHelper.matchDeclined(find(finding.body, 45), [at(finding.body, { line: null, original_line: 40 })]));
-  assert.equal(declinedHelper.matchDeclined(find(finding.body, 400), [at(finding.body, { line: null, original_line: 40 })]), null);
-  assert.ok(declinedHelper.matchDeclined(find(finding.body, 305), [at(finding.body, { line: null, original_line: null, fallback_line: 300 })]));
+  assert.ok(declinedHelper.matchDeclined(find(finding.body, 140), [at(finding.body, { line: 140, original_line: 40 })]));
+  // 古くなったスレッドは、当時の行・ファイル単位にした元の行と一致するときだけ
+  assert.ok(declinedHelper.matchDeclined(find(finding.body, 40), [at(finding.body, { line: null, original_line: 40 })]));
+  assert.equal(declinedHelper.matchDeclined(find(finding.body, 45), [at(finding.body, { line: null, original_line: 40 })]), null);
+  assert.ok(declinedHelper.matchDeclined(find(finding.body, 300), [at(finding.body, { line: null, original_line: null, fallback_line: 300 })]));
   // 行がまったく分からないスレッドとは照合しない
   assert.equal(declinedHelper.matchDeclined(find(finding.body), [at(finding.body, { line: null, original_line: null })]), null);
   // 印のハッシュが一致すれば、本文や行が違っても同じ指摘
   assert.match(declinedHelper.matchDeclined({ ...find('別', 400), hash: 'a'.repeat(64) }, [at(finding.body)]).how, /印のハッシュ/);
-});
-
-test('the prompt tells the models that only exact repeats are removed automatically', () => {
-  const prompt = declinedHelper.formatPrompt([declinedItem(finding.body)]);
-  assert.match(prompt, /言い換えた指摘は取り除かれずにそのまま投稿される/);
 });
