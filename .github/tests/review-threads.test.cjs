@@ -1991,3 +1991,33 @@ test('threads posted by a previous run are recognized end to end and the repeat 
   assert.equal(second.outputs.findings, '0');
   assert.match(second.notices[0], /本文が一致/);
 });
+
+test('a publication retry reuses the declined matching of the first attempt instead of matching again', async () => {
+  const declinedBody = '**削除による不具合**\n既存の呼び出しが失敗します。';
+  const value = { summary: '境界値で失敗する', findings: [finding,
+    { ...finding, line: 9, side: 'LEFT', body: declinedBody }, { ...finding, line: 998 }] };
+  const first = await run({ result: value, declined: [declinedItem(declinedBody, { item: { line: 9 } })],
+    fail: 'createReviewComment', failAt: 1 });
+  assert.equal(first.failures.length, 1);
+  assert.equal(first.publication.declined_dropped.length, 1);
+  const recovered = await recover({ artifactFiles: first.artifactFiles });
+  assert.equal(recovered.outputs.restored, 'true');
+  const resume = options => run({ server: structuredClone(first.server), restoredRaw: recovered.raw,
+    restoredMetadata: first.publication, diff: recovered.diff, files: recovered.files, ...options,
+    env: { RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped',
+      REVIEWER: recovered.outputs.reviewer, ...options.env } });
+  // 再試行で一覧を取れなくても、前回取り除いた指摘は投稿しない
+  // 再試行の間に付いた見送りでも、前回数えた指摘は件数から消さない
+  for (const options of [{ env: { DECLINED_OUTCOME: 'failure' } }, { declined: [declinedItem(finding.body)] }]) {
+    const resumed = await resume(options);
+    assert.equal(resumed.failures.length, 0, JSON.stringify(options));
+    assert.equal(summaryReviews(resumed.server).length, 1);
+    assert.equal(resumed.server.comments.length, 2);
+    assert.ok(!resumed.server.comments.some(comment => comment.body.startsWith('**削除による')));
+    assert.match(resumed.summary.body, /\*\*⚠️ 指摘 2件\*\*/);
+    assert.match(resumed.summary.body, /除外: 1件 — \[指摘 2\]/);
+    assert.doesNotMatch(resumed.summary.body, /照合していません/);
+    assert.equal(resumed.outputs.findings, '2');
+    assert.deepEqual(resumed.publication.declined_dropped, first.publication.declined_dropped);
+  }
+});

@@ -1325,6 +1325,8 @@ jobs:
             const writeOwnedStatus = new Function("return " + process.env.PR_REVIEW_STATUS_HELPER)()(github, context, process.env);
             let claudeLabel = process.env.CLAUDE_LABEL;
             let restoredMergeBase;
+            // 保存結果から再試行するときは、前回 attempt が見送り済みとして取り除いた指摘をそのまま使う
+            let restoredDeclined;
             const publication = { run_url: RUN_URL, sha: SHA, reviewer: statusContext, model_label: REVIEWER, restorable: false, posted: [] };
             const fs = require("node:fs");
             const path = require("node:path");
@@ -1394,6 +1396,11 @@ jobs:
                 // 再試行では effort を決めないので、Claude のラベルは前回の記録を使う
                 if (typeof metadata.claude_label === "string") claudeLabel = metadata.claude_label;
                 if (typeof metadata.merge_base === "string") restoredMergeBase = metadata.merge_base;
+                if (Array.isArray(metadata.declined_dropped) &&
+                    metadata.declined_dropped.every(item => Number.isSafeInteger(item?.index))) {
+                  restoredDeclined = { dropped: metadata.declined_dropped,
+                    warning: typeof metadata.declined_warning === "string" ? metadata.declined_warning : "" };
+                }
               } else if (isCodex) {
                 if (process.env.CODEX_AUTH_OUTCOME !== "success") throw new Error("認証情報の検査を準備できませんでした");
                 for (const name of ["auth-before.json", "auth.json"]) {
@@ -1554,9 +1561,14 @@ jobs:
               // 見送り済みの指摘 (Collect declined findings が集めたもの) と同じ指摘は投稿しない。
               // 取り除いた指摘は件数に数えず、サマリーとログに件数とリンクを出す
               const declinedHelper = new Function("return " + process.env.PR_REVIEW_DECLINED_HELPER)()(require("node:crypto"));
+              // 再試行で照合し直すと、前回投稿した件数・スレッドと食い違う (一覧の取得失敗で
+              // 取り除いた指摘が投稿される、間に付いた見送りで投稿済みの指摘が件数から消える)。
+              // 前回 attempt の照合結果があれば、それを使って同じ指摘を取り除く
               let declined = [];
               let declinedWarning = "";
-              if (process.env.DECLINED_OUTCOME === "success") {
+              if (restoredDeclined) {
+                declinedWarning = restoredDeclined.warning;
+              } else if (process.env.DECLINED_OUTCOME === "success") {
                 try {
                   declined = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, "pr-review/declined.json"), "utf8"));
                   if (!Array.isArray(declined)) throw new Error("not an array");
@@ -1590,7 +1602,12 @@ jobs:
                 // 挙げ直した理由を本文に添える
                 const reopen = (finding.reopen ?? "").replace(/[\r\n]+/g, " ").trim();
                 const text = finding.body.trim();
-                if (!reopen) {
+                const saved = restoredDeclined?.dropped.find(item => item.index === index + 1);
+                if (saved) {
+                  dropped.push(saved);
+                  return;
+                }
+                if (!reopen && !restoredDeclined) {
                   const match = declinedHelper.matchDeclined({ path: file.path, line: finding.line, text, hash: findingHash }, declined);
                   if (match) {
                     dropped.push({ index: index + 1, path: file.path, line: finding.line,
@@ -1619,6 +1636,7 @@ jobs:
               }
               publication.restorable = true;
               publication.declined_dropped = dropped;
+              publication.declined_warning = declinedWarning;
               savePublication();
               for (const item of dropped) {
                 core.notice(`見送り済みの指摘と同じため除外: 指摘 ${item.index} ${item.path}:${item.line} ` +
