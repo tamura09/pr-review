@@ -1749,7 +1749,7 @@ const thread = (root, replies, extra = {}) => ({ path: 'src/example.ts', line: 4
   comments: { nodes: [{ author: actionsBot, url: 'https://github.com/example/repo/pull/7#discussion_r1', ...root },
     ...replies.map((reply, index) => ({ url: `https://github.com/example/repo/pull/7#discussion_r${index + 2}`, ...reply }))] } });
 
-async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', prAuthorId = `U_${prAuthor}`, permissionError, moreComments = {} } = {}) {
+async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', prAuthorId = `U_${prAuthor}`, permissionUserIds = {}, permissionError, moreComments = {} } = {}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-declined-test-'));
   const outputs = {}, queries = [], permissionCalls = [], infos = [];
   const github = {
@@ -1770,7 +1770,9 @@ async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', p
       permissionCalls.push(username);
       if (permissionError) throw Object.assign(new Error('boom'), { status: permissionError });
       if (!(username in permissions)) throw Object.assign(new Error('Not Found'), { status: 404 });
-      return { data: { permission: permissions[username], role_name: permissions[username] } };
+      // 応答の user は、照会した時点でその login を持つユーザー
+      return { data: { permission: permissions[username], role_name: permissions[username],
+        user: { login: username, node_id: permissionUserIds[username] ?? `U_${username.toLowerCase()}` } } };
     } } },
   };
   let error;
@@ -2269,4 +2271,28 @@ test('the PR author is recognized by the immutable user id, not by a login someo
   assert.equal(impostor.declined.length, 0);
   assert.deepEqual(impostor.permissionCalls, ['author']);
   assert.match(workflow, /author \{ __typename login \.\.\. on User \{ id \} \}/);
+});
+
+test('a permission answer counts only when it is for the same user id as the replier', async () => {
+  const root = { body: postedBody(finding.body) };
+  // 照会までに login の持ち主が変わり、新しい持ち主に write 権限がある場合は採用しない
+  const swapped = await collectDeclined({ pages: [[thread(root, [{ author: person('helper', 'U_old-holder'), body: '見送り: x' }])]],
+    permissions: { helper: 'write' } });
+  assert.equal(swapped.declined.length, 0);
+  // 同じ人の複数の返信は、ID ごとに1回だけ照会する
+  const twice = await collectDeclined({ pages: [[
+    thread(root, [{ author: person('maintainer'), body: '見送り: a' }]),
+    thread(root, [{ author: person('Maintainer'), body: '見送り: b' }])]], permissions: { maintainer: 'write', Maintainer: 'write' } });
+  assert.equal(twice.declined.length, 2);
+  assert.equal(twice.permissionCalls.length, 1);
+});
+
+test('the summary links at most 50 dropped findings and counts the rest', async () => {
+  const findings = Array.from({ length: 60 }, (_, index) => ({ ...finding, body: `**指摘 ${index}**\n本文 ${index}` }));
+  const declined = findings.map((item, index) => declinedItem(item.body, { item: { url: `https://github.com/example/repo/pull/7#discussion_r${index + 1}` } }));
+  const output = await run({ declined, result: { summary: '', findings } });
+  assert.equal(output.failures.length, 0);
+  assert.match(output.summary.body, /除外: 60件 — /);
+  assert.equal((output.summary.body.match(/\[指摘 \d+\]/g) ?? []).length, 50);
+  assert.match(output.summary.body, / ほか 10件/);
 });

@@ -665,23 +665,24 @@ jobs:
             async function canDecline(author) {
               if (declinedHelper.isBot(author)) return false;
               if (prAuthorId && author.id === prAuthorId) return true;
-              // 作成者以外は、いまの login で権限を確かめる
-              const login = author.login.toLowerCase();
-              if (!permissions.has(login)) {
+              // 作成者以外は login で権限を照会する。照会までに login の持ち主が変わりうるので、
+              // 応答のユーザー ID が返信者の ID と一致するときだけ採用し、キャッシュも ID ごとに持つ
+              if (!author.id) return false;
+              if (!permissions.has(author.id)) {
                 let allowed = false;
                 try {
                   const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
                     ...context.repo, username: author.login,
                   });
-                  allowed = ["admin", "write"].includes(data.permission) ||
-                    ["admin", "maintain", "write"].includes(data.role_name);
+                  allowed = data.user?.node_id === author.id && (["admin", "write"].includes(data.permission) ||
+                    ["admin", "maintain", "write"].includes(data.role_name));
                 } catch (error) {
                   // 共同作業者でない人は 404 になる。それ以外の失敗は収集ごと失敗させる
                   if (error.status !== 404) throw error;
                 }
-                permissions.set(login, allowed);
+                permissions.set(author.id, allowed);
               }
-              return permissions.get(login);
+              return permissions.get(author.id);
             }
             const declined = [];
             for (const thread of threads) {
@@ -1706,6 +1707,11 @@ jobs:
               // Claude が取り除いた件数と照合できなかった警告は codex ジョブの env で受け取り、
               // Codex の指摘の有無にかかわらず Codex のサマリーに載せる
               const followsClaude = cleanComment === "combined";
+              // 除外した指摘へのリンクは50件まで (本文の上限 65536 文字を超えて投稿が失敗しないように)。
+              // 件数は全体を出し、載せきれなかった分は「ほか N件」とする
+              const MAX_LINKS = 50;
+              const linkList = links => links.slice(0, MAX_LINKS).join("・") +
+                (links.length > MAX_LINKS ? ` ほか ${links.length - MAX_LINKS}件` : "");
               const claudeDropped = followsClaude ? Number(process.env.CLAUDE_DECLINED_DROPPED) || 0 : 0;
               const claudeWarning = followsClaude ? process.env.CLAUDE_DECLINED_WARNING || "" : "";
               // Claude が照合したスレッドへのリンク。この PR のレビュースレッドの URL だけを載せる
@@ -1725,9 +1731,9 @@ jobs:
                 : combined ? "**✅ 指摘なし** (Claude・Codex)" : "**✅ 指摘なし**";
               const droppedLines = [
                 ...(claudeDropped ? [`見送り済みの指摘と同じため除外 (Claude): ${claudeDropped}件` +
-                  (claudeUrls.length ? ` — 照合した見送り: ${claudeUrls.map((url, index) => `[${index + 1}](${url})`).join("・")}` : "")] : []),
+                  (claudeUrls.length ? ` — 照合した見送り: ${linkList(claudeUrls.map((url, index) => `[${index + 1}](${url})`))}` : "")] : []),
                 ...(dropped.length ? [`見送り済みの指摘と同じため除外${followsClaude ? " (Codex)" : ""}: ${dropped.length}件 — ` +
-                  dropped.map(item => `[指摘 ${item.index}](${item.url})`).join("・")] : []),
+                  linkList(dropped.map(item => `[指摘 ${item.index}](${item.url})`))] : []),
                 ...(claudeWarning ? [`⚠️ ${claudeWarning} (Claude)`] : []),
                 ...(declinedWarning ? [`⚠️ ${declinedWarning}${followsClaude ? " (Codex)" : ""}`] : []),
               ];
