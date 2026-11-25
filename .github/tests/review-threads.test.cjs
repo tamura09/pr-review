@@ -2305,10 +2305,13 @@ test('a restored dropped record must match the original findings before anything
     restoredMetadata: { ...first.publication, declined_dropped: dropped }, diff: recovered.diff, files: recovered.files,
     env: { RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped',
       REVIEWER: recovered.outputs.reviewer } });
-  const ok = { index: 1, path: 'src/example.ts', line: 42, url: 'https://github.com/example/repo/pull/7#discussion_r1' };
+  const digest = createHash('sha256').update(JSON.stringify(['src/example.ts', 42, 'RIGHT', finding.body.trim(), ''])).digest('hex');
+  const ok = { index: 1, path: 'src/example.ts', line: 42, url: 'https://github.com/example/repo/pull/7#discussion_r1', digest };
   for (const dropped of [
     [{ index: 1 }], [{ ...ok, index: 3 }], [{ ...ok, index: 0 }], [ok, ok], [{ ...ok, url: '' }],
     [{ ...ok, line: 43 }], [{ ...ok, path: 'src/other.ts' }],
+    // 同じ行の別の指摘に当たった記録 (ダイジェストが違う) や、ダイジェストの無い記録
+    [{ ...ok, digest: 'x'.repeat(64) }], [{ ...ok, digest: undefined }],
   ]) {
     const output = await resume(dropped);
     assert.equal(output.status.state, 'error', JSON.stringify(dropped));

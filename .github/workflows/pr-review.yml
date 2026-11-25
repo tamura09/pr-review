@@ -279,7 +279,7 @@ env:
         .update(JSON.stringify([path, String(text ?? "").replace(/\r\n?/g, "\n").trim()])).digest("hex");
       // finding: { path, line, side, text, hash }。一致した見送りと照合の根拠、なければ null。
       // 後処理で取り除くのは、同じ指摘だと確かめられるものだけ:
-      //   - 印のハッシュが一致する (同じ run の再試行で同じ指摘を出した)
+      //   - 印のハッシュが一致する (ハッシュは run の URL を含むので、別の run の指摘とは一致しない)
       //   - 同じファイル・同じ側・見送ったスレッドと同じ行で、本文がそのまま一致する
       // 行は近さではなく一致で見る (同じ文面の指摘が近くの別の関数に出ることがある)。GitHub は
       // 古くなっていないスレッドの行を最新の head の行に合わせて動かすので、同じ箇所なら行が一致する。
@@ -640,29 +640,9 @@ jobs:
             const moreComments = `query($id: ID!, $cursor: String) { node(id: $id) {
               ... on PullRequestReviewThread { comments(first: 100, after: $cursor) {
                 pageInfo { hasNextPage endCursor } nodes { body url author { __typename login ... on User { id } } } } } } }`;
-            // 指摘はこのワークフロー (github-actions) が投稿した、末尾に署名と印のあるスレッドに限る。
-            // ページごとに判定し、対象のスレッドだけを残す (人どうしの議論の全文を溜め込まない)
+            // 指摘はこのワークフロー (github-actions) が投稿した、末尾に署名と印のあるスレッドに限る
             const isFinding = root => root?.author?.__typename === "Bot" &&
               ["github-actions", "github-actions[bot]"].includes(root.author.login) && declinedHelper.parsePosted(root.body) !== null;
-            const threads = [];
-            let cursor = null;
-            do {
-              const data = await github.graphql(query, { ...context.repo, number: pr.number, cursor });
-              const page = data.repository.pullRequest.reviewThreads;
-              threads.push(...page.nodes.filter(thread => isFinding(thread.comments?.nodes?.[0])));
-              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
-            } while (cursor);
-            // 返信の続きのページは、対象のスレッドだけ取る (ほかのスレッドの取得の失敗で収集全体を落とさない)
-            for (const thread of threads) {
-              if (!isFinding(thread.comments?.nodes?.[0])) continue;
-              let info = thread.comments?.pageInfo;
-              while (info?.hasNextPage) {
-                const data = await github.graphql(moreComments, { id: thread.id, cursor: info.endCursor });
-                const page = data.node.comments;
-                thread.comments.nodes.push(...page.nodes);
-                info = page.pageInfo;
-              }
-            }
             // 見送りを決められるのは PR の作成者と、リポジトリに write 以上の権限がある人
             const permissions = new Map();
             async function canDecline(author) {
@@ -687,29 +667,52 @@ jobs:
               }
               return permissions.get(author.id);
             }
-            const declined = [];
-            for (const thread of threads) {
-              const [root, ...replies] = thread.comments?.nodes ?? [];
-              if (!isFinding(root)) continue;
-              const posted = declinedHelper.parsePosted(root.body);
-              // 見送りの返信が複数あれば、最後のものの理由を使う
+            // 1つのスレッドの返信から見送りを決める。返信の続きのページは、指摘のスレッドだけ取る
+            // (ほかのスレッドの取得の失敗で収集全体を落とさない)。見送りの返信が複数あれば、最後のものの理由を使う
+            async function decide(thread) {
+              const [root] = thread.comments.nodes;
               let decision = null;
-              for (const reply of replies) {
-                const reason = declinedHelper.declineReason(reply.body);
-                if (reason !== null && await canDecline(reply.author)) {
-                  decision = { reason, by: reply.author.login, reply_url: reply.url };
+              const consider = async replies => {
+                for (const reply of replies) {
+                  const reason = declinedHelper.declineReason(reply.body);
+                  if (reason !== null && await canDecline(reply.author)) {
+                    decision = { reason, by: reply.author.login, reply_url: reply.url };
+                  }
                 }
+              };
+              await consider(thread.comments.nodes.slice(1));
+              let info = thread.comments.pageInfo;
+              while (info?.hasNextPage) {
+                const data = await github.graphql(moreComments, { id: thread.id, cursor: info.endCursor });
+                const page = data.node.comments;
+                await consider(page.nodes);
+                info = page.pageInfo;
               }
-              if (!decision) continue;
-              declined.push({
+              if (!decision) return null;
+              const posted = declinedHelper.parsePosted(root.body);
+              return {
                 path: thread.path, line: thread.line ?? null, original_line: thread.originalLine ?? null,
                 // 行への指摘はスレッドの側、ファイル単位にした指摘は元の位置の側
                 side: posted.fallback_side ?? (["LEFT", "RIGHT"].includes(thread.diffSide) ? thread.diffSide : null),
                 fallback_line: posted.fallback_line, hash: posted.hash, text: posted.text,
                 headline: declinedHelper.headline(posted.text), key: declinedHelper.contentKey(thread.path, posted.text),
                 url: root.url, ...decision,
-              });
+              };
             }
+            // スレッドはページごとに判定まで済ませ、持ち越すのは採用した見送りと権限の照会結果だけにする
+            // (過去の議論の本文を溜め込まない)
+            const declined = [];
+            let cursor = null;
+            do {
+              const data = await github.graphql(query, { ...context.repo, number: pr.number, cursor });
+              const page = data.repository.pullRequest.reviewThreads;
+              for (const thread of page.nodes) {
+                if (!isFinding(thread.comments?.nodes?.[0])) continue;
+                const item = await decide(thread);
+                if (item) declined.push(item);
+              }
+              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            } while (cursor);
             fs.writeFileSync(path.join(dir, "declined.json"), JSON.stringify(declined), { mode: 0o600 });
             // 一覧はファイルでモデルに渡し、両モデルが自分で読む。ステップの出力や環境変数に入れると、件数が
             // 多いときに1つの環境変数の上限 (Linux は 128 KiB) を超えてステップを起動できない。初期プロンプトに
@@ -1641,7 +1644,7 @@ jobs:
                 if (new Set(indexes).size !== indexes.length ||
                     restoredDeclined.dropped.some(item => item.index < 1 || item.index > findings.length ||
                       typeof item.path !== "string" || !Number.isSafeInteger(item.line) ||
-                      typeof item.url !== "string" || !item.url)) {
+                      typeof item.url !== "string" || !item.url || typeof item.digest !== "string")) {
                   throw new Error("保存済みの見送りの照合結果が不正です。新しい workflow run で再レビューしてください");
                 }
               }
@@ -1667,9 +1670,12 @@ jobs:
                 // 挙げ直した理由を本文に添える
                 const reopen = (finding.reopen ?? "").replace(/[\r\n]+/g, " ").trim();
                 const text = finding.body.trim();
+                // 取り除いた指摘そのもの (位置・左右・本文・reopen) のダイジェスト。再試行では、保存した記録が
+                // 同じ番号の別の指摘 (同じ行の2件目など) に当たっていないかを、これで確かめる
+                const findingDigest = hash([file.path, finding.line, finding.side, text, reopen]);
                 const saved = restoredDeclined?.dropped.find(item => item.index === index + 1);
                 if (saved) {
-                  if (saved.path !== file.path || saved.line !== finding.line) {
+                  if (saved.path !== file.path || saved.line !== finding.line || saved.digest !== findingDigest) {
                     throw new Error("保存済みの見送りの照合結果が元の指摘と一致しません。新しい workflow run で再レビューしてください");
                   }
                   dropped.push(saved);
@@ -1679,7 +1685,7 @@ jobs:
                   const match = declinedHelper.matchDeclined({ path: file.path, line: finding.line, side: finding.side,
                     text, hash: findingHash }, declined);
                   if (match) {
-                    dropped.push({ index: index + 1, path: file.path, line: finding.line,
+                    dropped.push({ index: index + 1, path: file.path, line: finding.line, digest: findingDigest,
                       headline: declinedHelper.headline(text), how: match.how, url: match.item.url });
                     return;
                   }
