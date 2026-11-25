@@ -255,8 +255,10 @@ env:
         const tail = POSTED_TAIL.exec(body);
         if (!tail) return null;
         let text = body.slice(0, tail.index);
+        // 投稿側が付けた挙げ直しの注記は、本文の末尾の1行だけ (reopen の改行は空白にしてから付ける)。
+        // 本文の途中で同じ文言を引用していても、その後ろは本文として残す
         const reopen = text.lastIndexOf(`\n\n${REOPEN_NOTE}`);
-        if (reopen >= 0) text = text.slice(0, reopen);
+        if (reopen >= 0 && !text.slice(reopen + 2).includes("\n")) text = text.slice(0, reopen);
         return { hash: tail[2], text: text.trim(), fallback_side: tail[3] ?? null,
           fallback_line: tail[4] ? Number(tail[4]) : null };
       }
@@ -275,7 +277,8 @@ env:
       //   - 同じファイル・同じ側・見送ったスレッドと同じ行で、本文がそのまま一致する
       // 行は近さではなく一致で見る (同じ文面の指摘が近くの別の関数に出ることがある)。GitHub は
       // 古くなっていないスレッドの行を最新の head の行に合わせて動かすので、同じ箇所なら行が一致する。
-      // 古くなったスレッド (現在の行が分からない) は、当時の行・ファイル単位にしたときの元の行と一致するときだけ。
+      // 古くなったスレッド・ファイル単位のスレッド (現在の行が分からない) は行で照合しない。当時の行は、
+      // その後の変更で同じ位置に別のコードが入っていても一致してしまうため (印のハッシュの一致だけで取り除く)。
       // 言い換えた指摘は取り除かない (対象や条件だけが違う別の問題と見分けられないため)。
       // 言い換えて同じ問題を出さないことは、プロンプトの見送り一覧でモデルに指示する
       function matchDeclined(finding, declined) {
@@ -284,8 +287,7 @@ env:
           if (finding.hash && item.hash === finding.hash) return { item, how: "印のハッシュが一致" };
           // 削除側 (LEFT) と追加側 (RIGHT) の行番号は別のファイルの行なので、左右が分かれば同じ側どうしで比べる
           if (item.side && finding.side && item.side !== finding.side) continue;
-          const lines = Number.isSafeInteger(item.line) ? [item.line] : [item.original_line, item.fallback_line];
-          if (!lines.some(line => Number.isSafeInteger(line) && line === finding.line)) continue;
+          if (!Number.isSafeInteger(item.line) || item.line !== finding.line) continue;
           if (item.key === contentKey(finding.path, finding.text)) return { item, how: "同じ行で本文が一致" };
         }
         return null;

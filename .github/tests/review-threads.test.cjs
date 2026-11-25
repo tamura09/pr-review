@@ -2236,12 +2236,20 @@ test('only a verbatim repeat on the declined thread\'s own line is dropped; ever
   // 現在の行が分かればそれだけを見る (動いたスレッドの元の行に出た指摘は残す)
   assert.equal(declinedHelper.matchDeclined(find(finding.body, 40), [at(finding.body, { line: 140, original_line: 40 })]), null);
   assert.ok(declinedHelper.matchDeclined(find(finding.body, 140), [at(finding.body, { line: 140, original_line: 40 })]));
-  // 古くなったスレッドは、当時の行・ファイル単位にした元の行と一致するときだけ
-  assert.ok(declinedHelper.matchDeclined(find(finding.body, 40), [at(finding.body, { line: null, original_line: 40 })]));
-  assert.equal(declinedHelper.matchDeclined(find(finding.body, 45), [at(finding.body, { line: null, original_line: 40 })]), null);
-  assert.ok(declinedHelper.matchDeclined(find(finding.body, 300), [at(finding.body, { line: null, original_line: null, fallback_line: 300 })]));
+  // 古くなったスレッド・ファイル単位のスレッドは、当時の行や元の行が一致しても行では照合しない
+  // (同じ位置に入った別の関数の指摘を落とさない)
+  assert.equal(declinedHelper.matchDeclined(find(finding.body, 40), [at(finding.body, { line: null, original_line: 40 })]), null);
+  assert.equal(declinedHelper.matchDeclined(find(finding.body, 300), [at(finding.body, { line: null, original_line: null, fallback_line: 300 })]), null);
   // 行がまったく分からないスレッドとは照合しない
   assert.equal(declinedHelper.matchDeclined(find(finding.body), [at(finding.body, { line: null, original_line: null })]), null);
   // 印のハッシュが一致すれば、本文や行が違っても同じ指摘
   assert.match(declinedHelper.matchDeclined({ ...find('別', 400), hash: 'a'.repeat(64) }, [at(finding.body)]).how, /印のハッシュ/);
+});
+
+test('only the reopen note the publisher appended at the end is removed from a declined body', () => {
+  const marker = `<!-- pr-review:finding:${'e'.repeat(64)} -->`;
+  const quoted = `**注記の扱い**\n本文に次の行を引用します。\n\n${declinedHelper.REOPEN_NOTE}例\nこの後ろに発生条件が続きます。`;
+  assert.equal(declinedHelper.parsePosted(`${quoted}\n\n_Claude · m · effort high_\n${marker}`).text, quoted);
+  // 投稿側が付けた末尾の1行の注記は外す (引用があってもそれは本文に残る)
+  assert.equal(declinedHelper.parsePosted(`${quoted}\n\n${declinedHelper.REOPEN_NOTE}理由\n\n_Codex · m · effort low_\n${marker}`).text, quoted);
 });
