@@ -2296,3 +2296,39 @@ test('the summary links at most 50 dropped findings and counts the rest', async 
   assert.equal((output.summary.body.match(/\[指摘 \d+\]/g) ?? []).length, 50);
   assert.match(output.summary.body, / ほか 10件/);
 });
+
+test('a restored dropped record must match the original findings before anything is removed', async () => {
+  const value = { summary: '境界値で失敗する', findings: [finding, { ...finding, line: 998 }] };
+  const first = await run({ result: value, fail: 'createReviewComment', failAt: 1 });
+  const recovered = await recover({ artifactFiles: first.artifactFiles });
+  const resume = dropped => run({ server: structuredClone(first.server), restoredRaw: recovered.raw,
+    restoredMetadata: { ...first.publication, declined_dropped: dropped }, diff: recovered.diff, files: recovered.files,
+    env: { RESTORED: 'true', REVIEW_DIFF_OUTCOME: 'skipped', EFFORT_OUTCOME: 'skipped', MODEL_OUTCOME: 'skipped',
+      REVIEWER: recovered.outputs.reviewer } });
+  const ok = { index: 1, path: 'src/example.ts', line: 42, url: 'https://github.com/example/repo/pull/7#discussion_r1' };
+  for (const dropped of [
+    [{ index: 1 }], [{ ...ok, index: 3 }], [{ ...ok, index: 0 }], [ok, ok], [{ ...ok, url: '' }],
+    [{ ...ok, line: 43 }], [{ ...ok, path: 'src/other.ts' }],
+  ]) {
+    const output = await resume(dropped);
+    assert.equal(output.status.state, 'error', JSON.stringify(dropped));
+    assert.match(output.failures[0], /保存済みの見送りの照合結果/);
+  }
+  const output = await resume([ok]);
+  assert.equal(output.failures.length, 0);
+  assert.equal(output.outputs.findings, '1');
+});
+
+test('Claude passes at most 50 matched thread URLs to the Codex job and the count of the rest', async () => {
+  const findings = Array.from({ length: 60 }, (_, index) => ({ ...finding, body: `**指摘 ${index}**\n本文 ${index}` }));
+  const declined = findings.map((item, index) => declinedItem(item.body, { item: { url: `https://github.com/example/repo/pull/7#discussion_r${index + 1}` } }));
+  const claude = await run({ isCodex: false, declined, result: { summary: '', findings }, env: { CLEAN_COMMENT: 'skip' } });
+  assert.equal(JSON.parse(claude.outputs.declined_dropped_urls).length, 50);
+  assert.equal(claude.outputs.declined_dropped_urls_more, '10');
+  const codex = await run({ result: { summary: '', findings: [] },
+    env: { CLEAN_COMMENT: 'combined', CLAUDE_LABEL: 'c', CLAUDE_DECLINED_DROPPED: '60',
+      CLAUDE_DECLINED_URLS: claude.outputs.declined_dropped_urls, CLAUDE_DECLINED_URLS_MORE: claude.outputs.declined_dropped_urls_more,
+      MERGE_BASE: 'a'.repeat(40), REVIEW_BASE_SHA: 'a'.repeat(40), REVIEW_DIFF_DIGEST: defaultDiffDigest } });
+  assert.match(codex.summary.body, /除外 \(Claude\): 60件 — 照合した見送り: .* ほか 10件/);
+  assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /CLAUDE_DECLINED_URLS_MORE: \$\{\{ needs\.review\.outputs\.declined_dropped_urls_more \}\}/);
+});

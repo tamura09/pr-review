@@ -371,6 +371,7 @@ jobs:
       declined_dropped: ${{ steps.publish_review.outputs.declined_dropped }}
       declined_warning: ${{ steps.publish_review.outputs.declined_warning }}
       declined_dropped_urls: ${{ steps.publish_review.outputs.declined_dropped_urls }}
+      declined_dropped_urls_more: ${{ steps.publish_review.outputs.declined_dropped_urls_more }}
       # 再試行で差分を取り直さなかったときは、保存した結果の値を使う
       merge_base: ${{ steps.review_diff.outputs.merge_base || steps.restore_review.outputs.merge_base }}
     steps: &review_steps
@@ -1631,6 +1632,17 @@ jobs:
               }
               if (declinedWarning) core.warning(declinedWarning);
               const dropped = [];
+              // 保存結果から投稿し直すときの除外の記録は、使う前に元の結果と照らし合わせる。番号が範囲外・
+              // 重複・項目の欠けがあれば、推測で補わずに止める (パスと行は指摘ごとに下で照合する)
+              if (restoredDeclined) {
+                const indexes = restoredDeclined.dropped.map(item => item.index);
+                if (new Set(indexes).size !== indexes.length ||
+                    restoredDeclined.dropped.some(item => item.index < 1 || item.index > findings.length ||
+                      typeof item.path !== "string" || !Number.isSafeInteger(item.line) ||
+                      typeof item.url !== "string" || !item.url)) {
+                  throw new Error("保存済みの見送りの照合結果が不正です。新しい workflow run で再レビューしてください");
+                }
+              }
               findings.forEach((finding, index) => {
                 if (!finding || typeof finding.path !== "string" || !finding.path.trim() ||
                     !Number.isSafeInteger(finding.line) || finding.line < 1 ||
@@ -1655,6 +1667,9 @@ jobs:
                 const text = finding.body.trim();
                 const saved = restoredDeclined?.dropped.find(item => item.index === index + 1);
                 if (saved) {
+                  if (saved.path !== file.path || saved.line !== finding.line) {
+                    throw new Error("保存済みの見送りの照合結果が元の指摘と一致しません。新しい workflow run で再レビューしてください");
+                  }
                   dropped.push(saved);
                   return;
                 }
@@ -1716,6 +1731,8 @@ jobs:
               const claudeWarning = followsClaude ? process.env.CLAUDE_DECLINED_WARNING || "" : "";
               // Claude が照合したスレッドへのリンク。この PR のレビュースレッドの URL だけを載せる
               let claudeUrls = [];
+              // Claude のジョブが出力に載せきれなかった URL の数
+              const claudeUrlsMore = followsClaude ? Math.max(0, Number.parseInt(process.env.CLAUDE_DECLINED_URLS_MORE, 10) || 0) : 0;
               if (followsClaude) {
                 try {
                   const prefix = `${context.payload.pull_request.html_url}#discussion_r`;
@@ -1731,7 +1748,8 @@ jobs:
                 : combined ? "**✅ 指摘なし** (Claude・Codex)" : "**✅ 指摘なし**";
               const droppedLines = [
                 ...(claudeDropped ? [`見送り済みの指摘と同じため除外 (Claude): ${claudeDropped}件` +
-                  (claudeUrls.length ? ` — 照合した見送り: ${linkList(claudeUrls.map((url, index) => `[${index + 1}](${url})`))}` : "")] : []),
+                  (claudeUrls.length ? ` — 照合した見送り: ${linkList(claudeUrls.map((url, index) => `[${index + 1}](${url})`))}` +
+                    (claudeUrlsMore ? ` ほか ${claudeUrlsMore}件` : "") : "")] : []),
                 ...(dropped.length ? [`見送り済みの指摘と同じため除外${followsClaude ? " (Codex)" : ""}: ${dropped.length}件 — ` +
                   linkList(dropped.map(item => `[指摘 ${item.index}](${item.url})`))] : []),
                 ...(claudeWarning ? [`⚠️ ${claudeWarning} (Claude)`] : []),
@@ -1961,7 +1979,9 @@ jobs:
               core.setOutput("declined_dropped", String(declinedDroppedCount));
               core.setOutput("declined_warning", declinedWarningText);
               // 照合した見送りのスレッドの URL。Claude が何も投稿しないとき、Codex のサマリーにリンクを載せる
-              core.setOutput("declined_dropped_urls", JSON.stringify(declinedDroppedUrls));
+              // ジョブの出力は codex ジョブの環境変数1個になるので、先頭50件だけ渡し、残りは件数で渡す
+              core.setOutput("declined_dropped_urls", JSON.stringify(declinedDroppedUrls.slice(0, 50)));
+              core.setOutput("declined_dropped_urls_more", String(Math.max(0, declinedDroppedUrls.length - 50)));
             }
 
       # Claude に指摘があり Codex を走らせないときも、codex-review を出しておく。
@@ -2056,6 +2076,7 @@ jobs:
       CLAUDE_DECLINED_DROPPED: ${{ needs.review.outputs.declined_dropped }}
       CLAUDE_DECLINED_WARNING: ${{ needs.review.outputs.declined_warning }}
       CLAUDE_DECLINED_URLS: ${{ needs.review.outputs.declined_dropped_urls }}
+      CLAUDE_DECLINED_URLS_MORE: ${{ needs.review.outputs.declined_dropped_urls_more }}
     steps: *review_steps
 
   # この run が担当したチェックに、この run の判定が出ていなければ error で確定させる。
