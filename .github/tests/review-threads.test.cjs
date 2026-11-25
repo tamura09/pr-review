@@ -2343,3 +2343,9 @@ test('posted bodies saved with CRLF are read like LF, including the reopen note'
   assert.equal(posted.text, '**本文**\n説明');
   assert.equal(posted.hash, 'f'.repeat(64));
 });
+
+test('collecting declined findings has its own short time limit and does not stop the review', () => {
+  const section = workflow.slice(workflow.indexOf('      - name: Collect declined findings')).split(/\n      - name: /)[0];
+  assert.match(section, /timeout-minutes: 3/);
+  assert.match(section, /continue-on-error: true/);
+});
