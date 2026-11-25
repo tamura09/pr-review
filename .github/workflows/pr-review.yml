@@ -240,6 +240,8 @@ env:
         "(?:\\r?\\n\\r?\\n> [^\\r\\n]*（(LEFT|RIGHT) (\\d+)行）。ファイル全体への指摘として投稿しています。)?\\s*$");
       // モデルが見送り済みの指摘をあえて挙げ直したときに、投稿側が本文に付ける注記
       const REOPEN_NOTE = "> 見送り済みの指摘を挙げ直しています: ";
+      // 投稿側が実際に注記を付けたことを示す印。注記の行の末尾に置き、これがあるときだけ注記を外す
+      const REOPEN_MARKER = "<!-- pr-review:reopen -->";
       // 見送りの印は、返信の本文の先頭の「見送り:」だけ (全角のコロンも同じに扱う)。
       // 印が無ければ null、あれば理由 (空文字もある) を返す
       function declineReason(body) {
@@ -255,10 +257,13 @@ env:
         const tail = POSTED_TAIL.exec(body);
         if (!tail) return null;
         let text = body.slice(0, tail.index);
-        // 投稿側が付けた挙げ直しの注記は、本文の末尾の1行だけ (reopen の改行は空白にしてから付ける)。
-        // 本文の途中で同じ文言を引用していても、その後ろは本文として残す
+        // 投稿側が付けた挙げ直しの注記は、本文の末尾の1行で、行末に REOPEN_MARKER がある
+        // (reopen の改行は空白にしてから付ける)。モデルが本文で同じ文言を引用・末尾に書いていても、
+        // 印が無ければ本文として残す
         const reopen = text.lastIndexOf(`\n\n${REOPEN_NOTE}`);
-        if (reopen >= 0 && !text.slice(reopen + 2).includes("\n")) text = text.slice(0, reopen);
+        if (reopen >= 0 && !text.slice(reopen + 2).includes("\n") && text.trimEnd().endsWith(REOPEN_MARKER)) {
+          text = text.slice(0, reopen);
+        }
         return { hash: tail[2], text: text.trim(), fallback_side: tail[3] ?? null,
           fallback_line: tail[4] ? Number(tail[4]) : null };
       }
@@ -328,7 +333,7 @@ env:
           }),
         ].join("\n");
       }
-      return { REOPEN_NOTE, declineReason, isBot, parsePosted, headline, contentKey, matchDeclined, formatPrompt };
+      return { REOPEN_NOTE, REOPEN_MARKER, declineReason, isBot, parsePosted, headline, contentKey, matchDeclined, formatPrompt };
     })
 
 jobs:
@@ -618,20 +623,21 @@ jobs:
             const dir = path.join(process.env.RUNNER_TEMP, "pr-review");
             fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
             const pr = context.payload.pull_request;
-            const prAuthor = String(pr.user?.login ?? "").toLowerCase();
+            // PR の作成者は、変わらないユーザー ID (node_id) で照合する。login は改名で他人に渡りうる
+            const prAuthorId = pr.user?.node_id;
             const query = `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
               repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
                 reviewThreads(first: 50, after: $cursor) {
                   pageInfo { hasNextPage endCursor }
                   nodes { id path line originalLine diffSide
                     comments(first: 100) { pageInfo { hasNextPage endCursor }
-                      nodes { body url author { __typename login } } } }
+                      nodes { body url author { __typename login ... on User { id } } } } }
                 } } } }`;
             // 101件目以降の返信は、スレッドごとに続きのページを取る (後から付いた見送りや、
             // 書き直した理由を読み落とさないため)
             const moreComments = `query($id: ID!, $cursor: String) { node(id: $id) {
               ... on PullRequestReviewThread { comments(first: 100, after: $cursor) {
-                pageInfo { hasNextPage endCursor } nodes { body url author { __typename login } } } } } }`;
+                pageInfo { hasNextPage endCursor } nodes { body url author { __typename login ... on User { id } } } } } } }`;
             const threads = [];
             let cursor = null;
             do {
@@ -658,8 +664,9 @@ jobs:
             const permissions = new Map();
             async function canDecline(author) {
               if (declinedHelper.isBot(author)) return false;
+              if (prAuthorId && author.id === prAuthorId) return true;
+              // 作成者以外は、いまの login で権限を確かめる
               const login = author.login.toLowerCase();
-              if (login === prAuthor) return true;
               if (!permissions.has(login)) {
                 let allowed = false;
                 try {
@@ -1661,7 +1668,7 @@ jobs:
                 }
                 const comment = {
                   path: file.path, line: finding.line, side: finding.side,
-                  body: `${text}${reopen ? `\n\n${declinedHelper.REOPEN_NOTE}${reopen}` : ""}\n\n_${REVIEWER}_\n${marker}`,
+                  body: `${text}${reopen ? `\n\n${declinedHelper.REOPEN_NOTE}${reopen} ${declinedHelper.REOPEN_MARKER}` : ""}\n\n_${REVIEWER}_\n${marker}`,
                   index: index + 1, marker,
                 };
                 if (file[finding.side].has(finding.line)) lineComments.push(comment);

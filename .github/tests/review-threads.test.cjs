@@ -1739,7 +1739,8 @@ test('a rewritten base history, or a moved head on a failure path, stops the old
 const collectScript = workflow.match(/- name: Collect declined findings[\s\S]*?          script: \|\n((?: {12}[^\n]*\n|\n)*)/)[1].replace(/^ {12}/gm, '');
 const collect = new AsyncFunction('github', 'context', 'core', 'process', 'require', collectScript);
 const actionsBot = { __typename: 'Bot', login: 'github-actions' };
-const person = login => ({ __typename: 'User', login });
+// GraphQL の User。id は改名しても変わらない (テストでは login の小文字から作る)
+const person = (login, id = `U_${login.toLowerCase()}`) => ({ __typename: 'User', login, id });
 // 投稿ステップが付ける形の指摘本文
 const postedBody = (body, { hash = 'a'.repeat(64), reviewer = 'Codex · gpt-test · effort high', fallback } = {}) =>
   `${body}\n\n_${reviewer}_\n<!-- pr-review:finding:${hash} -->` +
@@ -1748,7 +1749,7 @@ const thread = (root, replies, extra = {}) => ({ path: 'src/example.ts', line: 4
   comments: { nodes: [{ author: actionsBot, url: 'https://github.com/example/repo/pull/7#discussion_r1', ...root },
     ...replies.map((reply, index) => ({ url: `https://github.com/example/repo/pull/7#discussion_r${index + 2}`, ...reply }))] } });
 
-async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', permissionError, moreComments = {} } = {}) {
+async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', prAuthorId = `U_${prAuthor}`, permissionError, moreComments = {} } = {}) {
   const tempDir = mkdtempSync(join(tmpdir(), 'pr-review-declined-test-'));
   const outputs = {}, queries = [], permissionCalls = [], infos = [];
   const github = {
@@ -1776,7 +1777,7 @@ async function collectDeclined({ pages, permissions = {}, prAuthor = 'author', p
   try {
     try {
       await collect(github, { repo: { owner: 'example', repo: 'repo' },
-        payload: { pull_request: { number: 7, user: { login: prAuthor } } } },
+        payload: { pull_request: { number: 7, user: { login: prAuthor, node_id: prAuthorId } } } },
       { info: message => infos.push(message), setOutput: (key, value) => { outputs[key] = value; } },
       { env: { RUNNER_TEMP: tempDir, PR_REVIEW_DECLINED_HELPER: declinedHelperSource } }, require);
     } catch (failure) { error = failure; }
@@ -1947,7 +1948,7 @@ test('a finding re-raised with reopen is posted with its reason instead of being
     result: { summary: '境界値で失敗する', findings: [{ ...finding, reopen: '呼び出し側の 0 の検査が\nこの PR で消えた' }] } });
   assert.equal(output.failures.length, 0);
   assert.equal(output.review.comments.length, 1);
-  assert.match(output.review.comments[0].body, /> 見送り済みの指摘を挙げ直しています: 呼び出し側の 0 の検査が この PR で消えた\n\n_Codex/);
+  assert.match(output.review.comments[0].body, /> 見送り済みの指摘を挙げ直しています: 呼び出し側の 0 の検査が この PR で消えた <!-- pr-review:reopen -->\n\n_Codex/);
   assert.equal(output.outputs.findings, '1');
   // 挙げ直した指摘の本文からも、元の本文を取り出せる
   assert.equal(declinedHelper.parsePosted(output.review.comments[0].body).text, finding.body);
@@ -2105,7 +2106,7 @@ test('only comments ending in the publisher\'s own signature and marker count as
   // 投稿側の形 (行への指摘・ファイル単位・挙げ直し) は読める
   assert.equal(declinedHelper.parsePosted(`**本文**\n説明\n\n_Claude · m · effort high_\n${marker}`).text, '**本文**\n説明');
   assert.equal(declinedHelper.parsePosted(postedBody('**本文**', { fallback: 'LEFT 7行' })).fallback_line, 7);
-  assert.equal(declinedHelper.parsePosted(`**本文**\n\n${declinedHelper.REOPEN_NOTE}理由\n\n_Codex · m · effort low_\n${marker}`).text, '**本文**');
+  assert.equal(declinedHelper.parsePosted(`**本文**\n\n${declinedHelper.REOPEN_NOTE}理由 ${declinedHelper.REOPEN_MARKER}\n\n_Codex · m · effort low_\n${marker}`).text, '**本文**');
 });
 
 test('a quoted marker thread from another workflow is not collected as a declined finding', async () => {
@@ -2251,5 +2252,21 @@ test('only the reopen note the publisher appended at the end is removed from a d
   const quoted = `**注記の扱い**\n本文に次の行を引用します。\n\n${declinedHelper.REOPEN_NOTE}例\nこの後ろに発生条件が続きます。`;
   assert.equal(declinedHelper.parsePosted(`${quoted}\n\n_Claude · m · effort high_\n${marker}`).text, quoted);
   // 投稿側が付けた末尾の1行の注記は外す (引用があってもそれは本文に残る)
-  assert.equal(declinedHelper.parsePosted(`${quoted}\n\n${declinedHelper.REOPEN_NOTE}理由\n\n_Codex · m · effort low_\n${marker}`).text, quoted);
+  assert.equal(declinedHelper.parsePosted(`${quoted}\n\n${declinedHelper.REOPEN_NOTE}理由 ${declinedHelper.REOPEN_MARKER}\n\n_Codex · m · effort low_\n${marker}`).text, quoted);
+  // モデルが本文の末尾に同じ文言の行を書いても、投稿側の印が無ければ本文として残す
+  const trailing = `**注記の扱い**\n説明。\n\n${declinedHelper.REOPEN_NOTE}例`;
+  assert.equal(declinedHelper.parsePosted(`${trailing}\n\n_Claude · m · effort high_\n${marker}`).text, trailing);
+});
+
+test('the PR author is recognized by the immutable user id, not by a login someone else may now hold', async () => {
+  const root = { body: postedBody(finding.body) };
+  // 改名後の作成者 (login は変わったが id は同じ) の見送りは効く
+  const renamed = await collectDeclined({ pages: [[thread(root, [{ author: person('new-name', 'U_author'), body: '見送り: x' }])]] });
+  assert.equal(renamed.declined.length, 1);
+  assert.deepEqual(renamed.permissionCalls, []);
+  // 旧 login を取った別人 (id が違う) は作成者とみなさず、権限で判定する (権限が無ければ効かない)
+  const impostor = await collectDeclined({ pages: [[thread(root, [{ author: person('author', 'U_someone-else'), body: '見送り: x' }])]] });
+  assert.equal(impostor.declined.length, 0);
+  assert.deepEqual(impostor.permissionCalls, ['author']);
+  assert.match(workflow, /author \{ __typename login \.\.\. on User \{ id \} \}/);
 });
