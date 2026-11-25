@@ -321,7 +321,8 @@ env:
               : Number.isSafeInteger(item.fallback_line ?? item.original_line) ? `${side}${item.fallback_line ?? item.original_line}行付近 (当時)` : "ファイル全体";
             return [
               `### 見送り ${index + 1}`,
-              `- ファイルと行: \`${item.path}\` ${where}`,
+              // パスは JSON 文字列で書く (改行やバッククォートを含むファイル名で一覧の構造を変えさせない)
+              `- ファイルと行: ${JSON.stringify(item.path)} ${where}`,
               `- 要旨: ${clip(item.headline, 200)}`,
               `- 指摘の本文:`,
               // 一覧はファイルで渡すので、長さの上限で切らない。理由の末尾にある結論や前提も、
@@ -1789,7 +1790,10 @@ jobs:
                   (fileLinks.size ? "\n" : "") + footer + `\n${summaryMarker}\n<!-- pr-review:head:${SHA} -->`;
                 // 件数・警告の文面の分 (1000 文字) を見込み、残りを見送り先のリンクに使う
                 const lines = droppedLines({ left: Math.max(0, SUMMARY_LIMIT - head.length - tail.length - 1000) });
-                return head + (lines.length ? lines.join("\n") + "\n\n" : "") + tail;
+                const body = head + (lines.length ? lines.join("\n") + "\n\n" : "") + tail;
+                // それでも上限を超えるとき (要約やファイル単位の指摘へのリンクだけで上限近い) は、見送りの行を
+                // 省く。取り除いた件数はチェックの説明とログに残る
+                return body.length <= SUMMARY_LIMIT ? body : head + tail;
               };
               function record(kind, posted) {
                 publication.posted.push({ kind, id: posted.id, url: posted.html_url });
