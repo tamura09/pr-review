@@ -2349,3 +2349,19 @@ test('collecting declined findings has its own short time limit and does not sto
   assert.match(section, /timeout-minutes: 3/);
   assert.match(section, /continue-on-error: true/);
 });
+
+test('links to matched threads only use what is left of the summary length limit', async () => {
+  const findings = Array.from({ length: 3 }, (_, index) => ({ ...finding, body: `**指摘 ${index}**\n本文 ${index}` }));
+  const declined = findings.map((item, index) => declinedItem(item.body, { item: { url: `https://github.com/example/repo/pull/7#discussion_r${index + 1}` } }));
+  // 要約だけで上限近くまで使う (残りの指摘が1件あるので、要約が見出しに載る)
+  const long = 'あ'.repeat(59500);
+  const output = await run({ declined, result: { summary: long, findings: [{ ...finding, line: 9, side: 'LEFT', body: '**残る**\n本文' }, ...findings] } });
+  assert.equal(output.failures.length, 0);
+  assert.match(output.summary.body, /除外: 3件 — ほか 3件/);
+  assert.ok(output.summary.body.length < 65536);
+});
+
+test('declined findings are not collected when the diff could not be prepared', () => {
+  const section = workflow.slice(workflow.indexOf('      - name: Collect declined findings')).split(/\n      - name: /)[0];
+  assert.match(section, /steps\.review_diff\.outcome == 'success'/);
+});

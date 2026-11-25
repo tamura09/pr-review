@@ -614,7 +614,8 @@ jobs:
         # 超えたときは continue-on-error で先に進み、投稿ステップが「照合していない」と警告を出す
         timeout-minutes: 3
         # 保存結果から投稿し直すときは、前回 attempt の照合結果を使うので集めない
-        if: ${{ !cancelled() && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' }}
+        # 差分の準備に失敗したときもモデルを起動しないので集めない
+        if: ${{ !cancelled() && steps.restore_review.outcome == 'success' && steps.restore_review.outputs.restored != 'true' && steps.review_diff.outcome == 'success' }}
         continue-on-error: true
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
@@ -1735,9 +1736,23 @@ jobs:
               const followsClaude = cleanComment === "combined";
               // 除外した指摘へのリンクは50件まで (本文の上限 65536 文字を超えて投稿が失敗しないように)。
               // 件数は全体を出し、載せきれなかった分は「ほか N件」とする
+              // さらに、サマリー全体 (要約・ファイル単位の指摘へのリンク・フッターを含む) が本文の上限に
+              // 収まるよう、見送り先のリンクは残りの文字数に入る分だけ載せる
               const MAX_LINKS = 50;
-              const linkList = links => links.slice(0, MAX_LINKS).join("・") +
-                (links.length > MAX_LINKS ? ` ほか ${links.length - MAX_LINKS}件` : "");
+              const SUMMARY_LIMIT = 60000;
+              const linkList = (links, budget, more = 0) => {
+                let text = "";
+                let shown = 0;
+                for (const link of links.slice(0, MAX_LINKS)) {
+                  const next = (shown ? "・" : "") + link;
+                  if (next.length > budget.left) break;
+                  text += next;
+                  budget.left -= next.length;
+                  shown++;
+                }
+                const rest = links.length - shown + more;
+                return text + (rest ? `${shown ? " " : ""}ほか ${rest}件` : "");
+              };
               const claudeDropped = followsClaude ? Number(process.env.CLAUDE_DECLINED_DROPPED) || 0 : 0;
               const claudeWarning = followsClaude ? process.env.CLAUDE_DECLINED_WARNING || "" : "";
               // Claude が照合したスレッドへのリンク。この PR のレビュースレッドの URL だけを載せる
@@ -1757,22 +1772,25 @@ jobs:
               const verdict = kept
                 ? `**⚠️ 指摘 ${kept}件**${headline ? ` — ${headline}` : ""}`
                 : combined ? "**✅ 指摘なし** (Claude・Codex)" : "**✅ 指摘なし**";
-              const droppedLines = [
+              const droppedLines = budget => [
                 ...(claudeDropped ? [`見送り済みの指摘と同じため除外 (Claude): ${claudeDropped}件` +
-                  (claudeUrls.length ? ` — 照合した見送り: ${linkList(claudeUrls.map((url, index) => `[${index + 1}](${url})`))}` +
-                    (claudeUrlsMore ? ` ほか ${claudeUrlsMore}件` : "") : "")] : []),
+                  (claudeUrls.length || claudeUrlsMore ? ` — 照合した見送り: ${linkList(claudeUrls.map((url, index) => `[${index + 1}](${url})`), budget, claudeUrlsMore)}` : "")] : []),
                 ...(dropped.length ? [`見送り済みの指摘と同じため除外${followsClaude ? " (Codex)" : ""}: ${dropped.length}件 — ` +
-                  linkList(dropped.map(item => `[指摘 ${item.index}](${item.url})`))] : []),
+                  linkList(dropped.map(item => `[指摘 ${item.index}](${item.url})`), budget)] : []),
                 ...(claudeWarning ? [`⚠️ ${claudeWarning} (Claude)`] : []),
                 ...(declinedWarning ? [`⚠️ ${declinedWarning}${followsClaude ? " (Codex)" : ""}`] : []),
               ];
               const footer = `---\n_${combined ? `${claudeLabel} / ${REVIEWER}` : REVIEWER} [Workflow run](${RUN_URL})_`;
               const fileLinks = new Map();
-              const summary = () => `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n` +
-                (droppedLines.length ? droppedLines.join("\n") + "\n\n" : "") +
-                [...fileLinks].sort(([a], [b]) => a - b)
+              const summary = () => {
+                const head = `${isCodex ? "<!-- pr-review:codex -->\n" : ""}${verdict}\n\n`;
+                const tail = [...fileLinks].sort(([a], [b]) => a - b)
                   .map(([index, url]) => `- [ファイル全体への指摘 ${index}](${url})\n`).join("") +
-                (fileLinks.size ? "\n" : "") + footer + `\n${summaryMarker}\n<!-- pr-review:head:${SHA} -->`;
+                  (fileLinks.size ? "\n" : "") + footer + `\n${summaryMarker}\n<!-- pr-review:head:${SHA} -->`;
+                // 件数・警告の文面の分 (1000 文字) を見込み、残りを見送り先のリンクに使う
+                const lines = droppedLines({ left: Math.max(0, SUMMARY_LIMIT - head.length - tail.length - 1000) });
+                return head + (lines.length ? lines.join("\n") + "\n\n" : "") + tail;
+              };
               function record(kind, posted) {
                 publication.posted.push({ kind, id: posted.id, url: posted.html_url });
                 savePublication();
