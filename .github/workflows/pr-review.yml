@@ -253,7 +253,8 @@ env:
       // 投稿した指摘の本文から、モデルが書いた部分・印のハッシュ・ファイル単位にした元の行を取り出す。
       // 印は末尾の形 (POSTED_TAIL) のものだけを使う。本文に引用された印は本文として扱う
       function parsePosted(body) {
-        body = String(body ?? "");
+        // 改行は LF にそろえてから読む (CRLF で保存された本文でも注記や署名を見分ける)
+        body = String(body ?? "").replace(/\r\n?/g, "\n");
         const tail = POSTED_TAIL.exec(body);
         if (!tail) return null;
         let text = body.slice(0, tail.index);
@@ -639,18 +640,19 @@ jobs:
             const moreComments = `query($id: ID!, $cursor: String) { node(id: $id) {
               ... on PullRequestReviewThread { comments(first: 100, after: $cursor) {
                 pageInfo { hasNextPage endCursor } nodes { body url author { __typename login ... on User { id } } } } } } }`;
+            // 指摘はこのワークフロー (github-actions) が投稿した、末尾に署名と印のあるスレッドに限る。
+            // ページごとに判定し、対象のスレッドだけを残す (人どうしの議論の全文を溜め込まない)
+            const isFinding = root => root?.author?.__typename === "Bot" &&
+              ["github-actions", "github-actions[bot]"].includes(root.author.login) && declinedHelper.parsePosted(root.body) !== null;
             const threads = [];
             let cursor = null;
             do {
               const data = await github.graphql(query, { ...context.repo, number: pr.number, cursor });
               const page = data.repository.pullRequest.reviewThreads;
-              threads.push(...page.nodes);
+              threads.push(...page.nodes.filter(thread => isFinding(thread.comments?.nodes?.[0])));
               cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
             } while (cursor);
-            // 指摘はこのワークフロー (github-actions) が投稿した、末尾に署名と印のあるスレッドに限る。
             // 返信の続きのページは、対象のスレッドだけ取る (ほかのスレッドの取得の失敗で収集全体を落とさない)
-            const isFinding = root => root?.author?.__typename === "Bot" &&
-              ["github-actions", "github-actions[bot]"].includes(root.author.login) && declinedHelper.parsePosted(root.body) !== null;
             for (const thread of threads) {
               if (!isFinding(thread.comments?.nodes?.[0])) continue;
               let info = thread.comments?.pageInfo;

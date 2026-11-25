@@ -2332,3 +2332,11 @@ test('Claude passes at most 50 matched thread URLs to the Codex job and the coun
   assert.match(codex.summary.body, /除外 \(Claude\): 60件 — 照合した見送り: .* ほか 10件/);
   assert.match(workflow.slice(workflow.indexOf('\n  codex:\n')), /CLAUDE_DECLINED_URLS_MORE: \$\{\{ needs\.review\.outputs\.declined_dropped_urls_more \}\}/);
 });
+
+test('posted bodies saved with CRLF are read like LF, including the reopen note', () => {
+  const marker = `<!-- pr-review:finding:${'f'.repeat(64)} -->`;
+  const body = `**本文**\r\n説明\r\n\r\n${declinedHelper.REOPEN_NOTE}理由 ${declinedHelper.REOPEN_MARKER}\r\n\r\n_Codex · m · effort low_\r\n${marker}`;
+  const posted = declinedHelper.parsePosted(body);
+  assert.equal(posted.text, '**本文**\n説明');
+  assert.equal(posted.hash, 'f'.repeat(64));
+});
